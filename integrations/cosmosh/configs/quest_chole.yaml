@@ -1,0 +1,45 @@
+# Quest server — chole still image with the JHU/Chole checkpoint.
+#
+# Run with:
+#   uv run --package flash-cosmosh python -m cosmosh.webrtc.server_quest \
+#     --config integrations/cosmosh/configs/quest_chole.yaml
+
+runtime:
+  config_name: 2steps_vae_lighttae
+  compile_network: true
+  device: cuda:0
+  seed: 1
+  ckpt_path: /localhome/local-javierg/checkpoints/model_ema_jhuchole_bf16.pt
+  cr1_embeddings_path: /localhome/local-javierg/sf_inference_data/cr1_empty_string_text_embeddings.pt
+  input_path: /localhome/local-javierg/sf_inference_data/chole/chole_frame0.png
+  stats_path: /localhome/local-javierg/sf_inference_data/260206/stats_cosmos_chole.json
+  resolution: [288, 512]
+  fps: 30
+  actions_per_chunk: 12  # 4 / 8 / 12 / 16…; smaller = lower latency, lower fidelity
+
+vr:
+  # translate_scale: scalar / [x,y,z] / {right, left} dict — see
+  # quest_episode_001867.yaml or config_loader.py for the full shapes.
+  translate_scale: 250.0
+  # translate_scale: [250.0, 1000.0, 250.0]
+  # translate_scale: {right: [250.0, 1000.0, 250.0], left: [250.0, 1000.0, 250.0]}
+  rotate_scale: 9.0
+  # rotate_scale: {right: 9.0, left: 9.0}
+  # See QUEST_PLAN.md for trade-offs. Default false = absolute play-space.
+  body_relative_translate: false
+  body_relative_rotation: false
+  # In-headset display panel. Aspect should ideally match runtime.resolution
+  # — defaults (0.4 × 0.3 m) match the historical hardcoded quad.
+  display:
+    width_m: 0.4
+    height_m: 0.3
+    distance_m: 1.2
+
+video:
+  jpeg_quality: 85
+
+server:
+  host: 0.0.0.0
+  port: 8443
+  cert: cert.pem
+  key: key.pem

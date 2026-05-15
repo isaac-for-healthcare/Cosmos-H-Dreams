@@ -132,3 +132,6 @@ AGENTS.md
 .agents/
 checkpoints/
 sf_inference_data/
+*.pem
+
+*PLAN.md

@@ -4,13 +4,34 @@ This guide walks through running the CosmosH action-conditioned streaming
 Video2World recipe end to end: build a container, drop into it, and run
 one of the bundled configurations.
 
-The recipe takes a per-entry JSON manifest, a precomputed CR1 text
-embedding, an input video (frame 0 is the conditional anchor) and an
-action trajectory, then rolls a CosmosH-2B autoregressive policy
-forward in blocks of 12 generated frames, decoding each block back to
-pixels and writing MP4 + raw-tensor outputs.
+The recipe takes a CosmosH-2B autoregressive policy, conditions it on a
+first frame + a precomputed CR1 text embedding, and rolls it forward
+in blocks of 12 generated frames.
+
+The guide has two parts after the shared setup:
+
+- **Common setup** (sections 1–4) — build the container, mount your
+  assets, sync deps, pick one of the six bundled configurations.
+- **Mode A — Offline batch inference** (sections 5–6) — feed a JSON
+  manifest of `{input_video, input_action, output_video}` entries and
+  drive the recipe with action `.npy` trajectories. Outputs are MP4 +
+  raw-tensor files. Reach for this when you want reproducible rollouts
+  or benchmark numbers.
+- **Mode B — Interactive WebRTC** (section 7) — start the
+  `integrations/cosmosh/` WebRTC server and drive the rollout live
+  from either a keyboard (browser) or a Meta Quest headset (WebXR).
+  No action `.npy` needed; the browser / headset is the input device.
+
+Both modes share the same recipe runtime — the same checkpoint, the
+same outer-block render loop, the same first-block warmup. Pick the
+mode that matches what you want to do and skip past the other.
 
 ---
+
+## Common setup (sections 1–4)
+
+These four steps are identical regardless of which mode you intend to
+run.
 
 ## 1. Build the container
 
@@ -113,6 +134,13 @@ ones), run `uv run flashdreams-run --help` from inside the container.
 
 ---
 
+## Mode A — Offline batch inference (sections 5–6)
+
+You'll need a JSON manifest of entries, each pointing at an input
+video and an action `.npy`. Outputs are written to disk as MP4 +
+tensor files. Skip this part if you only want to drive the recipe
+interactively — jump to [section 7](#7-mode-b--interactive-webrtc-keyboard--quest).
+
 ## 5. Run a configuration
 
 Minimum required inputs:
@@ -152,6 +180,17 @@ uv run flashdreams-run cosmosh-2steps-lightvae-lighttae \
   --cr1-embeddings-path ... \
   --total-blocks 20
 ```
+
+> **Note — first-run latency.** The very first block of the very first
+> run is significantly slower than later ones: the DiT is compiled
+> with `torch.compile` and the CUDA graphs are captured on the first
+> forward pass. The runner reports this block as `[WARMUP]` in the
+> per-block log. The compiled artifacts are cached by PyTorch's
+> Inductor cache and reused on subsequent runs of the same
+> configuration / resolution / GPU, so repeated invocations of the
+> same `cosmosh-*` slug start much faster — only the CUDA-graph
+> capture (~a few seconds) runs again. Changing `--resolution`, the
+> checkpoint, or the slug forces a recompile.
 
 ### Overriding pinned knobs
 
@@ -200,7 +239,72 @@ excludes it.
 
 ---
 
-## 7. Troubleshooting
+## Mode B — Interactive WebRTC (keyboard / Quest)
+
+The `integrations/cosmosh/` package wraps the recipe in a small WebRTC
+server that streams generated frames to a browser (keyboard) or a
+Meta Quest headset (WebXR). No action `.npy` manifest needed — the
+client device produces the action stream live.
+
+Server configs live in `integrations/cosmosh/configs/`. Pick the one
+that matches the dataset / episode you want to condition on; ports
+and asset paths are documented in the YAML itself.
+
+## 7. Start the WebRTC server
+
+### Keyboard
+
+```bash
+uv run --package flash-cosmosh python -m cosmosh.webrtc.server \
+  --config integrations/cosmosh/configs/keyboard_episode_001867.yaml
+```
+
+Then open **<http://0.0.0.0:8080/request_session>** in any
+browser. The viewer page handles SDP signaling on its own — once it
+loads, you should see the conditional first frame and can start
+driving with the keys documented in `integrations/cosmosh/README.md`
+("DataChannel Message Format" → key bindings).
+
+### Quest (WebXR)
+
+WebXR requires HTTPS, so the Quest path needs a TLS cert. One-time
+setup:
+
+1. **Put the headset in developer mode.** Pair it with the Meta
+   Quest mobile app, enable developer settings (Meta's official docs cover the latest
+   flow.)
+2. **Generate a self-signed certificate** on the host that will run
+   the server. Replace `<bridge-pc-lan-ip>` with the LAN IP of that
+   host so the Quest can verify the cert against the address it
+   connects to:
+
+   ```bash
+   openssl req -x509 -newkey rsa:2048 -nodes \
+     -keyout key.pem -out cert.pem -days 365 \
+     -subj "/CN=quest" \
+     -addext "subjectAltName=IP:<bridge-pc-lan-ip>"
+   ```
+
+   The Quest config (`configs/quest_*.yaml`) points at these
+   `key.pem` / `cert.pem` paths — keep them next to the configs or
+   update the YAML to match.
+
+Launch the Quest server:
+
+```bash
+uv run --package flash-cosmosh python -m cosmosh.webrtc.server_quest \
+  --config integrations/cosmosh/configs/quest_episode_001867.yaml
+```
+
+On the Quest browser, open **`https://<bridge-pc-lan-ip>:8443/quest_session`**.
+Accept the self-signed-cert warning, click **Enter VR**, and you're
+in. **Hold `B` on the Meta Quest controller to reset the simulation**
+(server drains the queue and re-anchors on the initial conditional
+frame).
+
+---
+
+## 8. Troubleshooting
 
 - **`ImportError: cannot import name '…' from 'flashdreams.infra.encoder'`** — you're running outside `uv run` against a stale environment. Re-run with `uv run flashdreams-run …` from inside the synced project.
 - **`invalid choice '…' for argument '--save-comparison'`** — pass `True` (or `False`) explicitly; the CLI has flag-conversion disabled globally.

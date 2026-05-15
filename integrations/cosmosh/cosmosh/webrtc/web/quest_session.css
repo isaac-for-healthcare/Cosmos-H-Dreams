@@ -1,0 +1,129 @@
+:root {
+  color-scheme: light;
+  font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: #ffffff;
+  color: #1a1f2c;
+}
+
+.container {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 1.5rem;
+  display: grid;
+  gap: 1.25rem;
+}
+
+.controls {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.controls h1 {
+  margin: 0;
+  font-size: 1.4rem;
+}
+
+.hint {
+  margin: 0;
+  color: #5a6373;
+}
+
+code {
+  background: #f5f6f9;
+  border: 1px solid #c8ced8;
+  border-radius: 4px;
+  padding: 0.05rem 0.3rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.85rem;
+}
+
+.buttonRow {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+button {
+  width: fit-content;
+  padding: 0.55rem 0.9rem;
+  border: 1px solid #c8ced8;
+  border-radius: 8px;
+  background: #f6f8fb;
+  color: #1a1f2c;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  background: #eef1f6;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.status {
+  display: flex;
+  gap: 0.4rem;
+  font-size: 0.95rem;
+}
+
+.videoPane {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 0.5rem;
+  border: 1px solid #d8dde4;
+  border-radius: 12px;
+  background: #f0f2f5;
+}
+
+/* Cap the stream so the Quest browser panel doesn't render it at panel
+   size. Native resolution is preserved up to the cap; smaller streams
+   display 1:1. */
+#remoteVideo {
+  display: block;
+  max-width: 640px;
+  max-height: 480px;
+  width: auto;
+  height: auto;
+  background: #f0f2f5;
+  image-rendering: auto;
+}
+
+.logPane {
+  border: 1px solid #d8dde4;
+  border-radius: 12px;
+  overflow: hidden;
+  background: #fafbfc;
+}
+
+.logPane h2 {
+  margin: 0;
+  padding: 0.7rem 0.9rem;
+  border-bottom: 1px solid #d8dde4;
+  background: #f6f8fb;
+  font-size: 1rem;
+}
+
+#eventLog {
+  margin: 0;
+  padding: 0.9rem;
+  min-height: 7rem;
+  max-height: 18rem;
+  overflow: auto;
+  background: #fafbfc;
+  color: #2a2f3a;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.82rem;
+  line-height: 1.35;
+}

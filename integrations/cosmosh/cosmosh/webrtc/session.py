@@ -1,0 +1,1054 @@
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import logging
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import mediapy
+import numpy as np
+import torch
+import torchvision.transforms.functional as TF
+from PIL import Image
+
+from cosmosh.webrtc.controls import CosmoshActionIntegrator, KeyboardState
+from cosmosh.webrtc.controls_quest import (
+    VRControllerState,
+    compute_action_chunk,
+)
+from cosmosh.webrtc.media import CosmoshVideoTrack
+from cosmosh.webrtc.utils import ACTION_DIM_NORMALISED
+from flashdreams.recipes.cosmosh.config import COSMOSH_CONFIG_BUILDERS
+from flashdreams.recipes.cosmosh.constants import AVAILABLE_COSMOSH_CHECKPOINT_PATHS
+
+LOGGER = logging.getLogger(__name__)
+
+# Wan2.1 VAE temporal / spatial compression. Mirrors run_cosmosh.py.
+WAN_TCR = 4
+WAN_SCR = 8
+
+# Default outer block size: 1 conditional + 12 generated pixel frames
+# (= 4 latent frames). The 12 is overridable via
+# ``CosmoshRuntimeConfig.actions_per_chunk`` — see that field's docstring
+# for the divisibility constraint. ``PIXELS_PER_OUTER_BLOCK`` follows by
+# adding the conditioning frame.
+DEFAULT_ACTIONS_PER_OUTER_BLOCK = 12
+
+
+class CosmoshRuntimeError(RuntimeError):
+    """Raised when the Cosmosh runtime is used incorrectly."""
+
+
+class SessionBusyError(RuntimeError):
+    """Raised when a second peer tries to open a session."""
+
+
+@dataclass(slots=True)
+class CosmoshRuntimeConfig:
+    config_name: str = "lightvae_lighttae"
+    compile_network: bool = True
+    seed: int = 1
+    device: str = "cuda:0"
+    ckpt_path: str | None = None
+    cr1_embeddings_path: str = ""
+    # Path to either a video file (any mediapy-readable format) or a still
+    # image. Image vs video is auto-detected from the file extension; when
+    # an image is supplied, ``start_frame_idx`` is ignored.
+    input_path: str = ""
+    stats_path: str = ""
+    start_frame_idx: int = 0
+    # If None, the first frame's native (H, W) is used.
+    resolution: tuple[int, int] | None = None
+    fps: int = 10
+    translate_v_per_frame: float = 0.3
+    gripper_v_per_chunk: float = 1.0
+    rotate_theta_per_frame: float = 0.017453292519943295  # 1° in radians
+    # VR-only: per-arm, per-axis scale applied element-wise to play-space
+    # ``dpos`` *before* the empirical camera-frame remap. Each arm's tuple
+    # is ``(x, y, z)`` in play-space — index 1 is "vertical hand motion"
+    # regardless of which camera-frame dim that maps onto. YAML accepts
+    # scalar / 3-vec (broadcast across arms) or ``{right, left}`` dict
+    # (asymmetric). Ignored by the keyboard path.
+    translate_scale: dict[str, tuple[float, float, float]] = field(
+        default_factory=lambda: {
+            "right": (500.0, 500.0, 500.0),
+            "left": (500.0, 500.0, 500.0),
+        }
+    )
+    # Number of action / generated pixel frames per outer block. Default
+    # matches the model's training setup (12). Must be a positive multiple
+    # of the pipeline's ``num_action_per_latent_frame`` (typically 4 → valid
+    # values 4, 8, 12, 16, ...). Validated at runtime init; an invalid
+    # value raises ``CosmoshRuntimeError``. The model was trained with 12;
+    # other values may produce degraded quality.
+    actions_per_chunk: int = DEFAULT_ACTIONS_PER_OUTER_BLOCK
+    # VR-only: per-arm rotation scale. ``omega = drot × rotate_scale`` per
+    # arm. ``drot`` is per-browser-frame axis-angle (radians); browser
+    # frames are ~90 Hz vs output frames at ``fps`` (typically 10), so
+    # ``rotate_scale=1.0`` ≈ keyboard's 1°/output-frame default. YAML
+    # accepts scalar (broadcast across arms) or ``{right, left}`` dict
+    # (asymmetric). Ignored by the keyboard path.
+    rotate_scale: dict[str, float] = field(
+        default_factory=lambda: {"right": 1.0, "left": 1.0}
+    )
+
+
+@dataclass(slots=True)
+class CosmoshStepResult:
+    chunk_index: int
+    num_frames: int
+    video_chunk: torch.Tensor  # [1, 3, 12, H, W] in [-1, 1] on CPU
+
+
+# Common single-image extensions ``mediapy.read_image`` understands. Any
+# other extension is treated as a video and read via ``mediapy.read_video``.
+_IMAGE_SUFFIXES = frozenset(
+    {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+)
+
+
+def _load_conditional_frame(path: str, start_frame_idx: int) -> np.ndarray:
+    """Load the conditional first frame from either a still image or a video.
+
+    Image files (extension in :data:`_IMAGE_SUFFIXES`) are read directly via
+    ``mediapy.read_image``; ``start_frame_idx`` is ignored. Anything else is
+    treated as a video and indexed at ``start_frame_idx``. Returns ``[H, W, 3]``
+    uint8.
+    """
+    suffix = Path(path).suffix.lower()
+    if suffix in _IMAGE_SUFFIXES:
+        frame = mediapy.read_image(path)
+        if frame.ndim == 2:
+            # Grayscale → broadcast to RGB.
+            frame = np.stack([frame] * 3, axis=-1)
+        if frame.ndim == 3 and frame.shape[-1] == 4:
+            # Drop alpha channel.
+            frame = frame[..., :3]
+        if frame.ndim != 3 or frame.shape[-1] != 3:
+            raise ValueError(
+                f"Image at {path} did not yield a [H, W, 3] frame; got shape "
+                f"{frame.shape}"
+            )
+        return frame
+    video = mediapy.read_video(path)
+    if start_frame_idx < 0 or start_frame_idx >= video.shape[0]:
+        raise ValueError(
+            f"start_frame_idx={start_frame_idx} is out of range for video "
+            f"with {video.shape[0]} frames at {path}"
+        )
+    return video[start_frame_idx]
+
+
+def _load_action_stats(stats_path: str) -> dict[str, np.ndarray]:
+    """Load ``stats_cosmos.json`` and return per-component mean/std slices.
+
+    The file's combined ``"action"`` block is the 20-dim normalisation that
+    matches the inference action layout (PSM1 xyz/rot6d/gripper +
+    PSM2 xyz/rot6d/gripper). We slice out the 6-dim PSM1 / PSM2 rot6d
+    means/stds for the rotation integrator's identity-baseline computation.
+    """
+    with open(stats_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    action = data.get("action") if isinstance(data, dict) else None
+    if not isinstance(action, dict) or "mean" not in action or "std" not in action:
+        raise ValueError(
+            f"stats file missing 'action.mean' / 'action.std': {stats_path}"
+        )
+    mean = np.asarray(action["mean"], dtype=np.float64)
+    std = np.asarray(action["std"], dtype=np.float64)
+    if mean.shape != (20,) or std.shape != (20,):
+        raise ValueError(
+            f"stats action.mean/std must be 20-dim, got {mean.shape}/{std.shape}"
+        )
+    return {
+        "psm1_rot6d_mean": mean[3:9].copy(),
+        "psm1_rot6d_std": std[3:9].copy(),
+        # Sliced now so Phase 4 PSM2 wiring is just a constructor arg away.
+        "psm2_rot6d_mean": mean[13:19].copy(),
+        "psm2_rot6d_std": std[13:19].copy(),
+    }
+
+
+def _load_cr1_text_embeddings(path: str) -> torch.Tensor:
+    """Load CR1 text embeddings and normalise to ``[1, T, D]`` (CPU)."""
+    emb = torch.load(path, map_location="cpu", weights_only=False)
+    if isinstance(emb, (list, tuple)):
+        emb = emb[0]
+    if not torch.is_tensor(emb):
+        raise ValueError(f"CR1 embeddings file is not a torch.Tensor: {path}")
+    if emb.dim() == 2:
+        emb = emb.unsqueeze(0)
+    elif emb.dim() != 3:
+        raise ValueError(
+            f"CR1 embeddings must be [T, D] or [B, T, D]; got {tuple(emb.shape)}"
+        )
+    return emb
+
+
+def _pad_actions(actions_np: np.ndarray, target_dim: int) -> np.ndarray:
+    """Right-pad the last dim with zeros so the action width matches ``action_dim``."""
+    if actions_np.shape[-1] >= target_dim:
+        return actions_np
+    pad_width = target_dim - actions_np.shape[-1]
+    pad_shape = list(actions_np.shape[:-1]) + [pad_width]
+    zeros = np.zeros(pad_shape, dtype=actions_np.dtype)
+    return np.concatenate([actions_np, zeros], axis=-1)
+
+
+def _pixel_frame_to_neg1_pos1(
+    frame_uint8: np.ndarray,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Convert a single ``[H, W, 3]`` uint8 frame to ``[1, 1, 3, H, W]`` in ``[-1, 1]``.
+
+    Mirrors run_cosmosh.py's ``x / 128 - 1`` mapping so VAE-encoder inputs match.
+    """
+    frame_uint8 = np.clip(np.round(frame_uint8), 0, 255).astype(np.uint8)
+    t = TF.to_tensor(Image.fromarray(frame_uint8))  # [3, H, W] in [0, 1]
+    t = t * 255.0 / 128.0 - 1.0
+    return t.to(device=device, dtype=dtype).unsqueeze(0).unsqueeze(0)
+
+
+class CosmoshInferenceRuntime:
+    """Single-session Cosmosh runtime with action-bound chunk generation."""
+
+    def __init__(self, config: CosmoshRuntimeConfig | None = None) -> None:
+        self.config = config or CosmoshRuntimeConfig()
+
+        self.keyboard_state = KeyboardState()
+        self.vr_state = VRControllerState()
+        self.autoregressive_index = 0
+
+        self._device: torch.device | None = None
+        self._dtype: torch.dtype | None = None
+        self._pipeline: Any | None = None
+        self._encoder: Any | None = None
+        self._decoder: Any | None = None
+        self._action_target_dim: int = 0
+        self._inner_steps_per_block: int = 0
+        # Populated in _initialize_sync after validating against the model's
+        # num_action_per_latent_frame. Exposed publicly for the render loop
+        # so it can size its backpressure cap correctly.
+        self.actions_per_chunk: int = self.config.actions_per_chunk
+
+        # Action stats (populated in _initialize_sync) — passed to the
+        # integrator so rotation is normalised against the dataset stats.
+        self._psm1_rot6d_mean: np.ndarray | None = None
+        self._psm1_rot6d_std: np.ndarray | None = None
+        self._psm2_rot6d_mean: np.ndarray | None = None
+        self._psm2_rot6d_std: np.ndarray | None = None
+
+        self._text_embeddings: torch.Tensor | None = None
+        self._initial_cond_pixels: torch.Tensor | None = None
+        self._cond_pixels: torch.Tensor | None = None
+
+        self._closed = False
+        self._step_lock = asyncio.Lock()
+
+        # Built lazily after stats are loaded; defaults are safe enough for
+        # __init__ time (no rotation, identity baseline).
+        self.action_integrator = self._build_integrator()
+
+    def _build_integrator(self) -> CosmoshActionIntegrator:
+        """Construct the integrator using whatever stats have been loaded."""
+        kwargs: dict[str, Any] = {
+            "translate_v_per_frame": self.config.translate_v_per_frame,
+            "gripper_v_per_chunk": self.config.gripper_v_per_chunk,
+            "rotate_theta_per_frame": self.config.rotate_theta_per_frame,
+        }
+        if self._psm1_rot6d_mean is not None and self._psm1_rot6d_std is not None:
+            kwargs["psm1_rot6d_mean"] = self._psm1_rot6d_mean
+            kwargs["psm1_rot6d_std"] = self._psm1_rot6d_std
+        if self._psm2_rot6d_mean is not None and self._psm2_rot6d_std is not None:
+            kwargs["psm2_rot6d_mean"] = self._psm2_rot6d_mean
+            kwargs["psm2_rot6d_std"] = self._psm2_rot6d_std
+        return CosmoshActionIntegrator(**kwargs)
+
+    async def initialize(self) -> None:
+        if self._pipeline is not None:
+            return
+        await asyncio.to_thread(self._initialize_sync)
+
+    async def reset_for_new_session(self) -> None:
+        if self._closed:
+            raise CosmoshRuntimeError("Runtime is closed.")
+        if self._pipeline is None:
+            raise CosmoshRuntimeError("Runtime is not initialized.")
+        await asyncio.to_thread(self._reset_rollout_sync)
+
+    async def reset(self) -> None:
+        """In-session reset: clears keyboard / integrator / AR index and re-anchors
+        on the initial conditional frame. Serialised against in-flight chunks via
+        the step lock."""
+        if self._closed:
+            raise CosmoshRuntimeError("Runtime is closed.")
+        if self._pipeline is None:
+            raise CosmoshRuntimeError("Runtime is not initialized.")
+        async with self._step_lock:
+            await asyncio.to_thread(self._reset_rollout_sync)
+
+    def initial_frame_chunk(self) -> torch.Tensor:
+        """Return the conditional anchor frame as ``[1, 3, 1, H, W]`` on CPU.
+
+        The video track's ``enqueue_chunk`` accepts ``[B, C, T, H, W]``; with
+        ``T=1`` it produces a single RGB frame the browser can display while
+        the render loop is paused.
+        """
+        if self._initial_cond_pixels is None:
+            raise CosmoshRuntimeError("Runtime is not initialized.")
+        # ``_initial_cond_pixels`` is ``[1, 1, 3, H, W]``; permute to
+        # ``[1, 3, 1, H, W]`` to match the per-block video-chunk layout.
+        return (
+            self._initial_cond_pixels.permute(0, 2, 1, 3, 4)
+            .contiguous()
+            .detach()
+            .cpu()
+        )
+
+    async def close(self) -> None:
+        self._closed = True
+        await asyncio.to_thread(self._close_sync)
+
+    async def apply_actions_and_generate(
+        self, actions: list[dict[str, Any]]
+    ) -> CosmoshStepResult:
+        if self._closed:
+            raise CosmoshRuntimeError("Session is closed.")
+        if self._pipeline is None:
+            raise CosmoshRuntimeError("Runtime is not initialized.")
+
+        for action in actions:
+            event = str(action.get("event", "keydown")).strip().lower()
+            if event == "step":
+                LOGGER.debug(
+                    "Received step event with active_keys=%s",
+                    sorted(self.keyboard_state.snapshot()),
+                )
+                continue
+            raw_key = action.get("key", "")
+            key = str(raw_key) if raw_key else ""
+            if not key:
+                raise CosmoshRuntimeError(
+                    "Action payload must include non-empty 'key' for keydown/keyup."
+                )
+
+            applied = self.keyboard_state.apply_event(event=event, key=key)
+            if not applied:
+                raise CosmoshRuntimeError(
+                    f"Unsupported action payload: event={event!r}, key={key!r}."
+                )
+            LOGGER.debug(
+                "Applied control event=%s key=%s active_keys=%s "
+                "psm1_t=%s psm1_r=%s psm2_t=%s psm2_r=%s",
+                event,
+                key,
+                sorted(self.keyboard_state.snapshot()),
+                sorted(self.keyboard_state.psm1_translate_keys()),
+                sorted(self.keyboard_state.psm1_rotation_keys()),
+                sorted(self.keyboard_state.psm2_translate_keys()),
+                sorted(self.keyboard_state.psm2_rotation_keys()),
+            )
+
+        async with self._step_lock:
+            if self._closed:
+                raise CosmoshRuntimeError("Session is closed.")
+            return await asyncio.to_thread(self._generate_one_chunk_sync)
+
+    def apply_vr_input(self, payload: dict[str, Any]) -> bool:
+        """Update :attr:`vr_state` from a ``vr_input`` payload (Phase 3 VR path).
+
+        Synchronous + cheap: just delegates to :meth:`VRControllerState.apply_vr_input`,
+        which replaces per-arm sub-state with fresh dataclass instances. Safe
+        to call concurrently with the render loop — the integrator snapshots
+        ``vr_state`` at chunk start and operates on the immutable arm
+        instances captured at that moment.
+        """
+        if self._closed:
+            return False
+        return self.vr_state.apply_vr_input(payload)
+
+    async def generate_one_chunk_vr(self) -> CosmoshStepResult:
+        """Render one outer block from the latest :class:`VRControllerState`.
+
+        Serialised against keyboard / VR / reset paths via the step lock so
+        only one GPU pipeline call is in flight at a time.
+        """
+        if self._closed:
+            raise CosmoshRuntimeError("Session is closed.")
+        if self._pipeline is None:
+            raise CosmoshRuntimeError("Runtime is not initialized.")
+        async with self._step_lock:
+            if self._closed:
+                raise CosmoshRuntimeError("Session is closed.")
+            return await asyncio.to_thread(self._generate_one_chunk_vr_sync)
+
+    def _initialize_sync(self) -> None:
+        if self._pipeline is not None:
+            return
+
+        if not self.config.cr1_embeddings_path:
+            raise CosmoshRuntimeError(
+                "CosmoshRuntimeConfig.cr1_embeddings_path must be set."
+            )
+        if not self.config.input_path:
+            raise CosmoshRuntimeError(
+                "CosmoshRuntimeConfig.input_path must be set."
+            )
+        if not self.config.stats_path:
+            raise CosmoshRuntimeError(
+                "CosmoshRuntimeConfig.stats_path must be set "
+                "(stats_cosmos.json — needed for rotation normalisation)."
+            )
+        if not Path(self.config.cr1_embeddings_path).exists():
+            raise FileNotFoundError(
+                f"CR1 embeddings not found: {self.config.cr1_embeddings_path}"
+            )
+        if not Path(self.config.input_path).exists():
+            raise FileNotFoundError(
+                f"Input not found: {self.config.input_path}"
+            )
+        if not Path(self.config.stats_path).exists():
+            raise FileNotFoundError(
+                f"Action stats file not found: {self.config.stats_path}"
+            )
+        if self.config.config_name not in COSMOSH_CONFIG_BUILDERS:
+            supported = ", ".join(sorted(COSMOSH_CONFIG_BUILDERS))
+            raise ValueError(
+                f"Unknown config_name={self.config.config_name!r}. Supported: {supported}"
+            )
+
+        self._device = torch.device(self.config.device)
+        if self._device.type == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("CUDA is required for Cosmosh runtime.")
+
+        # Read the conditional first frame from either an image or a video.
+        # Size determines pipeline latent dims unless the user passed an
+        # explicit resolution.
+        cond_frame = _load_conditional_frame(
+            self.config.input_path, self.config.start_frame_idx
+        )
+        native_h = int(cond_frame.shape[0])
+        native_w = int(cond_frame.shape[1])
+        if self.config.resolution is None:
+            ht, wt = native_h, native_w
+        else:
+            ht, wt = self.config.resolution
+        if ht % WAN_SCR != 0 or wt % WAN_SCR != 0:
+            raise ValueError(
+                f"Resolution ({ht}, {wt}) must be divisible by Wan VAE spatial "
+                f"compression {WAN_SCR}."
+            )
+
+        ckpt_path = self.config.ckpt_path or AVAILABLE_COSMOSH_CHECKPOINT_PATHS["default"]
+        builder = COSMOSH_CONFIG_BUILDERS[self.config.config_name]
+        bundle = builder(
+            seed=self.config.seed,
+            checkpoint_path=ckpt_path,
+            compile_network=self.config.compile_network,
+            height=ht // WAN_SCR,
+            width=wt // WAN_SCR,
+        )
+        self._pipeline = bundle.pipeline.setup().to(self._device).eval()
+        self._encoder = bundle.vae_encoder.setup().to(self._device).eval()
+        self._decoder = bundle.vae_decoder.setup().to(self._device).eval()
+
+        transformer = self._pipeline.diffusion_model.transformer
+        cfg = transformer.config
+        self._dtype = cfg.dtype
+        actions_per_latent = cfg.network.num_action_per_latent_frame
+        requested = int(self.config.actions_per_chunk)
+        if requested <= 0 or requested % actions_per_latent != 0:
+            raise CosmoshRuntimeError(
+                f"actions_per_chunk={requested} must be a positive multiple of "
+                f"num_action_per_latent_frame={actions_per_latent} "
+                f"(valid examples: {actions_per_latent}, {2*actions_per_latent}, "
+                f"{3*actions_per_latent}, ...)."
+            )
+        self.actions_per_chunk = requested
+        self._inner_steps_per_block = 1 + requested // actions_per_latent
+        self._action_target_dim = int(cfg.network.action_dim)
+
+        text_embeddings_cpu = _load_cr1_text_embeddings(self.config.cr1_embeddings_path)
+        self._text_embeddings = text_embeddings_cpu.to(
+            device=self._device, dtype=self._dtype
+        )
+
+        stats = _load_action_stats(self.config.stats_path)
+        self._psm1_rot6d_mean = stats["psm1_rot6d_mean"]
+        self._psm1_rot6d_std = stats["psm1_rot6d_std"]
+        self._psm2_rot6d_mean = stats["psm2_rot6d_mean"]
+        self._psm2_rot6d_std = stats["psm2_rot6d_std"]
+
+        if (cond_frame.shape[0], cond_frame.shape[1]) != (ht, wt):
+            cond_frame = mediapy.resize_image(cond_frame, (ht, wt))
+        cond_pixels = _pixel_frame_to_neg1_pos1(
+            cond_frame, device=self._device, dtype=self._dtype
+        )
+        self._initial_cond_pixels = cond_pixels.clone()
+        self._cond_pixels = cond_pixels
+
+        self._reset_rollout_sync()
+
+        LOGGER.info(
+            "Cosmosh runtime initialized: config_name=%s resolution=%dx%d "
+            "action_dim=%d inner_steps=%d",
+            self.config.config_name,
+            ht,
+            wt,
+            self._action_target_dim,
+            self._inner_steps_per_block,
+        )
+
+    def _reset_rollout_sync(self) -> None:
+        if self._pipeline is None:
+            raise CosmoshRuntimeError("Runtime pipeline is not initialized.")
+        if self._initial_cond_pixels is None:
+            raise CosmoshRuntimeError("Runtime input state is not initialized.")
+
+        self.keyboard_state = KeyboardState()
+        self.vr_state = VRControllerState()
+        self.action_integrator = self._build_integrator()
+        self.autoregressive_index = 0
+        self._cond_pixels = self._initial_cond_pixels.clone()
+
+    def _close_sync(self) -> None:
+        pipeline = self._pipeline
+        encoder = self._encoder
+        decoder = self._decoder
+        self._pipeline = None
+        self._encoder = None
+        self._decoder = None
+        self._text_embeddings = None
+        self._initial_cond_pixels = None
+        self._cond_pixels = None
+
+        for obj in (pipeline, encoder, decoder):
+            if obj is not None:
+                del obj
+
+        if self._device is not None and self._device.type == "cuda":
+            torch.cuda.synchronize(device=self._device)
+            torch.cuda.empty_cache()
+
+    @torch.inference_mode()
+    def _generate_one_chunk_sync(self) -> CosmoshStepResult:
+        # Variable grippers: hold the open/close key on each arm to step the
+        # latched value toward the corresponding endpoint per generated chunk.
+        self.action_integrator.step_psm1_gripper(
+            self.keyboard_state.psm1_gripper_intent()
+        )
+        self.action_integrator.step_psm2_gripper(
+            self.keyboard_state.psm2_gripper_intent()
+        )
+
+        psm1_translate = self.keyboard_state.psm1_translate_keys()
+        psm1_rotation = self.keyboard_state.psm1_rotation_keys()
+        psm2_translate = self.keyboard_state.psm2_translate_keys()
+        psm2_rotation = self.keyboard_state.psm2_rotation_keys()
+        actions_np = self.action_integrator.next_action_chunk(
+            num_frames=self.actions_per_chunk,
+            psm1_translate_keys=psm1_translate,
+            psm1_rotation_keys=psm1_rotation,
+            psm2_translate_keys=psm2_translate,
+            psm2_rotation_keys=psm2_rotation,
+        )
+
+        LOGGER.debug(
+            "Rendering chunk=%s "
+            "psm1_t=%s psm1_r=%s psm1_g=%.3f "
+            "psm2_t=%s psm2_r=%s psm2_g=%.3f",
+            self.autoregressive_index,
+            sorted(psm1_translate),
+            sorted(psm1_rotation),
+            self.action_integrator.latched_gripper_psm1,
+            sorted(psm2_translate),
+            sorted(psm2_rotation),
+            self.action_integrator.latched_gripper_psm2,
+        )
+
+        return self._render_chunk_from_actions(actions_np)
+
+    @torch.inference_mode()
+    def _generate_one_chunk_vr_sync(self) -> CosmoshStepResult:
+        """VR variant of :meth:`_generate_one_chunk_sync`.
+
+        Snapshots the current :class:`VRControllerState` (latest-sample-wins
+        at chunk boundary) and routes through
+        :func:`cosmosh.webrtc.controls_quest.compute_action_chunk`, which
+        writes PSM1 translate (xyz), PSM1 rotation (rot6d) and PSM1
+        gripper. PSM2 slices stay at zero. GPU body is shared with the
+        keyboard path via :meth:`_render_chunk_from_actions`.
+
+        PSM1 rot6d stats live on the keyboard integrator (loaded from
+        ``stats_cosmos.json`` at init); we reuse them rather than threading
+        a second copy through the runtime.
+        """
+        state = self.vr_state
+        actions_np = compute_action_chunk(
+            state,
+            num_frames=self.actions_per_chunk,
+            translate_scale=self.config.translate_scale,
+            rotate_scale=self.config.rotate_scale,
+            psm1_rot6d_mean=self.action_integrator.psm1_rot6d_mean,
+            psm1_rot6d_std=self.action_integrator.psm1_rot6d_std,
+            psm1_rot6d_identity_norm=self.action_integrator._psm1_identity_rot6d_norm,
+            psm2_rot6d_mean=self.action_integrator.psm2_rot6d_mean,
+            psm2_rot6d_std=self.action_integrator.psm2_rot6d_std,
+            psm2_rot6d_identity_norm=self.action_integrator._psm2_identity_rot6d_norm,
+        )
+
+        LOGGER.debug(
+            "Rendering VR chunk=%s "
+            "right(dpos=%s drot=%s trigger=%.3f) "
+            "left(dpos=%s drot=%s trigger=%.3f)",
+            self.autoregressive_index,
+            state.right.dpos.tolist(),
+            state.right.drot.tolist(),
+            state.right.trigger,
+            state.left.dpos.tolist(),
+            state.left.drot.tolist(),
+            state.left.trigger,
+        )
+
+        return self._render_chunk_from_actions(actions_np)
+
+    def _render_chunk_from_actions(
+        self, actions_np: np.ndarray
+    ) -> CosmoshStepResult:
+        """Shared encoder + diffusion + decoder body.
+
+        Keyboard and VR paths differ only in how they compute ``actions_np``;
+        from here it's identical work — pad to ``action_target_dim``, run the
+        cache through ``inner_steps_per_block`` AR steps, decode, re-anchor
+        on the last pixel frame, return the 12 generated frames in
+        ``[B=1, C=3, T=12, H, W]`` layout on CPU.
+        """
+        if (
+            self._pipeline is None
+            or self._encoder is None
+            or self._decoder is None
+            or self._text_embeddings is None
+            or self._cond_pixels is None
+            or self._device is None
+            or self._dtype is None
+        ):
+            raise CosmoshRuntimeError("Runtime is not initialized.")
+
+        assert actions_np.shape == (self.actions_per_chunk, ACTION_DIM_NORMALISED)
+        actions_np = _pad_actions(actions_np, target_dim=self._action_target_dim)
+        actions_block = (
+            torch.from_numpy(actions_np)
+            .to(device=self._device, dtype=self._dtype)
+            .unsqueeze(0)
+        )  # [1, actions_per_chunk, action_dim]
+
+        image_embeddings = self._encoder(input=self._cond_pixels)
+
+        cache = self._pipeline.initialize_cache(
+            text_embeddings=self._text_embeddings,
+            image_embeddings=image_embeddings,
+            actions=actions_block,
+        )
+
+        latent_frames: list[torch.Tensor] = []
+        for ar_idx in range(self._inner_steps_per_block):
+            out_5d = self._pipeline.generate(ar_idx, cache)
+            latent_frames.append(out_5d)
+            if ar_idx < self._inner_steps_per_block - 1:
+                self._pipeline.finalize(ar_idx, cache)
+
+        block_latent = torch.cat(latent_frames, dim=1)
+        block_pixels = self._decoder(input=block_latent).clamp(min=-1.0, max=1.0)
+        # block_pixels layout: [1, T_pix, 3, H, W]; T_pix = 13 (1 cond + 12 gen).
+
+        # Re-anchor on the last frame for the next outer block.
+        self._cond_pixels = block_pixels[:, -1:, :, :, :]
+
+        # Hand the generated frames to the video track in [1, 3, T, H, W],
+        # where T = self.actions_per_chunk.
+        generated_b3thw = (
+            block_pixels[:, 1:].permute(0, 2, 1, 3, 4).contiguous()
+        )
+
+        result = CosmoshStepResult(
+            chunk_index=self.autoregressive_index,
+            num_frames=self.actions_per_chunk,
+            video_chunk=generated_b3thw.detach().cpu(),
+        )
+        self.autoregressive_index += 1
+        return result
+
+
+# Cap the video track's outstanding frame buffer at two outer blocks so a
+# faster-than-playback render loop doesn't pile up frames (and doesn't run
+# more than ~one chunk ahead of what the user is seeing). Sized against the
+# default chunk; if a config picks an unusually large chunk it can clamp to
+# slightly less than 2× chunks of buffer, which is acceptable for v1.
+_MAX_BUFFERED_FRAMES = 2 * DEFAULT_ACTIONS_PER_OUTER_BLOCK
+# Polling interval used by the render loop while waiting for the video track
+# queue to drain below the cap.
+_BACKPRESSURE_POLL_S = 0.05
+# How long ``close()`` will wait for an in-flight chunk to finish before
+# falling back to ``Task.cancel()``.
+_CLOSE_TIMEOUT_S = 30.0
+
+
+@dataclass(slots=True)
+class _ManagedCosmoshSession:
+    runtime: CosmoshInferenceRuntime
+    video_track: CosmoshVideoTrack
+    peer_connection: Any
+    control_channel: Any | None = None
+    render_task: asyncio.Task[Any] | None = None
+    render_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Set by ``_handle_datachannel_message`` whenever an action arrives. The
+    # render loop blocks on it before its first iteration (so the model isn't
+    # drifting on idle chunks before the user has done anything). In
+    # ``light_mode`` it's also cleared after each chunk if no keys remain held
+    # and no events are queued — that's what makes light mode "render only on
+    # input" instead of continuous.
+    first_action_event: asyncio.Event = field(default_factory=asyncio.Event)
+    pending_actions: list[dict[str, Any]] = field(default_factory=list)
+    # When True, the render loop idles whenever no input is active. When False
+    # (default), the loop runs continuously after the first user action.
+    light_mode: bool = False
+    closed: bool = False
+
+    async def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        # Unblock the render loop if it's still waiting on the first user
+        # action; otherwise close() would idle until the timeout fires.
+        self.first_action_event.set()
+
+        # Setting ``closed`` makes the render loop exit at its next checkpoint;
+        # we let the in-flight chunk finish so we don't leave the GPU thread
+        # mutating runtime state after we return. If the loop overruns, fall
+        # back to a hard cancel.
+        if self.render_task is not None and not self.render_task.done():
+            try:
+                await asyncio.wait_for(self.render_task, timeout=_CLOSE_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                self.render_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self.render_task
+            except asyncio.CancelledError:
+                pass
+            self.render_task = None
+        self.pending_actions.clear()
+
+        await self.video_track.close()
+        await self.peer_connection.close()
+
+
+class CosmoshWebRTCSessionManager:
+    """Owns one active WebRTC session and forwards actions into the Cosmosh runtime."""
+
+    def __init__(
+        self,
+        *,
+        runtime_config: CosmoshRuntimeConfig | None = None,
+        fps: int = 10,
+        light_mode: bool = False,
+    ) -> None:
+        self.runtime_config = runtime_config or CosmoshRuntimeConfig()
+        self.fps = fps
+        self.light_mode = light_mode
+        self._runtime = CosmoshInferenceRuntime(config=self.runtime_config)
+        self._runtime_ready = False
+        self._active_session: _ManagedCosmoshSession | None = None
+        self._session_lock = asyncio.Lock()
+
+    def has_active_session(self) -> bool:
+        return self._active_session is not None and not self._active_session.closed
+
+    def is_runtime_ready(self) -> bool:
+        return self._runtime_ready
+
+    async def preload_runtime(self) -> None:
+        if self._runtime_ready:
+            return
+        await self._runtime.initialize()
+        self._runtime_ready = True
+
+    async def create_answer(self, *, offer_sdp: str, offer_type: str) -> dict[str, str]:
+        try:
+            from aiortc import RTCPeerConnection, RTCSessionDescription
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "aiortc is required for WebRTC signaling. Install aiortc dependency."
+            ) from exc
+
+        async with self._session_lock:
+            if self._active_session is not None and not self._active_session.closed:
+                raise SessionBusyError("A Cosmosh session is already active.")
+
+            if not self._runtime_ready:
+                await self._runtime.initialize()
+                self._runtime_ready = True
+            await self._runtime.reset_for_new_session()
+
+            peer_connection = RTCPeerConnection()
+            video_track = CosmoshVideoTrack(fps=self.fps)
+            peer_connection.addTrack(video_track)
+            managed_session = _ManagedCosmoshSession(
+                runtime=self._runtime,
+                video_track=video_track,
+                peer_connection=peer_connection,
+                light_mode=self.light_mode,
+            )
+            self._active_session = managed_session
+
+            @peer_connection.on("datachannel")
+            def on_datachannel(channel: Any) -> None:
+                managed_session.control_channel = channel
+
+                @channel.on("message")
+                def on_message(message: Any) -> None:
+                    asyncio.create_task(
+                        self._handle_datachannel_message(
+                            managed_session=managed_session,
+                            raw_message=message,
+                        )
+                    )
+
+            @peer_connection.on("connectionstatechange")
+            async def on_connectionstatechange() -> None:
+                state = peer_connection.connectionState
+                if state == "connected" and managed_session.render_task is None:
+                    managed_session.render_task = asyncio.create_task(
+                        self._render_loop(managed_session=managed_session)
+                    )
+                if state in {"failed", "disconnected", "closed"}:
+                    await self.close_active_session()
+
+            try:
+                offer = RTCSessionDescription(sdp=offer_sdp, type=offer_type)
+                await peer_connection.setRemoteDescription(offer)
+                answer = await peer_connection.createAnswer()
+                await peer_connection.setLocalDescription(answer)
+                local_description = peer_connection.localDescription
+                if local_description is None:
+                    raise RuntimeError(
+                        "Peer connection did not produce local description."
+                    )
+                return {"sdp": local_description.sdp, "type": local_description.type}
+            except Exception:
+                LOGGER.exception("WebRTC negotiation failed while creating an answer.")
+                await managed_session.close()
+                self._active_session = None
+                raise
+
+    async def close_active_session(self) -> None:
+        async with self._session_lock:
+            if self._active_session is None:
+                return
+            active_session = self._active_session
+            self._active_session = None
+            await active_session.close()
+
+    async def shutdown(self) -> None:
+        await self.close_active_session()
+        await self._runtime.close()
+        self._runtime_ready = False
+
+    async def _handle_datachannel_message(
+        self,
+        *,
+        managed_session: _ManagedCosmoshSession,
+        raw_message: Any,
+    ) -> None:
+        channel = managed_session.control_channel
+        if channel is None or managed_session.closed:
+            return
+
+        if not isinstance(raw_message, str):
+            self._send_json(
+                channel, {"type": "error", "message": "Expected text payload."}
+            )
+            return
+
+        try:
+            payload = json.loads(raw_message)
+        except json.JSONDecodeError:
+            self._send_json(
+                channel, {"type": "error", "message": "Invalid JSON payload."}
+            )
+            return
+
+        if not isinstance(payload, dict):
+            self._send_json(
+                channel, {"type": "error", "message": "Payload must be a JSON object."}
+            )
+            return
+
+        message_type = payload.get("type")
+        if message_type == "reset":
+            await self._handle_reset(managed_session=managed_session)
+            return
+        if message_type != "action":
+            self._send_json(
+                channel,
+                {
+                    "type": "error",
+                    "message": "Unsupported message type, expected 'action' or 'reset'.",
+                },
+            )
+            return
+
+        action_payload = payload.get("action", payload)
+        if not isinstance(action_payload, dict):
+            self._send_json(
+                channel, {"type": "error", "message": "'action' must be an object."}
+            )
+            return
+
+        # The render loop drains pending_actions at the top of each iteration
+        # (under the render lock) — incoming events just update server state.
+        managed_session.pending_actions.append(action_payload)
+        # Unblock the render loop's first-action gate; subsequent calls are
+        # no-ops since asyncio.Event stays set once flipped.
+        managed_session.first_action_event.set()
+
+    async def _handle_reset(
+        self, *, managed_session: _ManagedCosmoshSession
+    ) -> None:
+        channel = managed_session.control_channel
+        if channel is None or managed_session.closed:
+            return
+
+        # The render lock guarantees no chunk is in flight while we mutate
+        # runtime state and drain the video track. The lock acquisition will
+        # block at most one chunk's worth of inference time.
+        try:
+            async with managed_session.render_lock:
+                managed_session.pending_actions.clear()
+                await managed_session.runtime.reset()
+                dropped = managed_session.video_track.drain_pending()
+                # Re-arm the input gate so the render loop pauses on its
+                # next iteration, then push the conditional anchor frame so
+                # the browser shows the starting pose instead of the last
+                # generated frame from the pre-reset rollout.
+                managed_session.first_action_event.clear()
+                initial_chunk = managed_session.runtime.initial_frame_chunk()
+                await managed_session.video_track.enqueue_chunk(initial_chunk)
+        except Exception as exc:
+            LOGGER.exception("Cosmosh runtime reset failed.")
+            self._send_json(channel, {"type": "error", "message": str(exc)})
+            return
+
+        LOGGER.info("Reset: cleared rollout state and %d pending frames.", dropped)
+        self._send_json(
+            channel,
+            {"type": "reset_done", "dropped_frames": dropped},
+        )
+
+    async def _render_loop(
+        self, *, managed_session: _ManagedCosmoshSession
+    ) -> None:
+        """Generate chunks while the session is connected.
+
+        Pushes the conditional anchor frame to the video track immediately so
+        the browser has something to display, then pauses on
+        ``first_action_event`` until a user action arrives. Each iteration
+        drains pending action events, runs one outer block under the render
+        lock, enqueues the result, and emits ``chunk_done``. Backpressure is
+        enforced outside the lock by polling the video track's queue size —
+        when the buffer is at capacity, the loop sleeps and yields the lock
+        so reset can interrupt.
+
+        In default (continuous) mode the loop runs back-to-back once the first
+        action arrives. In ``light_mode`` it additionally idles after each
+        chunk if no keys remain held and no events are queued, waking up the
+        next time the user submits an action.
+        """
+        channel = managed_session.control_channel
+        try:
+            try:
+                async with managed_session.render_lock:
+                    initial_chunk = managed_session.runtime.initial_frame_chunk()
+                    await managed_session.video_track.enqueue_chunk(initial_chunk)
+            except Exception:
+                LOGGER.exception("Failed to enqueue initial conditional frame.")
+
+            while not managed_session.closed:
+                # Pause until the next user action. Set on action append,
+                # cleared on reset.
+                await managed_session.first_action_event.wait()
+                if managed_session.closed:
+                    break
+
+                # Backpressure: don't run ahead of playback by more than the cap.
+                while (
+                    not managed_session.closed
+                    and managed_session.video_track.qsize() >= _MAX_BUFFERED_FRAMES
+                ):
+                    await asyncio.sleep(_BACKPRESSURE_POLL_S)
+                if managed_session.closed:
+                    break
+
+                actions = managed_session.pending_actions
+                managed_session.pending_actions = []
+
+                try:
+                    async with managed_session.render_lock:
+                        if managed_session.closed:
+                            break
+                        result = await managed_session.runtime.apply_actions_and_generate(
+                            actions
+                        )
+                        enqueued = await managed_session.video_track.enqueue_chunk(
+                            result.video_chunk
+                        )
+                except Exception as exc:
+                    LOGGER.exception("Render loop chunk failed.")
+                    self._send_json(channel, {"type": "error", "message": str(exc)})
+                    break
+
+                # Light mode: idle the loop until the next user action when
+                # there's nothing live to render. Continuous mode leaves the
+                # event set so the next iteration's ``await`` returns
+                # immediately. Safe to mutate the event here without a lock —
+                # the datachannel handler can only run at an ``await`` point,
+                # and the next iteration's ``wait()`` is the next one.
+                if (
+                    managed_session.light_mode
+                    and not managed_session.closed
+                    and not managed_session.runtime.keyboard_state.pressed_keys
+                    and not managed_session.pending_actions
+                ):
+                    managed_session.first_action_event.clear()
+
+                LOGGER.debug(
+                    "Rendered chunk=%s num_frames=%s enqueued=%s qsize=%s "
+                    "light=%s",
+                    result.chunk_index,
+                    result.num_frames,
+                    enqueued,
+                    managed_session.video_track.qsize(),
+                    managed_session.light_mode,
+                )
+                self._send_json(
+                    channel,
+                    {
+                        "type": "chunk_done",
+                        "chunk_index": result.chunk_index,
+                        "num_frames": result.num_frames,
+                        "enqueued_frames": enqueued,
+                    },
+                )
+        except asyncio.CancelledError:
+            return
+
+    @staticmethod
+    def _send_json(channel: Any, payload: dict[str, Any]) -> None:
+        try:
+            channel.send(json.dumps(payload))
+        except Exception:
+            return

@@ -18,7 +18,7 @@
 AVAILABLE_COSMOSH_CHECKPOINT_PATHS: dict[str, str] = {
     # CosmosH 2B EMA, action_dim=44, temporal_compression_ratio=4.
     # Single-file .pt extracted from the upstream DCP checkpoint.
-    "default": "/localhome/local-javierg/checkpoints/model_ema_bf16.pt",
+    "default": "checkpoints/model_ema_bf16.pt",
 }
 """Canonical CosmosH checkpoint paths. Keys are the variant shorthand;
 values are local paths or ``s3://`` URIs."""
