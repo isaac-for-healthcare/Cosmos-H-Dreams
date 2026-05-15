@@ -130,3 +130,5 @@ AGENTS.md
 .cursor/
 .claude/
 .agents/
+checkpoints/
+sf_inference_data/
