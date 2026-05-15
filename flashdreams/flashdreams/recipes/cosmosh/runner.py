@@ -175,6 +175,15 @@ class CosmoshRunner(Runner[CosmoshRunnerConfig, CosmoshPipeline]):
         assert isinstance(tcfg, CosmosHTransformerConfig)
         tcfg.height = new_h // WAN_SCR
         tcfg.width = new_w // WAN_SCR
+        # ``__post_init__`` derives ``_pT / _pH / _pW / _steady_ar_idx`` from
+        # the latent dims and runs only once at dataclass construction (during
+        # bundle build). The DiT reads those derived fields when ``setup()``
+        # builds RoPE tables + the patchifier, so the mutation above is a
+        # no-op for the network unless we re-run the post-init to refresh
+        # them. Without this, the VAE encoder produces a latent at the new
+        # resolution while the DiT stays sized for the bundle default and
+        # ``_maybe_inject_image`` fails with a token-count mismatch.
+        tcfg.__post_init__()
 
         super().__init__(config)
         # The base ``Runner`` already built + pinned the pipeline to
@@ -461,6 +470,29 @@ class CosmoshRunner(Runner[CosmoshRunnerConfig, CosmoshPipeline]):
                 f"  steady-state: {steady_blocks_count} blocks in "
                 f"{steady_blocks_total:.2f}s -> {steady_fps:.2f} FPS "
                 f"({steady_frames} generated frames)"
+            )
+
+        # Per-stage averages in milliseconds. Prefer steady-state blocks when
+        # we have them so the numbers aren't dragged by the warmup block's
+        # compile + CUDA-graph capture cost; fall back to all blocks for
+        # single-block entries.
+        if self.is_rank_zero and block_total:
+            if steady_blocks_count > 0:
+                stage_slice = slice(1, None)
+                avg_count = steady_blocks_count
+                avg_label = "steady block"
+            else:
+                stage_slice = slice(None)
+                avg_count = len(block_total)
+                avg_label = "block (warmup only)"
+            avg_encode_ms = sum(block_encode[stage_slice]) / avg_count * 1000.0
+            avg_gen_ms = sum(block_gen[stage_slice]) / avg_count * 1000.0
+            avg_decode_ms = sum(block_decode[stage_slice]) / avg_count * 1000.0
+            avg_total_ms = sum(block_total[stage_slice]) / avg_count * 1000.0
+            logger.info(
+                f"  avg per {avg_label}: encode={avg_encode_ms:.1f}ms "
+                f"gen={avg_gen_ms:.1f}ms decode={avg_decode_ms:.1f}ms "
+                f"total={avg_total_ms:.1f}ms"
             )
 
         if not self.is_rank_zero:

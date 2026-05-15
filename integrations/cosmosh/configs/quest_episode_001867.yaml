@@ -9,7 +9,7 @@ runtime:
   compile_network: true
   device: cuda:0
   seed: 1
-  ckpt_path: checkpoints/model_ema_jhutabletop_bf16.pt  # null → AVAILABLE_COSMOSH_CHECKPOINT_PATHS["default"]
+  ckpt_path: checkpoints/jhu/tabletop/model_ema_bf16_jhutabletop_288x512.pt  # null → AVAILABLE_COSMOSH_CHECKPOINT_PATHS["default"]
   cr1_embeddings_path: sf_inference_data/cr1_empty_string_text_embeddings.pt
   input_path: sf_inference_data/260206/suturebot_inference_data/episode_001867.mp4
   stats_path: sf_inference_data/260206/stats_cosmos.json
