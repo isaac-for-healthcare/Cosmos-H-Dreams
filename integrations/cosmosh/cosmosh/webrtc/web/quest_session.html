@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cosmosh Quest — Pose Capture (Phase 1)</title>
+  <link rel="stylesheet" href="/static/quest_session.css">
+</head>
+
+<body>
+  <main class="container">
+    <section class="controls">
+      <h1>Cosmosh Quest</h1>
+      <p class="hint">
+        Page auto-connects to <code>/ws</code> on load. Tap
+        <strong>Enter VR</strong> to start streaming.
+      </p>
+      <p class="hint">
+        <strong>Stripped baseline:</strong> only the
+        <strong>right controller's position</strong> is wired right now,
+        driving PSM1 translate. Rotation, gripper, left controller, and
+        everything else are deliberately disconnected — we're rebuilding
+        the movement model from scratch.
+      </p>
+      <p class="hint">
+        <strong>Reset</strong> the simulation with the button below, or by
+        <strong>holding the right controller's B button for 1 s</strong>
+        while in VR.
+      </p>
+      <div class="buttonRow">
+        <button id="enterVrButton" type="button" disabled>Enter VR</button>
+        <button id="resetButton" type="button" disabled>Reset</button>
+      </div>
+      <div class="status">
+        <span>WS:</span>
+        <strong id="wsText">connecting…</strong>
+      </div>
+      <div class="status">
+        <span>XR:</span>
+        <strong id="xrText">idle</strong>
+      </div>
+      <div class="status">
+        <span>Sent:</span>
+        <strong id="rateText">0 msg/s</strong>
+      </div>
+    </section>
+
+    <section class="videoPane">
+      <img id="remoteVideo" src="/video" alt="Cosmosh stream" />
+    </section>
+
+    <section class="logPane">
+      <h2>Event Log</h2>
+      <pre id="eventLog"></pre>
+    </section>
+  </main>
+
+  <script src="/static/quest_session.js" type="module"></script>
+</body>
+
+</html>

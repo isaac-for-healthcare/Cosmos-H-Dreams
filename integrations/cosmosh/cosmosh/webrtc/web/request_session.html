@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cosmosh WebRTC Viewer</title>
+  <link rel="stylesheet" href="/static/request_session.css">
+</head>
+
+<body>
+  <main class="container">
+    <section class="controls">
+      <h1>Cosmosh WebRTC Viewer</h1>
+      <p class="hint">
+        <strong>PSM1 (right arm — right hand):</strong>
+        translate <kbd>↑</kbd>/<kbd>↓</kbd> ±y,
+        <kbd>←</kbd>/<kbd>→</kbd> ±x,
+        <kbd>PgUp</kbd>/<kbd>PgDn</kbd> ±z;
+        rotate <kbd>Shift</kbd>+arrows,
+        <kbd>,</kbd>/<kbd>.</kbd> roll;
+        gripper <kbd>;</kbd>/<kbd>'</kbd>.
+      </p>
+      <p class="hint">
+        <strong>PSM2 (left arm — left hand):</strong>
+        translate <kbd>W</kbd>/<kbd>S</kbd> ±y,
+        <kbd>A</kbd>/<kbd>D</kbd> ±x,
+        <kbd>R</kbd>/<kbd>F</kbd> ±z;
+        rotate <kbd>Shift</kbd>+<kbd>W</kbd>/<kbd>S</kbd>/<kbd>A</kbd>/<kbd>D</kbd>,
+        <kbd>Q</kbd>/<kbd>E</kbd> roll;
+        gripper <kbd>Space</kbd>/<kbd>C</kbd>.
+      </p>
+      <button id="connectButton" type="button">Connect Session</button>
+      <button id="resetButton" type="button" disabled>Reset</button>
+      <div class="status">
+        <span>Status:</span>
+        <strong id="statusText">idle</strong>
+      </div>
+      <div class="status">
+        <span>Control flow:</span>
+        <strong id="flowText">waiting</strong>
+      </div>
+    </section>
+
+    <section class="videoPane">
+      <video id="remoteVideo" autoplay playsinline muted></video>
+    </section>
+
+    <section class="logPane">
+      <h2>Event Log</h2>
+      <pre id="eventLog"></pre>
+    </section>
+  </main>
+
+  <script src="/static/request_session.js" type="module"></script>
+</body>
+
+</html>

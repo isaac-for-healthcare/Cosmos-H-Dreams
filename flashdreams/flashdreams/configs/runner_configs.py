@@ -57,6 +57,7 @@ import tyro
 # calls against ``_SUPPORTED_RUNNERS``. Listed explicitly (no auto-walk
 # of ``flashdreams.recipes``) so the in-tree inventory is one grep away.
 import flashdreams.recipes.alpadreams.config  # noqa: F401, E402
+import flashdreams.recipes.cosmosh.config  # noqa: F401, E402
 import flashdreams.recipes.lingbot_world.config  # noqa: F401, E402
 import flashdreams.recipes.template.config  # noqa: F401, E402
 from flashdreams.configs.registry import (
