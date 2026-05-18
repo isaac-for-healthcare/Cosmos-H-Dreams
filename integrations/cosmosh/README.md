@@ -48,7 +48,7 @@ uv run --package flash-cosmosh python -m cosmosh.webrtc.server_quest \
 Then open:
 
 - [http://localhost:8080/request_session](http://localhost:8080/request_session) — keyboard viewer
-- `https://<workstation-ip>:8443/quest_session` — Quest viewer (HTTPS)
+- `https://<workstation-ip>:8443/quest` — Quest viewer (HTTPS)
 - `/healthz` on either port reports `runtime_ready`
 
 Override ports/hosts without editing YAML by passing `--host` / `--port` on

@@ -294,7 +294,7 @@ def get_keyboard_settings(cfg: dict[str, Any]) -> dict[str, Any]:
 
 
 _DISPLAY_DEFAULTS: dict[str, float] = {
-    # Match the historical hardcoded quad in quest_session.js so flipping
+    # Match the historical hardcoded quad in quest.js so flipping
     # this on for the first time doesn't visually change anything.
     "width_m": 0.4,
     "height_m": 0.3,

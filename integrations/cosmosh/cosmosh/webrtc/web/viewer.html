@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CosmosH-Surgical-Simulator — Spectator View</title>
+  <link rel="stylesheet" href="/static/viewer.css">
+</head>
+
+<body>
+  <header class="topbar">
+    <h1>CosmosH-Surgical-Simulator — Spectator View</h1>
+    <div class="status">
+      <span id="videoText" class="badge badge-idle">video: connecting…</span>
+      <span id="eventsText" class="badge badge-idle">events: connecting…</span>
+    </div>
+  </header>
+  <main class="container">
+    <section class="videoPane">
+      <img id="remoteVideo" src="/video" alt="Cosmosh stream" />
+    </section>
+    <section class="logPane">
+      <h2>Activity</h2>
+      <pre id="eventLog"></pre>
+    </section>
+  </main>
+
+  <script src="/static/viewer.js" type="module"></script>
+</body>
+
+</html>
