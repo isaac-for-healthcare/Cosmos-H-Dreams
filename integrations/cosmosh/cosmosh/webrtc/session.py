@@ -46,6 +46,23 @@ class SessionBusyError(RuntimeError):
     """Raised when a second peer tries to open a session."""
 
 
+@dataclass(slots=True, frozen=True)
+class Scene:
+    """A switchable scene — the per-conditioning inputs the runtime can swap.
+
+    Light-switch contract: ``config_name`` / ``ckpt_path`` / ``resolution`` /
+    ``actions_per_chunk`` are model-level and shared across scenes (changing
+    any of them would force a ``torch.compile`` recapture). Everything that
+    can change cheaply lives on :class:`Scene`.
+    """
+
+    name: str
+    input_path: str
+    stats_path: str
+    cr1_embeddings_path: str
+    start_frame_idx: int = 0
+
+
 @dataclass(slots=True)
 class CosmoshRuntimeConfig:
     config_name: str = "lightvae_lighttae"
@@ -250,6 +267,12 @@ class CosmoshInferenceRuntime:
         self._closed = False
         self._step_lock = asyncio.Lock()
 
+        # Name of the currently-loaded scene (set by callers via
+        # :meth:`set_active_scene_name` or :meth:`set_scene`). Independent of
+        # ``config`` because the runtime is initialised with one scene's
+        # fields but doesn't otherwise know about the scene list.
+        self._active_scene_name: str | None = None
+
         # Built lazily after stats are loaded; defaults are safe enough for
         # __init__ time (no rotation, identity baseline).
         self.action_integrator = self._build_integrator()
@@ -291,6 +314,35 @@ class CosmoshInferenceRuntime:
             raise CosmoshRuntimeError("Runtime is not initialized.")
         async with self._step_lock:
             await asyncio.to_thread(self._reset_rollout_sync)
+
+    async def set_scene(self, scene: Scene) -> None:
+        """Switch to a different scene without re-loading the model.
+
+        Re-loads the conditional frame, action stats, and CR1 embeddings from
+        the paths in ``scene``; rebuilds the action integrator; resets the
+        rollout state so the next chunk starts from the new anchor frame. The
+        model itself (pipeline / encoder / decoder / compiled CUDA graphs) is
+        untouched — the switch takes ~one encoder pass plus the file reads,
+        no ``torch.compile`` recapture.
+
+        Serialised against in-flight chunks via the step lock. The new scene's
+        files are validated before any state is mutated, so a typo can't
+        leave the runtime half-switched.
+        """
+        if self._closed:
+            raise CosmoshRuntimeError("Runtime is closed.")
+        if self._pipeline is None:
+            raise CosmoshRuntimeError("Runtime is not initialized.")
+        async with self._step_lock:
+            await asyncio.to_thread(self._set_scene_sync, scene)
+
+    @property
+    def active_scene_name(self) -> str | None:
+        return self._active_scene_name
+
+    def set_active_scene_name(self, name: str | None) -> None:
+        """Record the initial scene's name (called once at startup by the server)."""
+        self._active_scene_name = name
 
     def initial_frame_chunk(self) -> torch.Tensor:
         """Return the conditional anchor frame as ``[1, 3, 1, H, W]`` on CPU.
@@ -515,6 +567,70 @@ class CosmoshInferenceRuntime:
         self.action_integrator = self._build_integrator()
         self.autoregressive_index = 0
         self._cond_pixels = self._initial_cond_pixels.clone()
+
+    def _set_scene_sync(self, scene: Scene) -> None:
+        if self._pipeline is None:
+            raise CosmoshRuntimeError("Runtime pipeline is not initialized.")
+        if (
+            self._initial_cond_pixels is None
+            or self._device is None
+            or self._dtype is None
+        ):
+            raise CosmoshRuntimeError("Runtime is not initialized.")
+
+        # Validate paths before mutating any state so a typo can't leave the
+        # runtime half-switched.
+        for path, label in (
+            (scene.input_path, "input_path"),
+            (scene.stats_path, "stats_path"),
+            (scene.cr1_embeddings_path, "cr1_embeddings_path"),
+        ):
+            if not path or not Path(path).exists():
+                raise FileNotFoundError(
+                    f"Scene {scene.name!r}: {label} not found: {path}"
+                )
+
+        # Resolution is fixed at startup (changing it would force a compile
+        # recapture, which violates the light-switch contract). Take it from
+        # the existing conditional pixels' shape — ``[1, 1, 3, H, W]``.
+        ht = int(self._initial_cond_pixels.shape[-2])
+        wt = int(self._initial_cond_pixels.shape[-1])
+
+        cond_frame = _load_conditional_frame(scene.input_path, scene.start_frame_idx)
+        if (cond_frame.shape[0], cond_frame.shape[1]) != (ht, wt):
+            cond_frame = mediapy.resize_image(cond_frame, (ht, wt))
+        cond_pixels = _pixel_frame_to_neg1_pos1(
+            cond_frame, device=self._device, dtype=self._dtype
+        )
+
+        text_embeddings_cpu = _load_cr1_text_embeddings(scene.cr1_embeddings_path)
+        text_embeddings = text_embeddings_cpu.to(
+            device=self._device, dtype=self._dtype
+        )
+
+        stats = _load_action_stats(scene.stats_path)
+
+        # Commit. (Above can raise; only here do we touch ``self``.)
+        self._psm1_rot6d_mean = stats["psm1_rot6d_mean"]
+        self._psm1_rot6d_std = stats["psm1_rot6d_std"]
+        self._psm2_rot6d_mean = stats["psm2_rot6d_mean"]
+        self._psm2_rot6d_std = stats["psm2_rot6d_std"]
+        self._text_embeddings = text_embeddings
+        self._initial_cond_pixels = cond_pixels.clone()
+        self._cond_pixels = cond_pixels
+        self._active_scene_name = scene.name
+
+        self.keyboard_state = KeyboardState()
+        self.vr_state = VRControllerState()
+        self.action_integrator = self._build_integrator()
+        self.autoregressive_index = 0
+
+        LOGGER.info(
+            "Switched scene to %r (input=%s stats=%s).",
+            scene.name,
+            scene.input_path,
+            scene.stats_path,
+        )
 
     def _close_sync(self) -> None:
         pipeline = self._pipeline
@@ -756,11 +872,16 @@ class CosmoshWebRTCSessionManager:
         runtime_config: CosmoshRuntimeConfig | None = None,
         fps: int = 10,
         light_mode: bool = False,
+        scenes: list[Scene] | None = None,
     ) -> None:
         self.runtime_config = runtime_config or CosmoshRuntimeConfig()
         self.fps = fps
         self.light_mode = light_mode
+        self.scenes: list[Scene] = list(scenes) if scenes else []
+        self._scenes_by_name: dict[str, Scene] = {s.name: s for s in self.scenes}
         self._runtime = CosmoshInferenceRuntime(config=self.runtime_config)
+        if self.scenes:
+            self._runtime.set_active_scene_name(self.scenes[0].name)
         self._runtime_ready = False
         self._active_session: _ManagedCosmoshSession | None = None
         self._session_lock = asyncio.Lock()
@@ -770,6 +891,9 @@ class CosmoshWebRTCSessionManager:
 
     def is_runtime_ready(self) -> bool:
         return self._runtime_ready
+
+    def get_scene(self, name: str) -> Scene | None:
+        return self._scenes_by_name.get(name)
 
     async def preload_runtime(self) -> None:
         if self._runtime_ready:
@@ -892,12 +1016,20 @@ class CosmoshWebRTCSessionManager:
         if message_type == "reset":
             await self._handle_reset(managed_session=managed_session)
             return
+        if message_type == "set_scene":
+            await self._handle_set_scene(
+                managed_session=managed_session, payload=payload
+            )
+            return
         if message_type != "action":
             self._send_json(
                 channel,
                 {
                     "type": "error",
-                    "message": "Unsupported message type, expected 'action' or 'reset'.",
+                    "message": (
+                        "Unsupported message type, expected "
+                        "'action', 'reset', or 'set_scene'."
+                    ),
                 },
             )
             return
@@ -947,6 +1079,57 @@ class CosmoshWebRTCSessionManager:
         self._send_json(
             channel,
             {"type": "reset_done", "dropped_frames": dropped},
+        )
+
+    async def _handle_set_scene(
+        self,
+        *,
+        managed_session: _ManagedCosmoshSession,
+        payload: dict[str, Any],
+    ) -> None:
+        channel = managed_session.control_channel
+        if channel is None or managed_session.closed:
+            return
+        raw_name = payload.get("name")
+        if not isinstance(raw_name, str) or not raw_name:
+            self._send_json(
+                channel,
+                {"type": "error", "message": "set_scene requires non-empty 'name'."},
+            )
+            return
+        scene = self.get_scene(raw_name)
+        if scene is None:
+            self._send_json(
+                channel,
+                {"type": "error", "message": f"Unknown scene: {raw_name!r}"},
+            )
+            return
+
+        # Same render-lock contract as reset: drain pending actions and the
+        # video track, swap the runtime's scene, push the new anchor frame.
+        try:
+            async with managed_session.render_lock:
+                managed_session.pending_actions.clear()
+                await managed_session.runtime.set_scene(scene)
+                dropped = managed_session.video_track.drain_pending()
+                managed_session.first_action_event.clear()
+                initial_chunk = managed_session.runtime.initial_frame_chunk()
+                await managed_session.video_track.enqueue_chunk(initial_chunk)
+        except Exception as exc:
+            LOGGER.exception("Scene switch to %r failed.", raw_name)
+            self._send_json(channel, {"type": "error", "message": str(exc)})
+            return
+
+        LOGGER.info(
+            "Scene switched to %r; cleared %d pending frames.", scene.name, dropped
+        )
+        self._send_json(
+            channel,
+            {
+                "type": "scene_set",
+                "name": scene.name,
+                "dropped_frames": dropped,
+            },
         )
 
     async def _render_loop(

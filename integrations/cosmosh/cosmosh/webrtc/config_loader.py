@@ -11,13 +11,29 @@ Schema (full)::
       device: cuda:0
       seed: 1
       ckpt_path: null                       # null → default checkpoint
-      cr1_embeddings_path: /path/to/cr1.pt
-      input_path: /path/to/input.mp4
-      stats_path: /path/to/stats_cosmos.json
-      start_frame_idx: 0
       resolution: [288, 512]                # or null for native
       fps: 10
       actions_per_chunk: 12                 # Must divide num_action_per_latent_frame
+      # Per-scene fields (input_path / stats_path / cr1_embeddings_path /
+      # start_frame_idx) can live here as a backwards-compat shorthand for a
+      # single 'default' scene. When ``scenes:`` is present they should live
+      # there instead.
+
+    # Optional. List of scenes the user can switch between from the UI.
+    # Light switching only: the model (config_name / ckpt_path / resolution /
+    # actions_per_chunk) is shared across all scenes — only the conditional
+    # input, action stats, and CR1 embeddings change. If omitted, a single
+    # 'default' scene is synthesised from the runtime: fields.
+    scenes:
+      - name: episode_001867
+        input_path: /path/to/episode_001867.mp4
+        stats_path: /path/to/stats_cosmos.json
+        cr1_embeddings_path: /path/to/cr1.pt
+        start_frame_idx: 0
+      - name: chole
+        input_path: /path/to/chole_frame0.png
+        stats_path: /path/to/stats_cosmos_chole.json
+        cr1_embeddings_path: /path/to/cr1.pt
 
     # Keyboard server only
     keyboard:
@@ -68,13 +84,13 @@ from typing import Any
 
 import yaml
 
-from cosmosh.webrtc.session import CosmoshRuntimeConfig
+from cosmosh.webrtc.session import CosmoshRuntimeConfig, Scene
 
 LOGGER = logging.getLogger(__name__)
 
 # Top-level keys recognised by the loader. Anything else triggers a warning
 # (typo guard — silently-ignored keys are the worst kind of config bug).
-_KNOWN_TOP_LEVEL = frozenset({"runtime", "keyboard", "vr", "video", "server"})
+_KNOWN_TOP_LEVEL = frozenset({"runtime", "keyboard", "vr", "video", "server", "scenes"})
 
 
 class ConfigError(ValueError):
@@ -190,7 +206,76 @@ def _parse_resolution(value: Any) -> tuple[int, int] | None:
     )
 
 
-def build_runtime_config(cfg: dict[str, Any], *, role: str) -> CosmoshRuntimeConfig:
+def parse_scenes(cfg: dict[str, Any]) -> list[Scene]:
+    """Parse the optional ``scenes:`` list into ordered :class:`Scene` entries.
+
+    If ``scenes:`` is absent, synthesise a single ``"default"`` scene from
+    the ``runtime:`` block's per-scene fields (``input_path``,
+    ``stats_path``, ``cr1_embeddings_path``, ``start_frame_idx``). This keeps
+    legacy single-scene configs working unchanged.
+
+    Names must be unique. Anything except ``name`` / ``start_frame_idx``
+    that's missing or empty is a hard error — the scene wouldn't be
+    switchable-to without those files.
+    """
+    raw = cfg.get("scenes")
+    if raw is None:
+        runtime = cfg.get("runtime")
+        if not isinstance(runtime, dict):
+            raise ConfigError("Missing required section: runtime")
+        return [
+            Scene(
+                name="default",
+                input_path=str(
+                    _require(runtime, "input_path", section_name="runtime")
+                ),
+                stats_path=str(
+                    _require(runtime, "stats_path", section_name="runtime")
+                ),
+                cr1_embeddings_path=str(
+                    _require(runtime, "cr1_embeddings_path", section_name="runtime")
+                ),
+                start_frame_idx=int(runtime.get("start_frame_idx", 0)),
+            )
+        ]
+
+    if not isinstance(raw, list) or not raw:
+        raise ConfigError("scenes: must be a non-empty list when present.")
+
+    scenes: list[Scene] = []
+    seen_names: set[str] = set()
+    for idx, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            raise ConfigError(f"scenes[{idx}] must be a mapping; got {entry!r}")
+        name = str(_require(entry, "name", section_name=f"scenes[{idx}]")).strip()
+        if not name:
+            raise ConfigError(f"scenes[{idx}].name must be non-empty.")
+        if name in seen_names:
+            raise ConfigError(f"Duplicate scene name {name!r}.")
+        seen_names.add(name)
+        scenes.append(
+            Scene(
+                name=name,
+                input_path=str(
+                    _require(entry, "input_path", section_name=f"scenes[{name}]")
+                ),
+                stats_path=str(
+                    _require(entry, "stats_path", section_name=f"scenes[{name}]")
+                ),
+                cr1_embeddings_path=str(
+                    _require(
+                        entry, "cr1_embeddings_path", section_name=f"scenes[{name}]"
+                    )
+                ),
+                start_frame_idx=int(entry.get("start_frame_idx", 0)),
+            )
+        )
+    return scenes
+
+
+def build_runtime_config(
+    cfg: dict[str, Any], *, role: str, scenes: list[Scene] | None = None
+) -> CosmoshRuntimeConfig:
     """Map a loaded YAML dict onto a :class:`CosmoshRuntimeConfig`.
 
     ``role`` ∈ ``{"keyboard", "quest"}`` decides which input-tuning section
@@ -201,6 +286,11 @@ def build_runtime_config(cfg: dict[str, Any], *, role: str) -> CosmoshRuntimeCon
       - ``"quest"``: ``vr.{translate_scale, rotate_scale}`` → translate_scale,
         rotate_scale.
 
+    The first :class:`Scene` in ``scenes`` (or as parsed by
+    :func:`parse_scenes` when ``scenes`` is ``None``) seeds the per-scene
+    fields. The runtime starts on that scene; subsequent switches go
+    through :meth:`CosmoshInferenceRuntime.set_scene`.
+
     Defaults for missing fields come from :class:`CosmoshRuntimeConfig` itself.
     """
     if role not in {"keyboard", "quest"}:
@@ -209,6 +299,12 @@ def build_runtime_config(cfg: dict[str, Any], *, role: str) -> CosmoshRuntimeCon
     runtime = cfg.get("runtime")
     if not isinstance(runtime, dict):
         raise ConfigError("Missing required section: runtime")
+
+    if scenes is None:
+        scenes = parse_scenes(cfg)
+    if not scenes:
+        raise ConfigError("Expected at least one scene.")
+    initial_scene = scenes[0]
 
     defaults = CosmoshRuntimeConfig()
     ckpt_path = runtime.get("ckpt_path")
@@ -221,14 +317,10 @@ def build_runtime_config(cfg: dict[str, Any], *, role: str) -> CosmoshRuntimeCon
         seed=int(runtime.get("seed", defaults.seed)),
         device=str(runtime.get("device", defaults.device)),
         ckpt_path=ckpt_path,
-        cr1_embeddings_path=str(
-            _require(runtime, "cr1_embeddings_path", section_name="runtime")
-        ),
-        input_path=str(_require(runtime, "input_path", section_name="runtime")),
-        stats_path=str(_require(runtime, "stats_path", section_name="runtime")),
-        start_frame_idx=int(
-            runtime.get("start_frame_idx", defaults.start_frame_idx)
-        ),
+        cr1_embeddings_path=initial_scene.cr1_embeddings_path,
+        input_path=initial_scene.input_path,
+        stats_path=initial_scene.stats_path,
+        start_frame_idx=initial_scene.start_frame_idx,
         resolution=_parse_resolution(runtime.get("resolution")),
         fps=int(runtime.get("fps", defaults.fps)),
         actions_per_chunk=int(

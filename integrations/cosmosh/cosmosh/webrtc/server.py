@@ -12,6 +12,7 @@ from cosmosh.webrtc.config_loader import (
     get_keyboard_settings,
     get_server_settings,
     load_yaml_config,
+    parse_scenes,
 )
 from cosmosh.webrtc.session import (
     CosmoshWebRTCSessionManager,
@@ -132,6 +133,18 @@ def create_app(
             }
         )
 
+    async def scenes_list(request: web.Request) -> web.StreamResponse:
+        manager = request.app["session_manager"]
+        return web.json_response(
+            {
+                "scenes": [
+                    {"name": s.name, "start_frame_idx": s.start_frame_idx}
+                    for s in manager.scenes
+                ],
+                "active": manager.scenes[0].name if manager.scenes else None,
+            }
+        )
+
     async def on_startup(app: web.Application) -> None:
         manager = app["session_manager"]
         LOGGER.info("Preloading Cosmosh runtime on startup.")
@@ -146,6 +159,7 @@ def create_app(
     app.router.add_get("/request_session", request_session_page)
     app.router.add_post("/api/webrtc/offer", offer)
     app.router.add_get("/healthz", healthz)
+    app.router.add_get("/api/scenes", scenes_list)
     app.router.add_static("/static/", WEB_DIR, show_index=False)
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
@@ -160,7 +174,8 @@ def main() -> None:
     )
 
     cfg = load_yaml_config(args.config)
-    runtime_config = build_runtime_config(cfg, role="keyboard")
+    scenes = parse_scenes(cfg)
+    runtime_config = build_runtime_config(cfg, role="keyboard", scenes=scenes)
     server_settings = get_server_settings(cfg)
     keyboard_settings = get_keyboard_settings(cfg)
 
@@ -172,6 +187,12 @@ def main() -> None:
         runtime_config=runtime_config,
         fps=runtime_config.fps,
         light_mode=light_mode,
+        scenes=scenes,
+    )
+    LOGGER.info(
+        "Scenes: %s (initial=%r)",
+        [s.name for s in scenes],
+        scenes[0].name,
     )
     if light_mode:
         LOGGER.info("Light mode enabled: rendering only while input is held.")
