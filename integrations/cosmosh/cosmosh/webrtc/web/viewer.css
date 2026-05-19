@@ -103,6 +103,30 @@ body {
   color: #6b7488;
 }
 
+/* Reset button in the admin topbar. Styled to match badges visually but
+   with a click affordance and a slightly more emphatic border so it
+   doesn't disappear next to the status pills. */
+.admin-button {
+  font-size: 0.82rem;
+  padding: 0.22rem 0.7rem;
+  border-radius: 999px;
+  border: 1px solid #4a3a2a;
+  background: #2a1f15;
+  color: #f0c89a;
+  cursor: pointer;
+  font-family: inherit;
+  letter-spacing: 0.02em;
+}
+
+.admin-button:hover:not(:disabled) {
+  background: #3a2a1c;
+}
+
+.admin-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
 .container {
   flex: 1;
   min-height: 0;

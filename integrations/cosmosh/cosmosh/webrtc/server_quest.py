@@ -318,6 +318,34 @@ class QuestSessionManager:
             with contextlib.suppress(Exception):
                 await previous_ws.close()
 
+    async def reset(self, *, source: str = "user") -> None:
+        """Reset the shared rollout and push the anchor frame to the MJPEG sink.
+
+        Safe to call whether or not a ws is connected — the spectator
+        always sees the anchor frame even when nobody is driving. ``source``
+        is just used for log + viewer-event messaging ("user" for in-VR
+        reset, "admin" for the spectator-page Reset button).
+        """
+        async with self._render_lock:
+            self._first_action_event.clear()
+            if self._runtime_ready:
+                await self._runtime.reset()
+                await self._push_chunk_to_sink(
+                    self._runtime.initial_frame_chunk()
+                )
+        self._reset_cooldown_until = (
+            time.monotonic() + self._reset_cooldown_s
+        )
+        LOGGER.info(
+            "Runtime reset (%s). vr_input ignored for %.1fs.",
+            source,
+            self._reset_cooldown_s,
+        )
+        label = "Admin reset" if source == "admin" else "User reset"
+        self._viewer_events.publish(
+            "reset", f"{label} (anchor frame restored)."
+        )
+
     async def kick_active_ws(self) -> None:
         """Close the currently-active ws (if any) without attaching a replacement.
 
@@ -371,21 +399,7 @@ class QuestSessionManager:
             self._first_action_event.set()
             return
         if msg_type == "reset":
-            async with self._render_lock:
-                self._first_action_event.clear()
-                if self._runtime_ready:
-                    await self._runtime.reset()
-                    await self._push_chunk_to_sink(
-                        self._runtime.initial_frame_chunk()
-                    )
-            self._reset_cooldown_until = (
-                time.monotonic() + self._reset_cooldown_s
-            )
-            LOGGER.info(
-                "Runtime reset on user request. vr_input ignored for %.1fs.",
-                self._reset_cooldown_s,
-            )
-            self._viewer_events.publish("reset", "User reset (anchor frame restored).")
+            await self.reset(source="user")
             return
         if msg_type == "set_scene":
             raw_name = payload.get("name")
@@ -684,6 +698,11 @@ def create_app(
         # they're applied after the wire payload lands on the server.
         return web.json_response(request.app["vr_browser_settings"])
 
+    async def admin_reset(request: web.Request) -> web.StreamResponse:
+        mgr: QuestSessionManager = request.app["manager"]
+        await mgr.reset(source="admin")
+        return web.json_response({"ok": True, "driver": "quest"})
+
     async def scenes_list(request: web.Request) -> web.StreamResponse:
         mgr: QuestSessionManager = request.app["manager"]
         return web.json_response(
@@ -710,6 +729,7 @@ def create_app(
     app.router.add_get("/healthz", healthz)
     app.router.add_get("/vr_config", vr_config)
     app.router.add_get("/scenes", scenes_list)
+    app.router.add_post("/admin/reset", admin_reset)
     app.router.add_static("/static/", WEB_DIR, show_index=False)
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)

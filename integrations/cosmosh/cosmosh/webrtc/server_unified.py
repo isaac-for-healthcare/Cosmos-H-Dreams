@@ -202,6 +202,25 @@ def create_app(
             }
         )
 
+    async def admin_reset(_: web.Request) -> web.StreamResponse:
+        # Reset whichever side is currently driving. If the keyboard side
+        # is active we route through its session so its WebRTC video track
+        # gets drained; otherwise we go through the Quest manager (which
+        # works whether or not a ws is connected — the spectator MJPEG
+        # sink still shows the anchor frame). If no one's driving, fall
+        # back to the Quest path so the spectator view still re-anchors.
+        if kbd_manager.has_active_session():
+            did_reset = await kbd_manager.reset_active_session()
+            if did_reset:
+                quest_manager.viewer_events.publish(
+                    "reset", "Admin reset (keyboard session)."
+                )
+                return web.json_response({"ok": True, "driver": "keyboard"})
+        await quest_manager.reset(source="admin")
+        return web.json_response(
+            {"ok": True, "driver": _current_driver()}
+        )
+
     async def vr_config(request: web.Request) -> web.StreamResponse:
         return web.json_response(request.app["vr_browser_settings"])
 
@@ -253,6 +272,7 @@ def create_app(
     # Shared
     app.router.add_get("/healthz", healthz)
     app.router.add_get("/admin/status", admin_status)
+    app.router.add_post("/admin/reset", admin_reset)
     app.router.add_static("/static/", WEB_DIR, show_index=False)
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
