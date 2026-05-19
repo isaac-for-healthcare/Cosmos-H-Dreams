@@ -329,28 +329,67 @@ def build_runtime_config(
     )
 
     if role == "keyboard":
-        keyboard = cfg.get("keyboard", {}) or {}
-        kwargs["translate_v_per_frame"] = float(
-            keyboard.get("translate_v_per_frame", defaults.translate_v_per_frame)
-        )
-        kwargs["gripper_v_per_chunk"] = float(
-            keyboard.get("gripper_v_per_chunk", defaults.gripper_v_per_chunk)
-        )
-        # Config exposes degrees (human-friendly); dataclass stores radians.
-        rotate_deg = float(keyboard.get("rotate_deg_per_frame", 1.0))
-        kwargs["rotate_theta_per_frame"] = math.radians(rotate_deg)
+        _apply_keyboard_kwargs(cfg, defaults, kwargs)
     else:  # quest
-        vr = cfg.get("vr", {}) or {}
-        if "translate_scale" in vr:
-            kwargs["translate_scale"] = _parse_translate_scale(vr["translate_scale"])
-        else:
-            kwargs["translate_scale"] = defaults.translate_scale
-        if "rotate_scale" in vr:
-            kwargs["rotate_scale"] = _parse_rotate_scale(vr["rotate_scale"])
-        else:
-            kwargs["rotate_scale"] = defaults.rotate_scale
+        _apply_quest_kwargs(cfg, defaults, kwargs)
 
     return CosmoshRuntimeConfig(**kwargs)
+
+
+def _apply_keyboard_kwargs(
+    cfg: dict[str, Any],
+    defaults: CosmoshRuntimeConfig,
+    kwargs: dict[str, Any],
+) -> None:
+    keyboard = cfg.get("keyboard", {}) or {}
+    kwargs["translate_v_per_frame"] = float(
+        keyboard.get("translate_v_per_frame", defaults.translate_v_per_frame)
+    )
+    kwargs["gripper_v_per_chunk"] = float(
+        keyboard.get("gripper_v_per_chunk", defaults.gripper_v_per_chunk)
+    )
+    # Config exposes degrees (human-friendly); dataclass stores radians.
+    rotate_deg = float(keyboard.get("rotate_deg_per_frame", 1.0))
+    kwargs["rotate_theta_per_frame"] = math.radians(rotate_deg)
+
+
+def _apply_quest_kwargs(
+    cfg: dict[str, Any],
+    defaults: CosmoshRuntimeConfig,
+    kwargs: dict[str, Any],
+) -> None:
+    vr = cfg.get("vr", {}) or {}
+    if "translate_scale" in vr:
+        kwargs["translate_scale"] = _parse_translate_scale(vr["translate_scale"])
+    else:
+        kwargs["translate_scale"] = defaults.translate_scale
+    if "rotate_scale" in vr:
+        kwargs["rotate_scale"] = _parse_rotate_scale(vr["rotate_scale"])
+    else:
+        kwargs["rotate_scale"] = defaults.rotate_scale
+
+
+def build_runtime_config_unified(
+    cfg: dict[str, Any], *, scenes: list[Scene] | None = None
+) -> CosmoshRuntimeConfig:
+    """Variant of :func:`build_runtime_config` that fills both role's knobs.
+
+    The unified server shares one :class:`CosmoshInferenceRuntime` across the
+    keyboard and Quest managers; we populate both keyboard-side
+    (``translate_v_per_frame`` / ``gripper_v_per_chunk`` /
+    ``rotate_theta_per_frame``) and quest-side (``translate_scale`` /
+    ``rotate_scale``) tuning so the runtime can serve either render path
+    without reloading. Missing sections fall back to dataclass defaults.
+    """
+    # Reuse the keyboard path's kwargs (it already validates runtime / scenes)
+    # and then layer the quest knobs on top.
+    rc = build_runtime_config(cfg, role="keyboard", scenes=scenes)
+    defaults = CosmoshRuntimeConfig()
+    vr_kwargs: dict[str, Any] = {}
+    _apply_quest_kwargs(cfg, defaults, vr_kwargs)
+    for key, value in vr_kwargs.items():
+        setattr(rc, key, value)
+    return rc
 
 
 def get_server_settings(cfg: dict[str, Any]) -> dict[str, Any]:

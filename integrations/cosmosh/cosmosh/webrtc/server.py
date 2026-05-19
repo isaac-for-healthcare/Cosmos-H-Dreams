@@ -40,7 +40,7 @@ def get_external_ip() -> str:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Cosmosh WebRTC server: serves /request_session and streams "
+            "Cosmosh WebRTC server: serves /keyboard and streams "
             "action-bound video chunks over a single peer connection. "
             "All experiment parameters live in a YAML config (--config); "
             "CLI overrides are limited to runtime / deployment knobs."
@@ -86,7 +86,7 @@ def create_app(
     app = web.Application()
     app["session_manager"] = manager
 
-    async def request_session_page(_: web.Request) -> web.StreamResponse:
+    async def keyboard_page(_: web.Request) -> web.StreamResponse:
         return web.FileResponse(WEB_DIR / "request_session.html")
 
     async def offer(request: web.Request) -> web.StreamResponse:
@@ -156,7 +156,7 @@ def create_app(
         LOGGER.info("Shutting down Cosmosh runtime.")
         await manager.shutdown()
 
-    app.router.add_get("/request_session", request_session_page)
+    app.router.add_get("/keyboard", keyboard_page)
     app.router.add_post("/api/webrtc/offer", offer)
     app.router.add_get("/healthz", healthz)
     app.router.add_get("/api/scenes", scenes_list)

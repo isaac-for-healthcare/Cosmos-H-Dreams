@@ -8,7 +8,7 @@ import logging
 import ssl
 import time
 from collections import deque
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -222,19 +222,26 @@ class QuestSessionManager:
         fps: int,
         jpeg_quality: int,
         scenes: list[Scene] | None = None,
+        runtime: CosmoshInferenceRuntime | None = None,
     ) -> None:
         self.runtime_config = runtime_config
         self.fps = fps
         self.jpeg_quality = jpeg_quality
         self.scenes: list[Scene] = list(scenes) if scenes else []
         self._scenes_by_name: dict[str, Scene] = {s.name: s for s in self.scenes}
-        self._runtime = CosmoshInferenceRuntime(config=runtime_config)
-        if self.scenes:
+        # ``runtime`` lets the unified server share one runtime across the
+        # keyboard and Quest managers; otherwise we own a private instance.
+        self._runtime = runtime or CosmoshInferenceRuntime(config=runtime_config)
+        if self.scenes and self._runtime.active_scene_name is None:
             self._runtime.set_active_scene_name(self.scenes[0].name)
         self._runtime_ready = False
         self._sink = MJPEGSink()
         self._ws: web.WebSocketResponse | None = None
         self._render_task: asyncio.Task[Any] | None = None
+        # Optional async hook called immediately before a new ws is attached.
+        # The unified server uses this to close any active keyboard session
+        # so only one driver is touching the shared runtime at a time.
+        self.on_take_over: Callable[[], Awaitable[None]] | None = None
         # One lock serialises: render, reset, ws attach/detach. Keeps the
         # control flow trivially deadlock-free at the cost of waiting up to
         # one chunk's worth of (render + push) latency on reset / attach.
@@ -291,11 +298,18 @@ class QuestSessionManager:
         in VR. The render loop's input gate is cleared so we don't keep
         generating from stale state across the reconnect window.
         """
+        # Takeover: in the unified server, a new ws means any active
+        # keyboard session should be dropped so only one driver is touching
+        # the shared runtime at a time. No-op when running quest-only.
+        if self.on_take_over is not None:
+            with contextlib.suppress(Exception):
+                await self.on_take_over()
         async with self._render_lock:
             previous_ws = self._ws
             self._ws = ws
             self._first_action_event.clear()
             self._reset_cooldown_until = 0.0
+        self._viewer_events.publish("driver", "quest")
         if previous_ws is not None and not previous_ws.closed:
             LOGGER.info(
                 "Kicking previous ws (single-session contract) — a new "
@@ -303,6 +317,34 @@ class QuestSessionManager:
             )
             with contextlib.suppress(Exception):
                 await previous_ws.close()
+
+    async def kick_active_ws(self) -> None:
+        """Close the currently-active ws (if any) without attaching a replacement.
+
+        Used by the unified server's cross-kick: when a keyboard session
+        takes over, the Quest ws should be dropped (and its render loop go
+        idle) so the shared runtime isn't being driven from two sides.
+
+        Close code 4001 (application-defined) tells the Quest browser this
+        was a deliberate cross-driver kick — quest.js suppresses its 2 s
+        auto-reconnect for that code so the keyboard session isn't
+        immediately kicked back. The user comes back via the "Take over"
+        button.
+        """
+        async with self._render_lock:
+            previous_ws = self._ws
+            self._ws = None
+            self._first_action_event.clear()
+        if previous_ws is not None and not previous_ws.closed:
+            LOGGER.info("Quest ws kicked by cross-driver takeover.")
+            # The keyboard side will publish "driver: keyboard" once its
+            # peer connection finishes negotiating; flicker through "idle"
+            # is acceptable and matches the brief takeover gap.
+            self._viewer_events.publish("driver", "idle")
+            with contextlib.suppress(Exception):
+                await previous_ws.close(
+                    code=4001, message=b"taken over by other driver"
+                )
 
     async def detach_ws(self, ws: web.WebSocketResponse) -> None:
         """Drop the ws reference if it's still the one we own.
@@ -313,6 +355,7 @@ class QuestSessionManager:
         if self._ws is ws:
             self._ws = None
             self._first_action_event.clear()
+            self._viewer_events.publish("driver", "idle")
 
     async def handle_message(self, payload: dict[str, Any]) -> None:
         msg_type = payload.get("type")

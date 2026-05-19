@@ -51,12 +51,12 @@ async def _build_client(manager: FakeSessionManager) -> TestClient:
 
 
 @pytest.mark.asyncio
-async def test_request_session_serves_html() -> None:
+async def test_keyboard_serves_html() -> None:
     manager = FakeSessionManager()
     client = await _build_client(manager)
     try:
         assert manager.preload_calls == 1
-        response = await client.get("/request_session")
+        response = await client.get("/keyboard")
         body = await response.text()
         assert response.status == 200
         assert "Cosmosh WebRTC Viewer" in body

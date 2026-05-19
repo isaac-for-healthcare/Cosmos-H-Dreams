@@ -10,8 +10,14 @@
 
 <body>
   <header class="topbar">
-    <h1>CosmosH-Surgical-Simulator — Spectator View</h1>
+    <h1>CosmosH-Surgical-Simulator — Admin View</h1>
     <div class="status">
+      <span id="driverBadge" class="badge driver-badge driver-unknown">
+        driver: <strong id="driverText">unknown</strong>
+      </span>
+      <span id="sceneBadge" class="badge">
+        scene: <strong id="sceneText">…</strong>
+      </span>
       <span id="videoText" class="badge badge-idle">video: connecting…</span>
       <span id="eventsText" class="badge badge-idle">events: connecting…</span>
     </div>

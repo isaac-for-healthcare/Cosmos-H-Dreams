@@ -64,6 +64,45 @@ body {
   color: #e8b6b6;
 }
 
+/* Larger / more prominent driver badge — this is the main "who has control"
+   indicator at the top of the admin view. */
+.driver-badge {
+  font-size: 0.92rem;
+  padding: 0.28rem 0.75rem;
+  letter-spacing: 0.02em;
+}
+
+.driver-badge strong {
+  text-transform: uppercase;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  margin-left: 0.25rem;
+}
+
+.driver-keyboard {
+  border-color: #2f4a6b;
+  background: #1a2030;
+  color: #b6cae8;
+}
+
+.driver-quest {
+  border-color: #6b2f5a;
+  background: #2a1a26;
+  color: #e8b6da;
+}
+
+.driver-idle {
+  border-color: #3a3f4d;
+  background: #161b29;
+  color: #9aa3b5;
+}
+
+.driver-unknown {
+  border-color: #3a3f4d;
+  background: #161b29;
+  color: #6b7488;
+}
+
 .container {
   flex: 1;
   min-height: 0;

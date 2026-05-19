@@ -1,5 +1,6 @@
 const enterVrButton = document.getElementById("enterVrButton")
 const resetButton = document.getElementById("resetButton")
+const takeOverButton = document.getElementById("takeOverButton")
 const wsText = document.getElementById("wsText")
 const xrText = document.getElementById("xrText")
 const rateText = document.getElementById("rateText")
@@ -11,6 +12,16 @@ const sceneSelect = document.getElementById("sceneSelect")
 // dropdown if the user picks a scene the server rejects, or before the ws is
 // up.
 let activeScene = null
+
+// Application-defined ws close code used by the unified server when the
+// keyboard side takes over the shared runtime. The default behaviour is to
+// auto-reconnect 2 s after any close; on code 4001 we suppress that so the
+// keyboard session isn't immediately kicked back.
+const WS_CLOSE_CROSS_DRIVER_KICK = 4001
+// True while the Quest user is yielding to the keyboard driver. Set on a
+// 4001 close, cleared whenever we deliberately reconnect (via the "Take
+// over" button) so future non-deliberate closes still auto-retry.
+let yieldedToOtherDriver = false
 
 let ws = null
 let xrSession = null
@@ -268,12 +279,22 @@ function connectWs() {
       setXr("WebXR unavailable")
     }
   }
-  ws.onclose = () => {
-    logEvent("ws closed, reconnecting in 2s")
-    setWs("closed (retrying)")
+  ws.onclose = (event) => {
     enterVrButton.disabled = true
     resetButton.disabled = true
     sceneSelect.disabled = true
+    if (event && event.code === WS_CLOSE_CROSS_DRIVER_KICK) {
+      // Deliberate kick by the unified server — keyboard driver took over.
+      // Don't auto-reconnect (we'd just re-kick the keyboard session 2 s
+      // later); surface a button so the user can come back when ready.
+      yieldedToOtherDriver = true
+      logEvent("yielded to other driver (keyboard); click Take over to resume")
+      setWs("yielded (other driver active)")
+      takeOverButton.hidden = false
+      return
+    }
+    logEvent("ws closed, reconnecting in 2s")
+    setWs("closed (retrying)")
     setTimeout(connectWs, 2000)
   }
   ws.onerror = () => logEvent("ws error")
@@ -296,6 +317,17 @@ function sendReset() {
 }
 
 resetButton.addEventListener("click", () => sendReset())
+
+takeOverButton.addEventListener("click", () => {
+  // Clear the yield flag and force a fresh ws connection. attach_ws on
+  // the server calls on_take_over, which closes any active keyboard
+  // session, putting us back in the driver seat.
+  yieldedToOtherDriver = false
+  takeOverButton.hidden = true
+  setWs("connecting (taking over)…")
+  logEvent("take over clicked — reconnecting ws")
+  connectWs()
+})
 
 async function fetchScenes() {
   try {

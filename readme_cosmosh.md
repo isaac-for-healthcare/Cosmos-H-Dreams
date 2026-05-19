@@ -19,8 +19,9 @@ The guide has two parts after the shared setup:
   or benchmark numbers.
 - **Mode B — Interactive WebRTC** (section 7) — start the
   `integrations/cosmosh/` WebRTC server and drive the rollout live
-  from either a keyboard (browser) or a Meta Quest headset (WebXR).
-  No action `.npy` needed; the browser / headset is the input device.
+  from either a keyboard (browser) or a Meta Quest headset (WebXR),
+  or both at once through the unified server. No action `.npy` needed;
+  the browser / headset is the input device.
 
 Both modes share the same recipe runtime — the same checkpoint, the
 same outer-block render loop, the same first-block warmup. Pick the
@@ -259,7 +260,7 @@ uv run --package flash-cosmosh python -m cosmosh.webrtc.server \
   --config integrations/cosmosh/configs/keyboard_episode_001867.yaml
 ```
 
-Then open **<http://0.0.0.0:8080/request_session>** in any
+Then open **<http://0.0.0.0:8080/keyboard>** in any
 browser. The viewer page handles SDP signaling on its own — once it
 loads, you should see the conditional first frame and can start
 driving with the keys documented in `integrations/cosmosh/README.md`
@@ -300,7 +301,38 @@ On the Quest browser, open **`https://<bridge-pc-lan-ip>:8443/quest`**.
 Accept the self-signed-cert warning, click **Enter VR**, and you're
 in. **Hold `B` on the Meta Quest controller to reset the simulation**
 (server drains the queue and re-anchors on the initial conditional
-frame).
+frame). **Hold `Y` on the left controller for 1 s to exit immersive
+mode** and drop back to the 2D landing page.
+
+### Unified — keyboard + Quest on one port
+
+For a demo booth where users can drive either from a browser or a
+Quest headset, the unified server mounts both demos on a single HTTPS
+port sharing one rollout. Whichever side connects most recently
+drives; the other side's connection is closed automatically (takeover
+semantics — kicked Quest clients see a "Take over" button to come
+back). One-time setup is the same as the Quest path (developer-mode
+headset + self-signed cert), since WebXR requires HTTPS regardless.
+
+```bash
+uv run --package flash-cosmosh python -m cosmosh.webrtc.server_unified \
+  --config integrations/cosmosh/configs/unified_tabletop.yaml
+```
+
+URLs once running (HTTPS on the configured port — default `8443`):
+
+| Path | What |
+|---|---|
+| `/` | Landing page with links to the demos. |
+| `/keyboard` | Keyboard demo (WebRTC, any browser). |
+| `/quest` | Quest demo (open in the Quest browser; WebXR). |
+| `/viewer` | Admin / spectator view — shows who's driving, the active scene, and the rendered stream. |
+
+The YAML schema is the union of the keyboard and Quest schemas
+(`runtime` + `scenes` + `keyboard` + `vr` + `video` + `server`); the
+`scenes:` list lets users switch scenes live from the in-page
+dropdown on either side. See `integrations/cosmosh/configs/unified_tabletop.yaml`
+for a working example.
 
 ---
 
