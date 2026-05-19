@@ -5,7 +5,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Cosmosh Quest — Pose Capture (Phase 1)</title>
-  <link rel="stylesheet" href="/static/quest_session.css">
+  <link rel="stylesheet" href="/static/quest.css">
 </head>
 
 <body>
@@ -28,6 +28,17 @@
         <strong>holding the right controller's B button for 1 s</strong>
         while in VR.
       </p>
+      <p class="hint">
+        <strong>Exit VR</strong> by
+        <strong>holding the left controller's Y button for 1 s</strong>,
+        or via the Meta system button.
+      </p>
+      <div class="sceneRow">
+        <label for="sceneSelect">Scene:</label>
+        <select id="sceneSelect" disabled>
+          <option value="">loading…</option>
+        </select>
+      </div>
       <div class="buttonRow">
         <button id="enterVrButton" type="button" disabled>Enter VR</button>
         <button id="resetButton" type="button" disabled>Reset</button>
@@ -56,7 +67,7 @@
     </section>
   </main>
 
-  <script src="/static/quest_session.js" type="module"></script>
+  <script src="/static/quest.js" type="module"></script>
 </body>
 
 </html>

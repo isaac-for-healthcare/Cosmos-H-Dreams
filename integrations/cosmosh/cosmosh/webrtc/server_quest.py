@@ -7,6 +7,9 @@ import json
 import logging
 import ssl
 import time
+from collections import deque
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -20,8 +23,9 @@ from cosmosh.webrtc.config_loader import (
     get_video_settings,
     get_vr_browser_settings,
     load_yaml_config,
+    parse_scenes,
 )
-from cosmosh.webrtc.session import CosmoshInferenceRuntime, CosmoshRuntimeConfig
+from cosmosh.webrtc.session import CosmoshInferenceRuntime, CosmoshRuntimeConfig, Scene
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 LOGGER = logging.getLogger(__name__)
@@ -62,7 +66,7 @@ def _encode_frame_to_jpeg(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Cosmosh Quest server: serves /quest_session, accepts 'vr_input' "
+            "Cosmosh Quest server: serves /quest, accepts 'vr_input' "
             "on /ws, streams generated frames on /video. All experiment "
             "parameters live in a YAML config (--config). CLI overrides "
             "are limited to runtime / deployment knobs."
@@ -140,6 +144,61 @@ class MJPEGSink:
 
 
 # ---------------------------------------------------------------------------
+# Spectator event broadcaster.
+#
+# Server-side fan-out of short, human-readable events ("Headset connected",
+# "User reset", …) to passive viewer pages over SSE. The MJPEG sink already
+# broadcasts the model output; this is just the matching log channel so
+# spectators can see *what's happening* alongside what's being rendered.
+#
+# Latest-events-wins per subscriber: a slow viewer drops the oldest queued
+# event and the producer never blocks. New subscribers replay the recent
+# ring buffer so opening the page mid-demo doesn't start from a blank log.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class _ViewerEvent:
+    type: str
+    message: str
+    t_ms: float
+
+
+class _ViewerEventBroadcaster:
+    def __init__(self, *, ring_size: int = 200, queue_size: int = 64) -> None:
+        self._ring: deque[_ViewerEvent] = deque(maxlen=ring_size)
+        self._subscribers: set[asyncio.Queue[_ViewerEvent]] = set()
+        self._queue_size = queue_size
+
+    def publish(self, event_type: str, message: str) -> None:
+        evt = _ViewerEvent(
+            type=event_type, message=message, t_ms=time.monotonic() * 1000.0
+        )
+        self._ring.append(evt)
+        for q in list(self._subscribers):
+            # Drop the oldest queued event on overflow so a stalled viewer's
+            # queue can't grow without bound and the producer never awaits.
+            if q.full():
+                with contextlib.suppress(asyncio.QueueEmpty):
+                    q.get_nowait()
+            with contextlib.suppress(asyncio.QueueFull):
+                q.put_nowait(evt)
+
+    @contextlib.asynccontextmanager
+    async def subscribe(self) -> AsyncIterator[asyncio.Queue[_ViewerEvent]]:
+        q: asyncio.Queue[_ViewerEvent] = asyncio.Queue(maxsize=self._queue_size)
+        # Replay the tail of the ring (clipped to queue capacity so the
+        # initial enqueue can't itself overflow).
+        for evt in list(self._ring)[-self._queue_size :]:
+            q.put_nowait(evt)
+        self._subscribers.add(q)
+        try:
+            yield q
+        finally:
+            self._subscribers.discard(q)
+
+
+# ---------------------------------------------------------------------------
 # Quest session manager — runtime + ws + sink + render loop.
 # ---------------------------------------------------------------------------
 
@@ -162,11 +221,16 @@ class QuestSessionManager:
         runtime_config: CosmoshRuntimeConfig,
         fps: int,
         jpeg_quality: int,
+        scenes: list[Scene] | None = None,
     ) -> None:
         self.runtime_config = runtime_config
         self.fps = fps
         self.jpeg_quality = jpeg_quality
+        self.scenes: list[Scene] = list(scenes) if scenes else []
+        self._scenes_by_name: dict[str, Scene] = {s.name: s for s in self.scenes}
         self._runtime = CosmoshInferenceRuntime(config=runtime_config)
+        if self.scenes:
+            self._runtime.set_active_scene_name(self.scenes[0].name)
         self._runtime_ready = False
         self._sink = MJPEGSink()
         self._ws: web.WebSocketResponse | None = None
@@ -185,10 +249,15 @@ class QuestSessionManager:
         self._reset_cooldown_until: float = 0.0
         self._reset_cooldown_s: float = 1.0
         self._closed = False
+        self._viewer_events = _ViewerEventBroadcaster()
 
     @property
     def sink(self) -> MJPEGSink:
         return self._sink
+
+    @property
+    def viewer_events(self) -> _ViewerEventBroadcaster:
+        return self._viewer_events
 
     @property
     def runtime_ready(self) -> bool:
@@ -206,6 +275,7 @@ class QuestSessionManager:
         await self._runtime.initialize()
         self._runtime_ready = True
         LOGGER.info("Cosmosh runtime ready.")
+        self._viewer_events.publish("info", "Runtime ready.")
         # /video clients connecting before any ws get the anchor frame.
         async with self._render_lock:
             await self._push_chunk_to_sink(self._runtime.initial_frame_chunk())
@@ -272,9 +342,53 @@ class QuestSessionManager:
                 "Runtime reset on user request. vr_input ignored for %.1fs.",
                 self._reset_cooldown_s,
             )
+            self._viewer_events.publish("reset", "User reset (anchor frame restored).")
+            return
+        if msg_type == "set_scene":
+            raw_name = payload.get("name")
+            if not isinstance(raw_name, str) or not raw_name:
+                LOGGER.warning("set_scene without 'name' from ws")
+                return
+            scene = self._scenes_by_name.get(raw_name)
+            if scene is None:
+                LOGGER.warning("Unknown scene requested: %r", raw_name)
+                self._viewer_events.publish(
+                    "error", f"Unknown scene requested: {raw_name!r}"
+                )
+                return
+            try:
+                async with self._render_lock:
+                    self._first_action_event.clear()
+                    if self._runtime_ready:
+                        await self._runtime.set_scene(scene)
+                        await self._push_chunk_to_sink(
+                            self._runtime.initial_frame_chunk()
+                        )
+            except Exception as exc:
+                LOGGER.exception("Scene switch to %r failed.", raw_name)
+                self._viewer_events.publish(
+                    "error", f"Scene switch failed: {exc}"
+                )
+                return
+            self._reset_cooldown_until = (
+                time.monotonic() + self._reset_cooldown_s
+            )
+            LOGGER.info(
+                "Scene switched to %r. vr_input ignored for %.1fs.",
+                scene.name,
+                self._reset_cooldown_s,
+            )
+            self._viewer_events.publish("scene", f"Scene set to {scene.name!r}.")
             return
         if msg_type == "session":
-            LOGGER.info("session: %s", payload.get("action"))
+            action = payload.get("action")
+            LOGGER.info("session: %s", action)
+            if action == "start":
+                self._viewer_events.publish("session", "VR session started.")
+            elif action == "end":
+                self._viewer_events.publish("session", "VR session ended.")
+            else:
+                self._viewer_events.publish("session", f"session: {action}")
             return
         LOGGER.warning("ws msg type=%r ignored", msg_type)
 
@@ -314,9 +428,12 @@ class QuestSessionManager:
                         await self._push_chunk_to_sink(result.video_chunk)
                 except asyncio.CancelledError:
                     raise
-                except Exception:
+                except Exception as exc:
                     LOGGER.exception(
                         "VR chunk render failed; sleeping 1s before retrying."
+                    )
+                    self._viewer_events.publish(
+                        "error", f"Render error: {exc} (retrying in 1s)."
                     )
                     await asyncio.sleep(1.0)
         except asyncio.CancelledError:
@@ -384,6 +501,7 @@ async def _ws_handler(request: web.Request) -> web.WebSocketResponse:
     peer = request.remote
     LOGGER.info("ws client connected: %s", peer)
     await manager.attach_ws(ws)
+    manager.viewer_events.publish("headset", f"Headset connected ({peer}).")
     try:
         async for msg in ws:
             if msg.type == WSMsgType.TEXT:
@@ -401,7 +519,53 @@ async def _ws_handler(request: web.Request) -> web.WebSocketResponse:
     finally:
         LOGGER.info("ws client disconnected: %s", peer)
         await manager.detach_ws(ws)
+        manager.viewer_events.publish("headset", f"Headset disconnected ({peer}).")
     return ws
+
+
+async def _viewer_events_handler(request: web.Request) -> web.StreamResponse:
+    """Server-Sent Events stream of human-readable activity for spectator pages.
+
+    EventSource on the browser side handles reconnect/backoff for free, so
+    this handler just needs to keep the stream open and push events as the
+    broadcaster produces them. A 15 s comment ping keeps reverse proxies
+    and idle-aware browsers from closing the connection during quiet
+    periods.
+    """
+    manager: QuestSessionManager = request.app["manager"]
+    response = web.StreamResponse(
+        status=200,
+        headers={
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Connection": "keep-alive",
+            # Disable proxy buffering (nginx, etc.) so events arrive promptly.
+            "X-Accel-Buffering": "no",
+        },
+    )
+    await response.prepare(request)
+    peer = request.remote
+    LOGGER.info("viewer SSE connected: %s", peer)
+    try:
+        async with manager.viewer_events.subscribe() as q:
+            while True:
+                try:
+                    evt = await asyncio.wait_for(q.get(), timeout=15.0)
+                    payload = json.dumps(
+                        {
+                            "type": evt.type,
+                            "message": evt.message,
+                            "t_ms": evt.t_ms,
+                        }
+                    )
+                    await response.write(f"data: {payload}\n\n".encode("utf-8"))
+                except asyncio.TimeoutError:
+                    await response.write(b": ping\n\n")
+    except (asyncio.CancelledError, ConnectionResetError, ConnectionAbortedError):
+        pass
+    finally:
+        LOGGER.info("viewer SSE disconnected: %s", peer)
+    return response
 
 
 async def _video_stream_handler(request: web.Request) -> web.StreamResponse:
@@ -456,7 +620,10 @@ def create_app(
     app["vr_browser_settings"] = vr_browser_settings or {}
 
     async def quest_page(_: web.Request) -> web.StreamResponse:
-        return web.FileResponse(WEB_DIR / "quest_session.html")
+        return web.FileResponse(WEB_DIR / "quest.html")
+
+    async def viewer_page(_: web.Request) -> web.StreamResponse:
+        return web.FileResponse(WEB_DIR / "viewer.html")
 
     async def healthz(_: web.Request) -> web.StreamResponse:
         return web.json_response(
@@ -474,17 +641,32 @@ def create_app(
         # they're applied after the wire payload lands on the server.
         return web.json_response(request.app["vr_browser_settings"])
 
+    async def scenes_list(request: web.Request) -> web.StreamResponse:
+        mgr: QuestSessionManager = request.app["manager"]
+        return web.json_response(
+            {
+                "scenes": [
+                    {"name": s.name, "start_frame_idx": s.start_frame_idx}
+                    for s in mgr.scenes
+                ],
+                "active": mgr.scenes[0].name if mgr.scenes else None,
+            }
+        )
+
     async def on_startup(app: web.Application) -> None:
         await app["manager"].preload_runtime()
 
     async def on_shutdown(app: web.Application) -> None:
         await app["manager"].shutdown()
 
-    app.router.add_get("/quest_session", quest_page)
+    app.router.add_get("/quest", quest_page)
+    app.router.add_get("/viewer", viewer_page)
     app.router.add_get("/ws", _ws_handler)
     app.router.add_get("/video", _video_stream_handler)
+    app.router.add_get("/viewer_events", _viewer_events_handler)
     app.router.add_get("/healthz", healthz)
     app.router.add_get("/vr_config", vr_config)
+    app.router.add_get("/scenes", scenes_list)
     app.router.add_static("/static/", WEB_DIR, show_index=False)
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
@@ -517,7 +699,8 @@ def main() -> None:
     )
 
     cfg = load_yaml_config(args.config)
-    runtime_config = build_runtime_config(cfg, role="quest")
+    scenes = parse_scenes(cfg)
+    runtime_config = build_runtime_config(cfg, role="quest", scenes=scenes)
     server_settings = get_server_settings(cfg)
     video_settings = get_video_settings(cfg)
     vr_browser_settings = get_vr_browser_settings(cfg)
@@ -532,6 +715,12 @@ def main() -> None:
         runtime_config=runtime_config,
         fps=runtime_config.fps,
         jpeg_quality=jpeg_quality,
+        scenes=scenes,
+    )
+    LOGGER.info(
+        "Scenes: %s (initial=%r)",
+        [s.name for s in scenes],
+        scenes[0].name,
     )
     ssl_ctx = _make_ssl_context(cert_path, key_path)
     scheme = "https" if ssl_ctx else "http"
@@ -543,7 +732,8 @@ def main() -> None:
     )
     LOGGER.info(
         "Quest server listening on %s://%s:%d "
-        "(page: /quest_session, ws: /ws, video: /video) — config: %s",
+        "(headset: /quest, spectator: /viewer, "
+        "ws: /ws, video: /video, events: /viewer_events) — config: %s",
         scheme,
         host,
         port,

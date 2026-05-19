@@ -296,7 +296,7 @@ uv run --package flash-cosmosh python -m cosmosh.webrtc.server_quest \
   --config integrations/cosmosh/configs/quest_episode_001867.yaml
 ```
 
-On the Quest browser, open **`https://<bridge-pc-lan-ip>:8443/quest_session`**.
+On the Quest browser, open **`https://<bridge-pc-lan-ip>:8443/quest`**.
 Accept the self-signed-cert warning, click **Enter VR**, and you're
 in. **Hold `B` on the Meta Quest controller to reset the simulation**
 (server drains the queue and re-anchors on the initial conditional

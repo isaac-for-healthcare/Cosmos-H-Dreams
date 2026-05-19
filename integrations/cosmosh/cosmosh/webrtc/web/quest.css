@@ -52,6 +52,27 @@ code {
   flex-wrap: wrap;
 }
 
+.sceneRow {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.95rem;
+}
+
+.sceneRow select {
+  padding: 0.4rem 0.55rem;
+  border: 1px solid #c8ced8;
+  border-radius: 8px;
+  background: #f6f8fb;
+  color: #1a1f2c;
+  cursor: pointer;
+}
+
+.sceneRow select:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
 button {
   width: fit-content;
   padding: 0.55rem 0.9rem;

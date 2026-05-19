@@ -5,6 +5,12 @@ const xrText = document.getElementById("xrText")
 const rateText = document.getElementById("rateText")
 const eventLog = document.getElementById("eventLog")
 const remoteVideo = document.getElementById("remoteVideo")
+const sceneSelect = document.getElementById("sceneSelect")
+
+// Mirror of what the server reports as the active scene. Used to revert the
+// dropdown if the user picks a scene the server rejects, or before the ws is
+// up.
+let activeScene = null
 
 let ws = null
 let xrSession = null
@@ -44,6 +50,12 @@ let rateWindowStart = performance.now()
 const RESET_HOLD_MS = 1000
 let resetHoldStart = null
 let resetSentForThisHold = false
+
+// Left-Y-hold exit: 1 s. Same shape as the reset detector — ends the XR
+// session and drops the user back to the 2D landing page.
+const EXIT_HOLD_MS = 1000
+let exitHoldStart = null
+let exitFiredForThisHold = false
 
 // Input semantics flags, fetched from the server's /vr_config endpoint on
 // page load. Defaults match the historical absolute-frame behaviour so
@@ -251,6 +263,7 @@ function connectWs() {
     setWs("open")
     enterVrButton.disabled = !navigator.xr
     resetButton.disabled = false
+    sceneSelect.disabled = sceneSelect.options.length === 0
     if (!navigator.xr) {
       setXr("WebXR unavailable")
     }
@@ -260,6 +273,7 @@ function connectWs() {
     setWs("closed (retrying)")
     enterVrButton.disabled = true
     resetButton.disabled = true
+    sceneSelect.disabled = true
     setTimeout(connectWs, 2000)
   }
   ws.onerror = () => logEvent("ws error")
@@ -283,9 +297,47 @@ function sendReset() {
 
 resetButton.addEventListener("click", () => sendReset())
 
+async function fetchScenes() {
+  try {
+    const resp = await fetch("/scenes", { cache: "no-store" })
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+    const data = await resp.json()
+    const scenes = Array.isArray(data.scenes) ? data.scenes : []
+    sceneSelect.innerHTML = ""
+    for (const scene of scenes) {
+      const option = document.createElement("option")
+      option.value = scene.name
+      option.textContent = scene.name
+      sceneSelect.appendChild(option)
+    }
+    activeScene = data.active || (scenes[0] && scenes[0].name) || null
+    if (activeScene) {
+      sceneSelect.value = activeScene
+    }
+    sceneSelect.disabled = !(ws && ws.readyState === WebSocket.OPEN)
+    logEvent(`scenes loaded: ${scenes.map((s) => s.name).join(", ") || "(none)"}`)
+  } catch (e) {
+    sceneSelect.innerHTML = `<option value="">unavailable</option>`
+    logEvent(`scenes fetch failed: ${e.message}`)
+  }
+}
+
+sceneSelect.addEventListener("change", () => {
+  const name = sceneSelect.value
+  if (!name || name === activeScene) return
+  if (!send({ type: "set_scene", name })) {
+    sceneSelect.value = activeScene || ""
+    logEvent("set_scene not sent — ws not open")
+    return
+  }
+  activeScene = name
+  logEvent(`set_scene ${name} sent`)
+})
+
 // Fire-and-forget: flags land in milliseconds; user has to click Enter VR
 // anyway, so no race in practice. On failure we fall back to absolute mode.
 fetchVrConfig()
+fetchScenes()
 connectWs()
 
 // ---- WebXR session ----------------------------------------------------
@@ -341,6 +393,8 @@ async function enterVr() {
   clearLastPose()
   resetHoldStart = null
   resetSentForThisHold = false
+  exitHoldStart = null
+  exitFiredForThisHold = false
   sentCount = 0
   rateWindowStart = performance.now()
 
@@ -367,8 +421,8 @@ async function enterVr() {
 // orientation — server multiplies by ``--rotate_scale`` and feeds as
 // per-output-frame ω into the rot6d ramp. ``trigger``: analog
 // ``gamepad.buttons[0].value`` in [0, 1]. ``secondaryButton``:
-// ``gamepad.buttons[5].pressed`` (right = B, left = Y) — only the right
-// side's value is read by ``onXRFrame`` for the hold-to-reset detector.
+// ``gamepad.buttons[5].pressed`` (right = B, left = Y) — read by
+// ``onXRFrame`` for the right-B-hold reset and left-Y-hold exit detectors.
 
 // ---- Quaternion / yaw helpers -----------------------------------------
 // All quaternions are xyzw layout. Hamilton-product convention.
@@ -481,6 +535,15 @@ function updateRate() {
   }
 }
 
+function exitVrFromController() {
+  // Fire-and-forget. ``xrSession.end()`` resolves asynchronously and the
+  // ``addEventListener("end", ...)`` handler set up in enterVr() does the
+  // bookkeeping (clearLastPose, button labels, etc.).
+  if (xrSession) {
+    xrSession.end().catch((e) => logEvent(`xrSession.end failed: ${e.message}`))
+  }
+}
+
 function onXRFrame(t, frame) {
   const session = frame.session
   session.requestAnimationFrame(onXRFrame)
@@ -512,8 +575,6 @@ function onXRFrame(t, frame) {
   const left = readArm("left", frame, session, headsetYaw)
 
   // Right-B-hold reset detector. Fires once per hold; releases re-arm.
-  // Only the right controller participates — left's secondaryButton (Y)
-  // is currently ignored.
   if (right && right.secondaryButton) {
     if (resetHoldStart === null) {
       resetHoldStart = t
@@ -525,6 +586,24 @@ function onXRFrame(t, frame) {
   } else {
     resetHoldStart = null
     resetSentForThisHold = false
+  }
+
+  // Left-Y-hold exit detector. Mirrors the reset detector: 1 s hold ends
+  // the XR session and drops the user back to the 2D landing page. After
+  // firing we skip the remaining payload work for this frame — the session
+  // is on its way out, so there's no point sending one last vr_input.
+  if (left && left.secondaryButton) {
+    if (exitHoldStart === null) {
+      exitHoldStart = t
+    } else if (!exitFiredForThisHold && t - exitHoldStart >= EXIT_HOLD_MS) {
+      exitFiredForThisHold = true
+      logEvent("exit triggered by left-Y hold")
+      exitVrFromController()
+      return
+    }
+  } else {
+    exitHoldStart = null
+    exitFiredForThisHold = false
   }
 
   // Skip the send entirely if neither controller is tracked — saves bw,

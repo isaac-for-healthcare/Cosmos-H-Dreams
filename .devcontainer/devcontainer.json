@@ -1,0 +1,26 @@
+{
+    "name": "FlashDreams",
+    "image": "flashdreams:latest",
+    "runArgs": [
+        "--gpus=all",
+        "--network=host"
+    ],
+    "workspaceMount": "source=${localWorkspaceFolder},target=/workspace/flashdreams,type=bind",
+    "workspaceFolder": "/workspace/flashdreams",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python",
+                "ms-python.black-formatter",
+                "ms-python.debugpy"
+            ],
+            "settings": {
+                "python.formatting.provider": "black",
+                "editor.formatOnSave": true,
+                "python.linting.enabled": true,
+                "python.analysis.typeCheckingMode": "off",
+                "cursorpyright.analysis.typeCheckingMode": "off"
+            }
+        }
+    }
+}
