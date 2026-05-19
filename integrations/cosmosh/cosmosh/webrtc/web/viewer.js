@@ -5,6 +5,7 @@ const eventLog = document.getElementById("eventLog")
 const driverBadge = document.getElementById("driverBadge")
 const driverText = document.getElementById("driverText")
 const sceneText = document.getElementById("sceneText")
+const resetButton = document.getElementById("resetButton")
 
 const KNOWN_TYPES = new Set([
   "info", "headset", "session", "reset", "error", "driver", "scene",
@@ -111,6 +112,34 @@ async function loadInitialState() {
   }
 }
 void loadInitialState()
+
+// ---- Admin reset ------------------------------------------------------
+// POSTs to /admin/reset. Server picks the right path based on who's
+// driving (keyboard session drain vs. quest path); spectator sees the
+// effect via the "reset" SSE event that the server publishes.
+
+resetButton.addEventListener("click", async () => {
+  resetButton.disabled = true
+  try {
+    const resp = await fetch("/admin/reset", { method: "POST" })
+    if (!resp.ok) {
+      throw new Error(`HTTP ${resp.status}`)
+    }
+  } catch (e) {
+    // Synthesise a local error entry so the admin can see the failure
+    // without scraping devtools.
+    appendEvent({
+      type: "error",
+      message: `admin reset failed: ${e.message}`,
+      t_ms: 0,
+    })
+  } finally {
+    // Brief disable to discourage button-mashing while the server is
+    // mid-drain; ~600 ms is enough to feel intentional without making
+    // the UI feel stuck.
+    setTimeout(() => { resetButton.disabled = false }, 600)
+  }
+})
 
 // ---- /viewer_events (SSE) ---------------------------------------------
 // EventSource handles reconnect/backoff natively; we just surface the

@@ -992,6 +992,19 @@ class CosmoshWebRTCSessionManager:
                 self._active_session = None
                 raise
 
+    async def reset_active_session(self) -> bool:
+        """Run a reset on the currently-active session, if any.
+
+        Public wrapper around :meth:`_handle_reset` for the unified
+        server's ``/admin/reset`` endpoint. Returns ``True`` if a reset
+        was dispatched; ``False`` if no keyboard session is connected.
+        """
+        session = self._active_session
+        if session is None or session.closed:
+            return False
+        await self._handle_reset(managed_session=session)
+        return True
+
     async def close_active_session(self) -> None:
         had_active = False
         async with self._session_lock:
