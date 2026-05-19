@@ -2,14 +2,33 @@ const remoteVideo = document.getElementById("remoteVideo")
 const videoText = document.getElementById("videoText")
 const eventsText = document.getElementById("eventsText")
 const eventLog = document.getElementById("eventLog")
+const driverBadge = document.getElementById("driverBadge")
+const driverText = document.getElementById("driverText")
+const sceneText = document.getElementById("sceneText")
 
-const KNOWN_TYPES = new Set(["info", "headset", "session", "reset", "error"])
+const KNOWN_TYPES = new Set([
+  "info", "headset", "session", "reset", "error", "driver", "scene",
+])
 // Cap the DOM log so a long demo doesn't grow it unbounded.
 const MAX_ENTRIES = 400
 
 function setBadge(el, label, cls) {
   el.textContent = label
   el.className = `badge badge-${cls}`
+}
+
+// Update the prominent "Active driver" badge from a driver-name string.
+// Unknown values fall back to the neutral "unknown" style.
+function setDriver(name) {
+  const norm = (name || "").toLowerCase()
+  const known = ["keyboard", "quest", "idle"]
+  const cls = known.includes(norm) ? norm : "unknown"
+  driverText.textContent = norm || "unknown"
+  driverBadge.className = `badge driver-badge driver-${cls}`
+}
+
+function setScene(name) {
+  sceneText.textContent = name || "—"
 }
 
 function timeStamp(tMs) {
@@ -26,6 +45,18 @@ function timeStamp(tMs) {
 
 function appendEvent(evt) {
   const type = KNOWN_TYPES.has(evt.type) ? evt.type : "info"
+
+  // Driver / scene events also update the top-bar badges. We still log
+  // them in the activity feed so the timeline shows the transitions.
+  if (evt.type === "driver") {
+    setDriver(evt.message)
+  } else if (evt.type === "scene") {
+    // Server publishes a human-readable message like "Scene set to 'foo'.";
+    // extract the scene name when we can, fall back to the raw message.
+    const match = /'([^']+)'/.exec(String(evt.message ?? ""))
+    setScene(match ? match[1] : evt.message)
+  }
+
   const row = document.createElement("div")
   row.className = `evt evt-${type}`
 
@@ -62,6 +93,24 @@ function appendEvent(evt) {
 
 remoteVideo.addEventListener("load", () => setBadge(videoText, "video: live", "ok"))
 remoteVideo.addEventListener("error", () => setBadge(videoText, "video: error", "err"))
+
+// ---- Initial state ----------------------------------------------------
+// Seeded once on page load so the topbar badges render before the SSE
+// stream catches up. The unified server populates /admin/status; on the
+// Quest-only server it 404s and we just keep the defaults.
+
+async function loadInitialState() {
+  try {
+    const resp = await fetch("/admin/status", { cache: "no-store" })
+    if (!resp.ok) return
+    const data = await resp.json()
+    if (data.driver) setDriver(data.driver)
+    if (data.active_scene) setScene(data.active_scene)
+  } catch {
+    // Ignore — SSE will still populate the badges live.
+  }
+}
+void loadInitialState()
 
 // ---- /viewer_events (SSE) ---------------------------------------------
 // EventSource handles reconnect/backoff natively; we just surface the

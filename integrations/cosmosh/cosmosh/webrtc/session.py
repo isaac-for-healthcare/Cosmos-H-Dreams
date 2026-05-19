@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -873,18 +874,31 @@ class CosmoshWebRTCSessionManager:
         fps: int = 10,
         light_mode: bool = False,
         scenes: list[Scene] | None = None,
+        runtime: CosmoshInferenceRuntime | None = None,
+        events_broadcaster: Any | None = None,
     ) -> None:
         self.runtime_config = runtime_config or CosmoshRuntimeConfig()
         self.fps = fps
         self.light_mode = light_mode
         self.scenes: list[Scene] = list(scenes) if scenes else []
         self._scenes_by_name: dict[str, Scene] = {s.name: s for s in self.scenes}
-        self._runtime = CosmoshInferenceRuntime(config=self.runtime_config)
-        if self.scenes:
+        # ``runtime`` lets the unified server share one runtime across the
+        # keyboard and Quest managers; otherwise we own a private instance.
+        self._runtime = runtime or CosmoshInferenceRuntime(config=self.runtime_config)
+        if self.scenes and self._runtime.active_scene_name is None:
             self._runtime.set_active_scene_name(self.scenes[0].name)
         self._runtime_ready = False
         self._active_session: _ManagedCosmoshSession | None = None
         self._session_lock = asyncio.Lock()
+        # Optional async hook called immediately before a new keyboard session
+        # is accepted. The unified server uses this to close any active Quest
+        # ws so only one driver is touching the shared runtime at a time.
+        self.on_take_over: Callable[[], Awaitable[None]] | None = None
+        # Optional event broadcaster (Quest's ``_ViewerEventBroadcaster``)
+        # the unified server passes in so the admin panel can show which
+        # side is driving. We only require a ``publish(type, message)``
+        # method, so the type is intentionally loose.
+        self.events_broadcaster = events_broadcaster
 
     def has_active_session(self) -> bool:
         return self._active_session is not None and not self._active_session.closed
@@ -912,6 +926,14 @@ class CosmoshWebRTCSessionManager:
         async with self._session_lock:
             if self._active_session is not None and not self._active_session.closed:
                 raise SessionBusyError("A Cosmosh session is already active.")
+
+            # Takeover: in the unified server, a new keyboard session means
+            # any active Quest ws should be dropped so only one driver is
+            # touching the shared runtime at a time. No-op when running
+            # keyboard-only.
+            if self.on_take_over is not None:
+                with contextlib.suppress(Exception):
+                    await self.on_take_over()
 
             if not self._runtime_ready:
                 await self._runtime.initialize()
@@ -949,6 +971,7 @@ class CosmoshWebRTCSessionManager:
                     managed_session.render_task = asyncio.create_task(
                         self._render_loop(managed_session=managed_session)
                     )
+                    self._publish_driver("keyboard")
                 if state in {"failed", "disconnected", "closed"}:
                     await self.close_active_session()
 
@@ -970,12 +993,28 @@ class CosmoshWebRTCSessionManager:
                 raise
 
     async def close_active_session(self) -> None:
+        had_active = False
         async with self._session_lock:
             if self._active_session is None:
                 return
+            had_active = True
             active_session = self._active_session
             self._active_session = None
             await active_session.close()
+        if had_active:
+            self._publish_driver("idle")
+
+    def _publish_driver(self, name: str) -> None:
+        """Broadcast a 'driver' event for the unified server's admin panel.
+
+        ``name`` is one of ``"keyboard" / "quest" / "idle"``. Silent no-op
+        when no broadcaster is attached (keyboard-only deployments).
+        """
+        broadcaster = self.events_broadcaster
+        if broadcaster is None:
+            return
+        with contextlib.suppress(Exception):
+            broadcaster.publish("driver", name)
 
     async def shutdown(self) -> None:
         await self.close_active_session()

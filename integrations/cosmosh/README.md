@@ -5,7 +5,7 @@ keyboard viewer for the surgical-simulator (CosmosH) recipe.
 
 ## What It Provides (Phase 1)
 
-- `GET /request_session` serves a standalone viewer page (`HTML/CSS/JS`).
+- `GET /keyboard` serves a standalone viewer page (`HTML/CSS/JS`).
 - `POST /api/webrtc/offer` performs SDP offer/answer signaling.
 - Runtime/model preloading during server startup (CosmosH pipeline + Wan2.1
   VAE encoder + decoder + CR1 text embeddings + conditional first frame).
@@ -47,7 +47,7 @@ uv run --package flash-cosmosh python -m cosmosh.webrtc.server_quest \
 
 Then open:
 
-- [http://localhost:8080/request_session](http://localhost:8080/request_session) — keyboard viewer
+- [http://localhost:8080/keyboard](http://localhost:8080/keyboard) — keyboard viewer
 - `https://<workstation-ip>:8443/quest` — Quest viewer (HTTPS)
 - `/healthz` on either port reports `runtime_ready`
 
