@@ -26,6 +26,33 @@ from cosmosh.webrtc.session import CosmoshInferenceRuntime, CosmoshRuntimeConfig
 WEB_DIR = Path(__file__).resolve().parent / "web"
 LOGGER = logging.getLogger(__name__)
 
+_PACING_LAG_LOG_MS = 5.0
+"""Below this lag the per-frame push pacing re-anchors silently. Above
+it the lag is worth a one-line warning so frame drops (the MJPEG sink
+is latest-frame-wins, so a back-to-back push burst silently discards
+all but the last frame in the chunk) are correlatable in the log."""
+
+
+def _encode_frame_to_jpeg(
+    frame_chw_neg1_pos1: torch.Tensor, jpeg_quality: int
+) -> bytes | None:
+    """Convert one ``[3, H, W]`` CPU tensor in ``[-1, 1]`` to JPEG bytes.
+
+    Runs off the asyncio loop via :func:`asyncio.to_thread` so the cast +
+    cv2 encode don't starve the per-frame pacing in
+    :meth:`QuestSessionManager._push_chunk_to_sink`. Returns ``None`` if
+    OpenCV fails to encode (rare; corrupt frame data).
+    """
+    rgb = ((frame_chw_neg1_pos1 * 127.5) + 127.5).clamp(0.0, 255.0).to(torch.uint8)
+    rgb_hwc = rgb.permute(1, 2, 0).contiguous().numpy()
+    # cv2.imencode wants BGR. Model output is RGB (PIL/torchvision
+    # convention from ``_pixel_frame_to_neg1_pos1``).
+    bgr = cv2.cvtColor(rgb_hwc, cv2.COLOR_RGB2BGR)
+    ok, jpeg = cv2.imencode(
+        ".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)]
+    )
+    return jpeg.tobytes() if ok else None
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -313,23 +340,36 @@ class QuestSessionManager:
         t_frames = chunk.shape[2]
         start = time.monotonic()
         for f in range(t_frames):
-            frame = chunk[0, :, f]  # [3, H, W] on CPU in [-1, 1]
-            rgb = ((frame * 127.5) + 127.5).clamp(0.0, 255.0).to(torch.uint8)
-            rgb_hwc = rgb.permute(1, 2, 0).contiguous().numpy()
-            # cv2.imencode wants BGR. Model output is RGB (PIL/torchvision
-            # convention from ``_pixel_frame_to_neg1_pos1``).
-            bgr = cv2.cvtColor(rgb_hwc, cv2.COLOR_RGB2BGR)
-            ok, jpeg = cv2.imencode(
-                ".jpg",
-                bgr,
-                [int(cv2.IMWRITE_JPEG_QUALITY), int(self.jpeg_quality)],
+            # Offload float->uint8 + cv2 JPEG encode to a worker thread.
+            # On the asyncio loop this can dominate the 1/fps per-frame
+            # budget and force the re-anchor branch below to keep firing.
+            jpeg_bytes = await asyncio.to_thread(
+                _encode_frame_to_jpeg, chunk[0, :, f], self.jpeg_quality
             )
-            if ok:
-                await self._sink.push_jpeg(jpeg.tobytes())
+            if jpeg_bytes is not None:
+                await self._sink.push_jpeg(jpeg_bytes)
             target = start + (f + 1) * period
             now = time.monotonic()
-            if target > now:
-                await asyncio.sleep(target - now)
+            wait_s = target - now
+            if wait_s > 0:
+                await asyncio.sleep(wait_s)
+            else:
+                # Deadline is already in the past — encode + push took
+                # longer than ``period``. Without re-anchoring, every
+                # remaining frame's ``target`` is also in the past and
+                # they all push back-to-back; the sink (latest-frame-wins)
+                # then drops all but the last, so the spectator sees a
+                # missing chunk worth of motion. Shift ``start`` forward
+                # so the next frame's deadline is exactly ``now + period``.
+                lag_ms = -wait_s * 1000.0
+                if lag_ms > _PACING_LAG_LOG_MS:
+                    LOGGER.warning(
+                        "Quest push lag: f=%d deadline %.1fms behind walltime; "
+                        "re-anchoring (MJPEG sink would otherwise drop frames).",
+                        f,
+                        lag_ms,
+                    )
+                start = now - (f + 1) * period
 
 
 # ---------------------------------------------------------------------------

@@ -6,11 +6,11 @@
 #     --config integrations/cosmosh/configs/keyboard_episode_001867.yaml
 
 runtime:
-  config_name: 2steps_vae_lighttae
+  config_name: 2steps_lightvae_lighttae
   compile_network: true
   device: cuda:0
   seed: 1
-  ckpt_path: checkpoints/jhu/tabletop/model_ema_bf16_jhutabletop_288x512.pt
+  ckpt_path: sf_inference_data/checkpoints/jhu/tabletop/model_ema_bf16_jhutabletop_288x512.pt
   cr1_embeddings_path: sf_inference_data/cr1_empty_string_text_embeddings.pt
   input_path: sf_inference_data/260206/suturebot_inference_data/episode_001867.mp4
   stats_path: sf_inference_data/260206/stats_cosmos.json
