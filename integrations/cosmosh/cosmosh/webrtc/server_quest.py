@@ -23,8 +23,9 @@ from cosmosh.webrtc.config_loader import (
     get_video_settings,
     get_vr_browser_settings,
     load_yaml_config,
+    parse_scenes,
 )
-from cosmosh.webrtc.session import CosmoshInferenceRuntime, CosmoshRuntimeConfig
+from cosmosh.webrtc.session import CosmoshInferenceRuntime, CosmoshRuntimeConfig, Scene
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 LOGGER = logging.getLogger(__name__)
@@ -193,11 +194,16 @@ class QuestSessionManager:
         runtime_config: CosmoshRuntimeConfig,
         fps: int,
         jpeg_quality: int,
+        scenes: list[Scene] | None = None,
     ) -> None:
         self.runtime_config = runtime_config
         self.fps = fps
         self.jpeg_quality = jpeg_quality
+        self.scenes: list[Scene] = list(scenes) if scenes else []
+        self._scenes_by_name: dict[str, Scene] = {s.name: s for s in self.scenes}
         self._runtime = CosmoshInferenceRuntime(config=runtime_config)
+        if self.scenes:
+            self._runtime.set_active_scene_name(self.scenes[0].name)
         self._runtime_ready = False
         self._sink = MJPEGSink()
         self._ws: web.WebSocketResponse | None = None
@@ -310,6 +316,42 @@ class QuestSessionManager:
                 self._reset_cooldown_s,
             )
             self._viewer_events.publish("reset", "User reset (anchor frame restored).")
+            return
+        if msg_type == "set_scene":
+            raw_name = payload.get("name")
+            if not isinstance(raw_name, str) or not raw_name:
+                LOGGER.warning("set_scene without 'name' from ws")
+                return
+            scene = self._scenes_by_name.get(raw_name)
+            if scene is None:
+                LOGGER.warning("Unknown scene requested: %r", raw_name)
+                self._viewer_events.publish(
+                    "error", f"Unknown scene requested: {raw_name!r}"
+                )
+                return
+            try:
+                async with self._render_lock:
+                    self._first_action_event.clear()
+                    if self._runtime_ready:
+                        await self._runtime.set_scene(scene)
+                        await self._push_chunk_to_sink(
+                            self._runtime.initial_frame_chunk()
+                        )
+            except Exception as exc:
+                LOGGER.exception("Scene switch to %r failed.", raw_name)
+                self._viewer_events.publish(
+                    "error", f"Scene switch failed: {exc}"
+                )
+                return
+            self._reset_cooldown_until = (
+                time.monotonic() + self._reset_cooldown_s
+            )
+            LOGGER.info(
+                "Scene switched to %r. vr_input ignored for %.1fs.",
+                scene.name,
+                self._reset_cooldown_s,
+            )
+            self._viewer_events.publish("scene", f"Scene set to {scene.name!r}.")
             return
         if msg_type == "session":
             action = payload.get("action")
@@ -559,6 +601,18 @@ def create_app(
         # they're applied after the wire payload lands on the server.
         return web.json_response(request.app["vr_browser_settings"])
 
+    async def scenes_list(request: web.Request) -> web.StreamResponse:
+        mgr: QuestSessionManager = request.app["manager"]
+        return web.json_response(
+            {
+                "scenes": [
+                    {"name": s.name, "start_frame_idx": s.start_frame_idx}
+                    for s in mgr.scenes
+                ],
+                "active": mgr.scenes[0].name if mgr.scenes else None,
+            }
+        )
+
     async def on_startup(app: web.Application) -> None:
         await app["manager"].preload_runtime()
 
@@ -572,6 +626,7 @@ def create_app(
     app.router.add_get("/viewer_events", _viewer_events_handler)
     app.router.add_get("/healthz", healthz)
     app.router.add_get("/vr_config", vr_config)
+    app.router.add_get("/scenes", scenes_list)
     app.router.add_static("/static/", WEB_DIR, show_index=False)
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
@@ -604,7 +659,8 @@ def main() -> None:
     )
 
     cfg = load_yaml_config(args.config)
-    runtime_config = build_runtime_config(cfg, role="quest")
+    scenes = parse_scenes(cfg)
+    runtime_config = build_runtime_config(cfg, role="quest", scenes=scenes)
     server_settings = get_server_settings(cfg)
     video_settings = get_video_settings(cfg)
     vr_browser_settings = get_vr_browser_settings(cfg)
@@ -619,6 +675,12 @@ def main() -> None:
         runtime_config=runtime_config,
         fps=runtime_config.fps,
         jpeg_quality=jpeg_quality,
+        scenes=scenes,
+    )
+    LOGGER.info(
+        "Scenes: %s (initial=%r)",
+        [s.name for s in scenes],
+        scenes[0].name,
     )
     ssl_ctx = _make_ssl_context(cert_path, key_path)
     scheme = "https" if ssl_ctx else "http"
