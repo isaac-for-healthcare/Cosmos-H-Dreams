@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from fractions import Fraction
 
 import numpy as np
@@ -8,6 +9,21 @@ import torch
 from aiortc import MediaStreamTrack
 from aiortc.mediastreams import MediaStreamError
 from av import VideoFrame
+
+LOGGER = logging.getLogger(__name__)
+"""Module logger; warns on playback stalls so we can correlate with
+session-level chunk timing in :mod:`cosmosh.webrtc.session`."""
+
+_STALL_THRESHOLD_MS = 1.0
+"""Minimum ``await get()`` wait in milliseconds that we treat as a stall.
+In steady state the queue is non-empty when ``recv`` arrives so ``get``
+returns instantly; anything above ~1ms means generation did not keep
+ahead of playback for this frame."""
+
+_PACING_LAG_LOG_MS = 5.0
+"""Below this lag we re-anchor pacing silently. Above it the lag is
+worth a one-line warning so bursts (which the browser jitter buffer
+turns into visible playback speed-ups) are correlatable in the log."""
 
 
 def tensor_chunk_to_rgb_frames(video_chunk: torch.Tensor) -> list[np.ndarray]:
@@ -46,7 +62,11 @@ class CosmoshVideoTrack(MediaStreamTrack):
         self._closed = False
 
     async def enqueue_chunk(self, video_chunk: torch.Tensor) -> int:
-        frames = tensor_chunk_to_rgb_frames(video_chunk)
+        # Offload the float->uint8 cast to a worker thread so it doesn't
+        # stall the asyncio loop and starve ``recv``'s 1/fps pacing.
+        # When this ran inline it was the single biggest source of the
+        # empty-queue stalls that ``recv`` then has to re-anchor around.
+        frames = await asyncio.to_thread(tensor_chunk_to_rgb_frames, video_chunk)
         for frame in frames:
             await self._frames.put(frame)
         return len(frames)
@@ -70,19 +90,61 @@ class CosmoshVideoTrack(MediaStreamTrack):
         if self._closed:
             raise MediaStreamError
 
+        loop = asyncio.get_running_loop()
+        t_get_start = loop.time()
         frame_array = await self._frames.get()
         if frame_array is None:
             raise MediaStreamError
+        get_wait_ms = (loop.time() - t_get_start) * 1000.0
+        # ``_next_deadline_s is None`` is the single source of truth for
+        # "we haven't emitted any frame yet". The pre-first-frame wait
+        # is the time aiortc spends calling ``recv`` before the producer
+        # has generated anything; it is expected, not a stall.
+        first_frame = self._next_deadline_s is None
+        just_stalled = (not first_frame) and get_wait_ms > _STALL_THRESHOLD_MS
+        if just_stalled:
+            LOGGER.warning(
+                "Playback stall: pts=%d waited %.1fms for next frame; queue depth now %d.",
+                self._pts,
+                get_wait_ms,
+                self._frames.qsize(),
+            )
 
-        loop = asyncio.get_running_loop()
         now_s = loop.time()
-        if self._next_deadline_s is None:
+        if first_frame or just_stalled:
+            # First frame, or recovering from a queue stall: anchor pacing
+            # at ``now`` instead of adding ``frame_interval_s`` to a stale
+            # absolute deadline. The catch-up behaviour (``wait_s`` deeply
+            # negative for several consecutive recvs) burst-drains the
+            # queue in microseconds, which collapses the smooth RTP cadence
+            # the browser jitter buffer expects and makes the *next* chunk
+            # look like another empty-queue stall, even when generation
+            # outpaces playback — the sawtooth pattern visible in the logs.
             self._next_deadline_s = now_s
         else:
-            self._next_deadline_s += self._frame_interval_s
-            wait_s = self._next_deadline_s - now_s
+            proposed = self._next_deadline_s + self._frame_interval_s
+            wait_s = proposed - now_s
             if wait_s > 0:
                 await asyncio.sleep(wait_s)
+                self._next_deadline_s = proposed
+            else:
+                # Queue had a frame ready (no stall) but our deadline is
+                # already in the past — typical causes are aiortc's send
+                # loop lagging, ``asyncio.sleep`` over-sleeping, or another
+                # task hogging the loop. Without re-anchoring, subsequent
+                # recv()s also see ``wait_s < 0`` and burst the queue at
+                # aiortc's pull rate, which the browser jitter buffer
+                # turns into a visible playback speed-up. Anchor at
+                # ``now_s`` so the next frame resumes 1/fps cadence.
+                if -wait_s * 1000.0 > _PACING_LAG_LOG_MS:
+                    LOGGER.warning(
+                        "Pacing lag: pts=%d deadline %.1fms behind walltime; "
+                        "re-anchoring to avoid burst (queue depth %d).",
+                        self._pts,
+                        -wait_s * 1000.0,
+                        self._frames.qsize(),
+                    )
+                self._next_deadline_s = now_s
 
         frame = VideoFrame.from_ndarray(frame_array, format="rgb24")
         frame.pts = self._pts

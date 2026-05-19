@@ -3,7 +3,7 @@
 #
 # Run with:
 #   uv run --package flash-cosmosh python -m cosmosh.webrtc.server_quest \
-#     --config integrations/cosmosh/configs/quest_episode_001867.yaml
+#     --config integrations/cosmosh/configs/quest_tabletop.yaml
 
 runtime:
   config_name: 2steps_vae_lighttae
