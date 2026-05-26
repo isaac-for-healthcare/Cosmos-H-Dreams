@@ -73,18 +73,7 @@ docker run --rm -it \
   flashdreams:public /bin/bash
 ```
 
-What each flag does:
-
-| Flag | Why |
-|---|---|
-| `--rm -it` | Throwaway interactive shell. |
-| `--network host` | Lets HuggingFace / S3 / proxy traffic reach the host's network. |
-| `--gpus all` | Exposes every visible GPU; restrict with `--gpus '"device=0,1"'` if you need to pin. |
-| `-v .:/workspace/flashdreams` | Mounts the checkout (including `checkpoints/` and `sf_inference_data/`) into the container so edits + assets are live. |
-| `-w /workspace/flashdreams` | Drops you into the repo root (where the top-level `pyproject.toml` lives) so `uv run …` works out of the box. |
-
-The shell lands directly at the repo root — no further `cd` needed.
-All commands below are run from there.
+All commands below are run from the repo root.
 
 ---
 

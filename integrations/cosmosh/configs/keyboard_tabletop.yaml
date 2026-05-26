@@ -10,8 +10,8 @@ runtime:
   compile_network: true
   device: cuda:0
   seed: 1
-  ckpt_path: checkpoints/model_ema_jhutabletop_bf16.pt
-  resolution: [288, 512]
+  ckpt_path: checkpoints/jhu/tabletop/model_ema_bf16_jhutabletop_544x960.pt
+  resolution: [544, 960]
   fps: 30
   actions_per_chunk: 12  # 4 / 8 / 12 / 16…; smaller = lower latency, lower fidelity
 
