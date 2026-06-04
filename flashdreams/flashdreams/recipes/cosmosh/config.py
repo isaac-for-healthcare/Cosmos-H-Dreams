@@ -360,6 +360,7 @@ def build_cosmosh(
         cp_size=1,
         h_extrapolation_ratio=3.0,
         w_extrapolation_ratio=3.0,
+        t_extrapolation_ratio=1.0,
         window_size_t=window_size_t,
         sink_size_t=0,
         compile_network=compile_network,

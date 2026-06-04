@@ -215,6 +215,9 @@ class CosmosHTransformerConfig(TransformerConfig):
     w_extrapolation_ratio: float = 3.0
     """RoPE extrapolation along W."""
 
+    t_extrapolation_ratio: float = 3.0
+    """RoPE extrapolation along T."""
+
     window_size_t: int = 13
     """Self-attention sliding window in pre-patchify frames; matches the
     13-frame CosmosH conditioning window."""
@@ -406,6 +409,7 @@ class CosmosHTransformer(Transformer[CosmosHTransformerCache]):
             head_dim=head_dim,
             h_extrapolation_ratio=cfg.h_extrapolation_ratio,
             w_extrapolation_ratio=cfg.w_extrapolation_ratio,
+            t_extrapolation_ratio=cfg.t_extrapolation_ratio,
             device=self.device,
         )
         rope_adapter.set_context_parallel_group(cp_group=self._cp_group)

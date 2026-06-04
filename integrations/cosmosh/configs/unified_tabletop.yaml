@@ -13,11 +13,11 @@
 #   /viewer            spectator MJPEG view
 
 runtime:
-  config_name: 2steps_vae_lighttae
+  config_name: vae_vae
   compile_network: true
   device: cuda:0
   seed: 1
-  ckpt_path: sf_inference_data/checkpoints/jhu/tabletop/model_ema_bf16_jhutabletop_288x512.pt
+  ckpt_path: checkpoints/jhu/tabletop/model_ema_bf16_jhutabletop_288x512.pt
   resolution: [288, 512]
   fps: 30
   actions_per_chunk: 8  # 4 / 8 / 12 / 16…; smaller = lower latency, lower fidelity
