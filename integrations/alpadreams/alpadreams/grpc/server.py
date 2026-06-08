@@ -164,12 +164,12 @@ class OpenSessionPayload:
     n_cameras: int
 
     def __post_init__(self) -> None:
-        assert len(self.text_prompts) == 1, (
-            f"Expected 1 text prompt, got {len(self.text_prompts)}"
-        )
-        assert self.n_cameras == len(self.camera_names), (
-            f"Expected {self.n_cameras} camera names, got {len(self.camera_names)}"
-        )
+        assert (
+            len(self.text_prompts) == 1
+        ), f"Expected 1 text prompt, got {len(self.text_prompts)}"
+        assert self.n_cameras == len(
+            self.camera_names
+        ), f"Expected {self.n_cameras} camera names, got {len(self.camera_names)}"
         assert self.n_cameras == len(self.camera_models_from_client), (
             "Expected "
             f"{self.n_cameras} camera models, got {len(self.camera_models_from_client)}"
@@ -178,9 +178,9 @@ class OpenSessionPayload:
             "Expected "
             f"{self.n_cameras} rig_to_camera transforms, got {len(self.rig_to_camera_transforms)}"
         )
-        assert len(self.hdmap_parquets) > 0, (
-            f"Expected non-empty HD map parquets, got {len(self.hdmap_parquets)}"
-        )
+        assert (
+            len(self.hdmap_parquets) > 0
+        ), f"Expected non-empty HD map parquets, got {len(self.hdmap_parquets)}"
 
 
 @dataclass(slots=True)
@@ -213,7 +213,9 @@ def capture_exceptions(func: Callable) -> Callable:
         try:
             return func(*args, **kwargs)
         except Exception as e:
-            logger.error(f"Error in {func.__name__}: {e}")  # ty:ignore[unresolved-attribute]
+            logger.error(
+                f"Error in {func.__name__}: {e}"
+            )  # ty:ignore[unresolved-attribute]
 
             # print stack trace
             traceback.print_exc()
@@ -568,19 +570,17 @@ class WorldModelEngine:
         # Do a sanity check on the camera poses
         for cam_name, camera_pose in camera_poses_per_view.items():
             assert isinstance(camera_pose, torch.Tensor)
-            assert camera_pose.device == self.device, (
-                f"Camera pose for {cam_name} is on device {camera_pose.device}, expected {self.device}"
-            )
+            assert (
+                camera_pose.device == self.device
+            ), f"Camera pose for {cam_name} is on device {camera_pose.device}, expected {self.device}"
             assert camera_pose.shape == (
                 len(render_video_chunk_payload.frame_timestamps_us),
                 4,
                 4,
-            ), (
-                f"Camera pose for {cam_name} has shape {camera_pose.shape}, expected ({len(render_video_chunk_payload.frame_timestamps_us)}, 4, 4)"
-            )
-        assert len(camera_poses_per_view) == len(camera_names), (
-            f"[Rank {self.rank}] Expected {len(camera_names)} camera poses, got {len(camera_poses_per_view)}"
-        )
+            ), f"Camera pose for {cam_name} has shape {camera_pose.shape}, expected ({len(render_video_chunk_payload.frame_timestamps_us)}, 4, 4)"
+        assert len(camera_poses_per_view) == len(
+            camera_names
+        ), f"[Rank {self.rank}] Expected {len(camera_names)} camera poses, got {len(camera_poses_per_view)}"
 
         # Generate frames
         is_first_chunk = not session_state.generation_started
@@ -612,9 +612,9 @@ class WorldModelEngine:
             session_state.alpadreams_state = output.state
             session_state.generation_started = True
         else:
-            assert session_state.alpadreams_state is not None, (
-                "bbox_state should be set after first chunk"
-            )
+            assert (
+                session_state.alpadreams_state is not None
+            ), "bbox_state should be set after first chunk"
 
             logger.info(
                 f"[Rank {self.rank}] Continuing generation with {len(render_video_chunk_payload.frame_timestamps_us)} frames (skip_video={skip_video_generation})..."
@@ -681,9 +681,9 @@ class WorldModelEngine:
         logger.info(f"[Rank {self.rank}] Gathering camera outputs from all ranks")
         if V_group is not None:
             camera_outputs = cat_outputs_cp_object_list(camera_outputs, V_group)
-        assert len(camera_outputs) == len(session_state.camera_names), (
-            f"Expected {len(session_state.camera_names)} outputs, got {len(camera_outputs)}"
-        )
+        assert len(camera_outputs) == len(
+            session_state.camera_names
+        ), f"Expected {len(session_state.camera_names)} outputs, got {len(camera_outputs)}"
         logger.info(
             f"[Rank {self.rank}] Outputs gathered from all ranks: {len(camera_outputs)}"
         )
@@ -983,9 +983,9 @@ class WorldModelService(video_model_pb2_grpc.WorldModelServiceServicer):
             rig_to_camera_transforms[cam_name] = rig_to_cam_flu
 
         logger.info(f"Parsed {len(camera_names)} camera specs: {camera_names}")
-        assert len(camera_names) == len(camera_models_from_client), (
-            "Expected one camera model per camera name"
-        )
+        assert len(camera_names) == len(
+            camera_models_from_client
+        ), "Expected one camera model per camera name"
 
         # 2a. Decode initial frames — one per camera
         initial_frames_list = list(request.initial_frames)
@@ -1314,12 +1314,13 @@ class SessionState:
         self.pending_finalization_state: dict | None = None
 
         for cam_name, rig_to_cam in rig_to_camera_transforms.items():
-            assert isinstance(rig_to_cam, torch.Tensor), (
-                f"Rig-to-camera transform for {cam_name} must be a torch.Tensor, got {type(rig_to_cam)}"
-            )
-            assert rig_to_cam.shape == (4, 4), (
-                f"Rig-to-camera transform for {cam_name} must be a 4x4 matrix, got {rig_to_cam.shape}"
-            )
+            assert isinstance(
+                rig_to_cam, torch.Tensor
+            ), f"Rig-to-camera transform for {cam_name} must be a torch.Tensor, got {type(rig_to_cam)}"
+            assert rig_to_cam.shape == (
+                4,
+                4,
+            ), f"Rig-to-camera transform for {cam_name} must be a 4x4 matrix, got {rig_to_cam.shape}"
 
 
 def parse_args() -> argparse.Namespace:

@@ -21,9 +21,15 @@ from cosmosh.webrtc.utils import (
 PSM1_GRIPPER_DIM = 9
 PSM2_GRIPPER_DIM = 19
 
-# Gripper endpoints in normalised space, from actions.md
-# "Gripper raw stats and endpoints in normalised space".
-# These numbers are empirically determined by testing the gripper on the Quest 3 controller.
+# Fallback gripper endpoints in normalised space, from actions.md "Gripper
+# raw stats and endpoints in normalised space" (the dVRK ``stats_cosmos.json``
+# model). These are only used when the runtime has no loaded stats to derive
+# from (e.g. a bare integrator in tests, or a stats file without gripper
+# percentiles). At runtime the integrator's ``gripper_{open,closed}_psm{1,2}``
+# fields are populated per-scene from the loaded stats' q01/q99 — see
+# ``session._load_action_stats``. The OPEN values were empirically capped on
+# the Quest 3 controller (stats q99 normalise to ≈3.3/3.0); stats-derived
+# endpoints use the full range instead.
 PSM1_GRIPPER_OPEN = 1.25  # 3.34
 PSM1_GRIPPER_CLOSED = -0.45
 PSM2_GRIPPER_OPEN = 1.25
@@ -327,6 +333,14 @@ class CosmoshActionIntegrator:
     # dataset mean (≈ 0); held-key steps move toward the OPEN/CLOSED endpoints.
     latched_gripper_psm1: float = 0.0
     latched_gripper_psm2: float = 0.0
+    # Per-arm gripper clip endpoints in normalised space. Default to the dVRK
+    # module constants; the runtime overrides them per-scene with values
+    # derived from the loaded stats (q01/q99 → normalised). ``closed < open``
+    # is enforced in ``__post_init__``.
+    gripper_open_psm1: float = PSM1_GRIPPER_OPEN
+    gripper_closed_psm1: float = PSM1_GRIPPER_CLOSED
+    gripper_open_psm2: float = PSM2_GRIPPER_OPEN
+    gripper_closed_psm2: float = PSM2_GRIPPER_CLOSED
 
     # Pre-computed normalised baselines for identity rotation (one per arm).
     # Subtracting these makes "no rotation key held" yield exact zero in the
@@ -343,6 +357,15 @@ class CosmoshActionIntegrator:
         ):
             if arr.shape != (6,):
                 raise ValueError(f"{label} must have shape (6,); got {arr.shape}.")
+        for arm, closed, open_ in (
+            ("psm1", self.gripper_closed_psm1, self.gripper_open_psm1),
+            ("psm2", self.gripper_closed_psm2, self.gripper_open_psm2),
+        ):
+            if not closed < open_:
+                raise ValueError(
+                    f"{arm} gripper endpoints must satisfy closed < open; "
+                    f"got closed={closed}, open={open_}."
+                )
         self._psm1_identity_rot6d_norm = (
             IDENTITY_ROT6D - self.psm1_rot6d_mean
         ) / self.psm1_rot6d_std
@@ -358,8 +381,8 @@ class CosmoshActionIntegrator:
         self.latched_gripper_psm1 = float(
             np.clip(
                 self.latched_gripper_psm1 + delta,
-                PSM1_GRIPPER_CLOSED,
-                PSM1_GRIPPER_OPEN,
+                self.gripper_closed_psm1,
+                self.gripper_open_psm1,
             )
         )
 
@@ -371,8 +394,8 @@ class CosmoshActionIntegrator:
         self.latched_gripper_psm2 = float(
             np.clip(
                 self.latched_gripper_psm2 + delta,
-                PSM2_GRIPPER_CLOSED,
-                PSM2_GRIPPER_OPEN,
+                self.gripper_closed_psm2,
+                self.gripper_open_psm2,
             )
         )
 

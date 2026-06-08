@@ -267,6 +267,10 @@ def compute_action_chunk(
     psm2_rot6d_mean: np.ndarray | None = None,
     psm2_rot6d_std: np.ndarray | None = None,
     psm2_rot6d_identity_norm: np.ndarray | None = None,
+    psm1_gripper_open: float = PSM1_GRIPPER_OPEN,
+    psm1_gripper_closed: float = PSM1_GRIPPER_CLOSED,
+    psm2_gripper_open: float = PSM2_GRIPPER_OPEN,
+    psm2_gripper_closed: float = PSM2_GRIPPER_CLOSED,
 ) -> np.ndarray:
     """Build a ``(num_frames, 20)`` action chunk from the latest Quest sample.
 
@@ -290,9 +294,11 @@ def compute_action_chunk(
     about translate / gripper.
 
     Gripper mapping (squeeze-to-close, dVRK master-grip semantics):
-    ``trigger=0`` → ``OPEN`` endpoint, ``trigger=1`` → ``CLOSED`` endpoint
-    (per-arm endpoints from ``cosmosh.webrtc.controls``). Written constant
-    across the chunk because ``gripper`` is absolute every frame
+    ``trigger=0`` → ``OPEN`` endpoint, ``trigger=1`` → ``CLOSED`` endpoint.
+    Per-arm endpoints default to the ``cosmosh.webrtc.controls`` module
+    constants but are normally supplied by the runtime from the loaded stats
+    (q01/q99 → normalised) so the range matches the active model. Written
+    constant across the chunk because ``gripper`` is absolute every frame
     (``actions.md`` "Per-frame semantics"), not a delta.
     """
     if num_frames < 1:
@@ -310,8 +316,8 @@ def compute_action_chunk(
         translate_slice_start=_PSM1_TRANSLATE_SLICE_START,
         rot6d_slice_start=_PSM1_ROT6D_SLICE_START,
         gripper_dim=PSM1_GRIPPER_DIM,
-        gripper_open=PSM1_GRIPPER_OPEN,
-        gripper_closed=PSM1_GRIPPER_CLOSED,
+        gripper_open=psm1_gripper_open,
+        gripper_closed=psm1_gripper_closed,
         rot6d_mean=psm1_rot6d_mean,
         rot6d_std=psm1_rot6d_std,
         rot6d_identity_norm=psm1_rot6d_identity_norm,
@@ -325,8 +331,8 @@ def compute_action_chunk(
         translate_slice_start=_PSM2_TRANSLATE_SLICE_START,
         rot6d_slice_start=_PSM2_ROT6D_SLICE_START,
         gripper_dim=PSM2_GRIPPER_DIM,
-        gripper_open=PSM2_GRIPPER_OPEN,
-        gripper_closed=PSM2_GRIPPER_CLOSED,
+        gripper_open=psm2_gripper_open,
+        gripper_closed=psm2_gripper_closed,
         rot6d_mean=psm2_rot6d_mean,
         rot6d_std=psm2_rot6d_std,
         rot6d_identity_norm=psm2_rot6d_identity_norm,
