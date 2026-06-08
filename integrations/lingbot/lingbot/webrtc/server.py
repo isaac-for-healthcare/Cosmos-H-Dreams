@@ -19,41 +19,61 @@ import argparse
 import gc
 import logging
 import os
-import socket
 from pathlib import Path
+from typing import Protocol, cast
 
 import torch
 import torch.distributed as dist
 from aiohttp import web
+from aiohttp.multipart import BodyPartReader
+from loguru import logger
 
-from flashdreams.core.distributed import init as distributed_init
-from lingbot.webrtc.session import (
-    LingbotRuntimeConfig,
-    LingbotWebRTCSessionManager,
+from flashdreams.core.distributed import (
+    configure_loguru_for_distributed,
+)
+from flashdreams.core.distributed import (
+    init as distributed_init,
+)
+from flashdreams.serving.network import get_external_ip
+from flashdreams.serving.webrtc.server import (
+    SESSION_MANAGER_KEY,
     SessionBusyError,
+    WebRTCSessionManager,
+    create_webrtc_app,
+)
+from lingbot.runner import (
+    EXAMPLE_DATA_AVAILABLE_IDXS,
+    EXAMPLE_DATA_DIR_LOCAL,
+    ensure_example_data_downloaded,
+    example_data_dirname,
+)
+from lingbot.webrtc.session import (
+    LingbotImagePayload,
+    LingbotRuntimeConfig,
+    LingbotSessionInput,
+    LingbotWebRTCSessionManager,
+    normalize_prompt_text,
 )
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
-LOGGER = logging.getLogger(__name__)
+MAX_UPLOAD_IMAGE_BYTES = 15 * 1024 * 1024
+MAX_PROMPT_CHARS = 2_000
 
 
-def get_external_ip() -> str:
-    """Get the external IP address of this machine.
+class LingbotSessionManager(WebRTCSessionManager, Protocol):
+    def get_initial_scene(self) -> dict[str, object]: ...
+    def get_first_frame(self) -> LingbotImagePayload: ...
+    def set_pending_session_input(self, session_input: LingbotSessionInput) -> None: ...
 
-    Uses a UDP socket trick to determine which interface would be used
-    to reach an external address. No actual connection is made.
 
-    Returns:
-        The external IP address as a string, or "127.0.0.1" if detection fails.
-    """
-    try:
-        # Create a UDP socket and "connect" to an external address
-        # This doesn't send any data, but tells us which local IP would be used
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("8.8.8.8", 80))
-            return s.getsockname()[0]
-    except Exception:
-        return "127.0.0.1"
+def _get_lingbot_manager(app: web.Application) -> LingbotSessionManager:
+    return cast(LingbotSessionManager, app[SESSION_MANAGER_KEY])
+
+
+def configure_logging(*, world_rank: int | None = None) -> None:
+    configure_loguru_for_distributed(world_rank=world_rank)
+    for logger_name in ("aioice", "aioice.ice", "aiortc"):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
 
 
 def parse_args() -> argparse.Namespace:
@@ -69,7 +89,7 @@ def parse_args() -> argparse.Namespace:
         "--config_name",
         type=str,
         default="lingbot-world-fast",
-        help="Lingbot config preset from LINGBOT_WORLD_CONFIGS.",
+        help="Lingbot config preset from PIPELINE_CONFIGS.",
     )
     parser.add_argument(
         "--no_compile",
@@ -82,82 +102,160 @@ def parse_args() -> argparse.Namespace:
         default="cuda:0",
         help="Torch device used for the Lingbot runtime.",
     )
+    parser.add_argument(
+        "--warmup_chunks",
+        type=int,
+        default=10,
+        help="Number of synthetic startup chunks to generate for kernel autotuning.",
+    )
+    parser.add_argument(
+        "--warmup_timeout_s",
+        type=float,
+        default=600.0,
+        help="Maximum seconds to wait for synthetic startup warmup chunks.",
+    )
+    parser.add_argument(
+        "--fps",
+        type=int,
+        default=16,
+        help="Output video framerate for WebRTC playback.",
+    )
+    parser.add_argument(
+        "--example-idx",
+        "--example_idx",
+        type=int,
+        default=0,
+        choices=EXAMPLE_DATA_AVAILABLE_IDXS,
+        help="Example folder index under assets/example_data/lingbot_world (allowed: 0, 1, 2, 5).",
+    )
     return parser.parse_args()
 
 
 def create_app(
     *,
-    session_manager: LingbotWebRTCSessionManager | None = None,
+    request_session_url: str,
+    session_manager: WebRTCSessionManager | None = None,
 ) -> web.Application:
     manager = session_manager or LingbotWebRTCSessionManager()
-    app = web.Application()
-    app["session_manager"] = manager
+    app = create_webrtc_app(
+        web_dir=WEB_DIR,
+        session_manager=manager,
+        preload_name="Lingbot",
+        request_session_url=request_session_url,
+    )
+    app.router.add_get("/api/session/initial_scene", _initial_scene)
+    app.router.add_get("/api/session/first_frame", _first_frame)
+    app.router.add_post("/api/session/input", _session_input)
+    return app
 
-    async def request_session_page(_: web.Request) -> web.StreamResponse:
-        return web.FileResponse(WEB_DIR / "request_session.html")
 
-    async def offer(request: web.Request) -> web.StreamResponse:
+async def _initial_scene(request: web.Request) -> web.StreamResponse:
+    manager = _get_lingbot_manager(request.app)
+    return web.json_response(manager.get_initial_scene())
+
+
+async def _first_frame(request: web.Request) -> web.StreamResponse:
+    manager = _get_lingbot_manager(request.app)
+    payload = manager.get_first_frame()
+    if not isinstance(payload, LingbotImagePayload):
+        raise web.HTTPInternalServerError(reason="Invalid Lingbot first-frame payload.")
+    return web.Response(body=payload.data, content_type=payload.content_type)
+
+
+async def _read_upload_bytes(field: BodyPartReader) -> bytes:
+    data = bytearray()
+    while True:
+        chunk = await field.read_chunk(size=64 * 1024)
+        if not chunk:
+            break
+        data.extend(chunk)
+        if len(data) > MAX_UPLOAD_IMAGE_BYTES:
+            raise web.HTTPRequestEntityTooLarge(
+                max_size=MAX_UPLOAD_IMAGE_BYTES,
+                actual_size=len(data),
+            )
+    return bytes(data)
+
+
+async def _session_input(request: web.Request) -> web.StreamResponse:
+    prompt: str | None = None
+    image_bytes: bytes | None = None
+    image_url: str | None = None
+    image_content_type = "image/jpeg"
+
+    if request.content_type.startswith("multipart/"):
         try:
-            payload = await request.json()
+            reader = await request.multipart()
         except Exception as exc:
-            raise web.HTTPBadRequest(reason="Expected JSON offer payload.") from exc
-
-        if not isinstance(payload, dict):
-            raise web.HTTPBadRequest(reason="Offer payload must be a JSON object.")
-
-        sdp = payload.get("sdp")
-        offer_type = payload.get("type")
-        if not isinstance(sdp, str) or not sdp:
             raise web.HTTPBadRequest(
-                reason="Offer payload must include non-empty 'sdp'."
-            )
-        if not isinstance(offer_type, str) or not offer_type:
-            raise web.HTTPBadRequest(
-                reason="Offer payload must include non-empty 'type'."
-            )
+                reason="Expected multipart session input."
+            ) from exc
 
-        manager = request.app["session_manager"]
-        try:
-            answer_payload = await manager.create_answer(
-                offer_sdp=sdp,
-                offer_type=offer_type,
-            )
-        except SessionBusyError as exc:
-            raise web.HTTPConflict(reason=str(exc)) from exc
-        except Exception as exc:
-            LOGGER.exception("Failed to process WebRTC offer.")
-            raise web.HTTPInternalServerError(reason=str(exc)) from exc
+        while True:
+            field = await reader.next()
+            if field is None:
+                break
+            if not isinstance(field, BodyPartReader):
+                continue
+            if field.name == "prompt":
+                prompt = normalize_prompt_text(await field.text())
+                if len(prompt) > MAX_PROMPT_CHARS:
+                    raise web.HTTPBadRequest(
+                        reason=f"Prompt must be <= {MAX_PROMPT_CHARS} characters."
+                    )
+                continue
+            if field.name == "image_url":
+                image_url = (await field.text()).strip() or None
+                continue
+            if field.name == "image" and field.filename:
+                image_content_type = field.headers.get(
+                    "Content-Type", "application/octet-stream"
+                )
+                if not image_content_type.startswith("image/"):
+                    raise web.HTTPBadRequest(
+                        reason="Uploaded first frame must be an image."
+                    )
+                image_bytes = await _read_upload_bytes(field)
+                if not image_bytes:
+                    raise web.HTTPBadRequest(
+                        reason="Uploaded first-frame image is empty."
+                    )
+    else:
+        form = await request.post()
+        prompt_raw = form.get("prompt")
+        image_url_raw = form.get("image_url")
+        if isinstance(prompt_raw, str):
+            prompt = normalize_prompt_text(prompt_raw)
+            if len(prompt) > MAX_PROMPT_CHARS:
+                raise web.HTTPBadRequest(
+                    reason=f"Prompt must be <= {MAX_PROMPT_CHARS} characters."
+                )
+        if isinstance(image_url_raw, str):
+            image_url = image_url_raw.strip() or None
 
-        return web.json_response(answer_payload)
+    if image_bytes is not None:
+        image_url = None
 
-    async def healthz(request: web.Request) -> web.StreamResponse:
-        manager = request.app["session_manager"]
-        return web.json_response(
-            {
-                "status": "ok",
-                "runtime_ready": manager.is_runtime_ready(),
-                "session_active": manager.has_active_session(),
-            }
+    if not prompt and image_bytes is None and image_url is None:
+        raise web.HTTPBadRequest(
+            reason="Upload a prompt, an image file, an image URL, or a combination."
         )
 
-    async def on_startup(app: web.Application) -> None:
-        manager = app["session_manager"]
-        LOGGER.info("Preloading Lingbot runtime on startup.")
-        await manager.preload_runtime()
-        LOGGER.info("Lingbot runtime preload complete.")
-
-    async def on_shutdown(app: web.Application) -> None:
-        manager = app["session_manager"]
-        LOGGER.info("Shutting down Lingbot runtime.")
-        await manager.shutdown()
-
-    app.router.add_get("/request_session", request_session_page)
-    app.router.add_post("/api/webrtc/offer", offer)
-    app.router.add_get("/healthz", healthz)
-    app.router.add_static("/static/", WEB_DIR, show_index=False)
-    app.on_startup.append(on_startup)
-    app.on_shutdown.append(on_shutdown)
-    return app
+    manager = _get_lingbot_manager(request.app)
+    try:
+        manager.set_pending_session_input(
+            LingbotSessionInput(
+                prompt=prompt or None,
+                first_frame_image_bytes=image_bytes,
+                first_frame_image_url=image_url,
+                first_frame_content_type=image_content_type,
+            )
+        )
+    except SessionBusyError as exc:
+        raise web.HTTPConflict(reason=str(exc)) from exc
+    except ValueError as exc:
+        raise web.HTTPBadRequest(reason=str(exc)) from exc
+    return web.json_response(manager.get_initial_scene())
 
 
 def build_runtime_config(
@@ -166,11 +264,22 @@ def build_runtime_config(
     device_override: str | None = None,
     context_parallel_size: int = 1,
 ) -> LingbotRuntimeConfig:
+    example_idx = getattr(args, "example_idx", 0)
+    example_dir = EXAMPLE_DATA_DIR_LOCAL / example_data_dirname(example_idx)
+    if (
+        example_idx == 0
+        and not example_dir.exists()
+        and (EXAMPLE_DATA_DIR_LOCAL / "image.jpg").exists()
+    ):
+        example_dir = EXAMPLE_DATA_DIR_LOCAL
     return LingbotRuntimeConfig(
         config_name=args.config_name,
         compile_network=not args.no_compile,
         context_parallel_size=context_parallel_size,
         device=device_override or args.device,
+        warmup_chunks=args.warmup_chunks,
+        warmup_timeout_s=args.warmup_timeout_s,
+        example_data_dir=example_dir,
     )
 
 
@@ -214,8 +323,9 @@ def initialize_distributed(
             torch_device = torch.device("cuda:0")
     torch.cuda.set_device(torch_device)
 
-    LOGGER.info(
-        "Rank %s initialized Lingbot runtime with context_parallel_size %s",
+    configure_logging(world_rank=world_rank)
+    logger.info(
+        "Rank {} initialized Lingbot runtime with context_parallel_size {}",
         world_rank,
         world_size,
     )
@@ -223,14 +333,25 @@ def initialize_distributed(
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-    )
+    configure_logging()
     args = parse_args()
+    if args.fps <= 0:
+        raise ValueError("--fps must be > 0")
 
     runtime_device, world_rank, context_parallel_size = initialize_distributed(
         default_device=args.device
+    )
+
+    # Pull the bundled example-data assets onto rank 0 (and barrier the
+    # rest) before constructing the session manager: the manager's
+    # initial-sync step checks the example_data_dir for the first frame
+    # / intrinsics / poses / prompt files and raises FileNotFoundError
+    # otherwise. Mirrors the offline runner's pre-flight behavior so the
+    # WebRTC entry point is launchable on a fresh checkout with no
+    # manual file staging.
+    ensure_example_data_downloaded(
+        is_rank_zero=(world_rank == 0),
+        example_idx=args.example_idx,
     )
 
     runtime_config = build_runtime_config(
@@ -238,10 +359,17 @@ def main() -> None:
         device_override=str(runtime_device),
         context_parallel_size=context_parallel_size,
     )
-    session_manager = LingbotWebRTCSessionManager(runtime_config=runtime_config)
+    session_manager = LingbotWebRTCSessionManager(
+        runtime_config=runtime_config,
+        fps=args.fps,
+    )
     if world_rank == 0:
-        app = create_app(session_manager=session_manager)
-        print(f"Starting on external IP: {get_external_ip()}")
+        external_ip = get_external_ip()
+        app = create_app(
+            session_manager=session_manager,
+            request_session_url=f"http://{external_ip}:{args.port}/request_session",
+        )
+        logger.info("Starting on external IP: {}", external_ip)
         try:
             web.run_app(app, host=args.host, port=args.port)
         finally:
@@ -250,7 +378,7 @@ def main() -> None:
         try:
             session_manager.wait_for_termination()
         except KeyboardInterrupt:
-            LOGGER.warning("Worker rank interrupted, shutting down.")
+            logger.warning("Worker rank interrupted, shutting down.")
 
     gc.collect()
     if torch.cuda.is_available():
@@ -259,7 +387,7 @@ def main() -> None:
 
     if dist.is_initialized():
         dist.barrier()
-        LOGGER.info("[Rank %s] Destroying process group", world_rank)
+        logger.info("[Rank {}] Destroying process group", world_rank)
         dist.destroy_process_group()
 
 

@@ -24,7 +24,7 @@ from loguru import logger
 from torch import Tensor
 from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
-from flashdreams.core.io.hf import should_use_local_files_only
+from flashdreams.core.io.hf import maybe_download_hf_repo_on_rank0
 from flashdreams.infra.encoder import Encoder, EncoderConfig
 
 
@@ -32,10 +32,20 @@ from flashdreams.infra.encoder import Encoder, EncoderConfig
 class CosmosReason1TextEncoderConfig(EncoderConfig):
     """Config for the Cosmos-Reason1 text encoder."""
 
-    _target: type = field(default_factory=lambda: CosmosReason1TextEncoder)
+    _target: type["CosmosReason1TextEncoder"] = field(
+        default_factory=lambda: CosmosReason1TextEncoder
+    )
 
     model_name: str = "nvidia/Cosmos-Reason1-7B"
     """HF repo id of the underlying Qwen2.5-VL model."""
+
+    revision: str = "3210bec0495fdc7a8d3dbb8d58da5711eab4b423"
+    """HF commit hash to pin.
+
+    Defaults to the Cosmos-Reason1.1 SFT checkpoint
+    (``sft_exp721-1_qwen7b_tl_721_5vs5_s3_balanced_n32_resume_16k/iter_16000``)
+    that the Cosmos-Predict 2.5 2B model was trained on.
+    """
 
     max_length: int = 512
     """Token length to pad/truncate to."""
@@ -76,24 +86,34 @@ class CosmosReason1TextEncoder(Encoder):
         self.embedding_concat_strategy = config.embedding_concat_strategy
         self.n_layers_per_group = config.n_layers_per_group
 
-        local_files_only = should_use_local_files_only(config.model_name)
+        maybe_download_hf_repo_on_rank0(
+            config.model_name,
+            revision=config.revision,
+        )
 
         self.processor = AutoProcessor.from_pretrained(
             config.model_name,
-            local_files_only=local_files_only,
+            revision=config.revision,
+            local_files_only=True,
         )
         self.tokenizer = self.processor.tokenizer
 
-        logger.info(f"Loading Cosmos-Reason1 model from {config.model_name}")
+        logger.info(
+            f"Loading Cosmos-Reason1 model from {config.model_name}"
+            + (f"@{config.revision}" if config.revision else "")
+        )
         self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             config.model_name,
-            local_files_only=local_files_only,
+            revision=config.revision,
+            local_files_only=True,
             dtype=config.dtype,
         )
         self.model.eval().requires_grad_(False)
 
-        self.hidden_size = self.model.config.hidden_size  # 3584 for Qwen2.5-7B
-        self.num_layers = self.model.config.num_hidden_layers  # 28 for Qwen2.5-7B
+        # ``transformers>=5.8`` nests LM dims under ``text_config``.
+        text_cfg = getattr(self.model.config, "text_config", self.model.config)
+        self.hidden_size = text_cfg.hidden_size  # 3584 for Cosmos-Reason1-7B
+        self.num_layers = text_cfg.num_hidden_layers  # 28 for Cosmos-Reason1-7B
 
     def _mean_normalize(self, tensor: Tensor) -> Tensor:
         return (tensor - tensor.mean(dim=-1, keepdim=True)) / (
@@ -131,6 +151,12 @@ class CosmosReason1TextEncoder(Encoder):
                 add_vision_id=False,
                 return_tensors="pt",
             )
+            # ``transformers>=5.8`` may return a ``BatchEncoding`` mapping here
+            # instead of a raw tensor; keep backward compatibility with both.
+            if not torch.is_tensor(formatted):
+                formatted = formatted["input_ids"]
+            if formatted.ndim == 1:
+                formatted = formatted.unsqueeze(0)
 
             if formatted.shape[1] < self.max_length:
                 pad_len = self.max_length - formatted.shape[1]

@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 from argparse import Namespace
@@ -5,6 +20,8 @@ from argparse import Namespace
 import pytest
 import torch
 from lingbot.webrtc import server
+
+pytestmark = pytest.mark.ci_gpu
 
 
 class _FakeSessionManager:
@@ -26,6 +43,10 @@ def _args(device: str = "cuda:0") -> Namespace:
         config_name="LingBot-World-Fast",
         no_compile=False,
         device=device,
+        warmup_chunks=10,
+        warmup_timeout_s=600.0,
+        fps=16,
+        example_idx=0,
     )
 
 
@@ -118,6 +139,7 @@ def test_initialize_distributed_rejects_cpu_default_device(
 def test_main_rank0_sends_exit_signal(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_manager = _FakeSessionManager()
     runtime_configs = []
+    request_session_urls = []
 
     monkeypatch.delenv("RANK", raising=False)
     monkeypatch.delenv("WORLD_SIZE", raising=False)
@@ -127,13 +149,25 @@ def test_main_rank0_sends_exit_signal(monkeypatch: pytest.MonkeyPatch) -> None:
         "initialize_distributed",
         lambda default_device: (torch.device("cuda:2"), 0, 1),
     )
+    # Don't hit the network for the bundled example assets in a unit test.
+    monkeypatch.setattr(server, "ensure_example_data_downloaded", lambda **kwargs: None)
 
-    def _make_manager(runtime_config):
+    manager_fps: list[int] = []
+
+    def _make_manager(runtime_config, fps):
         runtime_configs.append(runtime_config)
+        manager_fps.append(fps)
         return fake_manager
 
     monkeypatch.setattr(server, "LingbotWebRTCSessionManager", _make_manager)
-    monkeypatch.setattr(server, "create_app", lambda session_manager: object())
+    monkeypatch.setattr(server, "get_external_ip", lambda: "203.0.113.10")
+
+    def _create_app(*, session_manager, request_session_url=None):
+        assert session_manager is fake_manager
+        request_session_urls.append(request_session_url)
+        return object()
+
+    monkeypatch.setattr(server, "create_app", _create_app)
     monkeypatch.setattr(server.web, "run_app", lambda app, host, port: None)
     monkeypatch.setattr(server.torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(server.dist, "is_initialized", lambda: False)
@@ -144,6 +178,8 @@ def test_main_rank0_sends_exit_signal(monkeypatch: pytest.MonkeyPatch) -> None:
     assert fake_manager.wait_called is False
     assert runtime_configs[0].device == "cuda:2"
     assert runtime_configs[0].context_parallel_size == 1
+    assert manager_fps == [16]
+    assert request_session_urls == ["http://203.0.113.10:8080/request_session"]
 
 
 def test_main_worker_rank_waits_for_termination(
@@ -160,9 +196,14 @@ def test_main_worker_rank_waits_for_termination(
     )
     monkeypatch.setattr(server.dist, "is_initialized", lambda: False)
     monkeypatch.setattr(server.torch.cuda, "is_available", lambda: False)
+    # Don't hit the network for the bundled example assets in a unit test.
+    monkeypatch.setattr(server, "ensure_example_data_downloaded", lambda **kwargs: None)
 
-    def _make_manager(runtime_config):
+    manager_fps: list[int] = []
+
+    def _make_manager(runtime_config, fps):
         runtime_configs.append(runtime_config)
+        manager_fps.append(fps)
         return fake_manager
 
     monkeypatch.setattr(server, "LingbotWebRTCSessionManager", _make_manager)
@@ -173,3 +214,4 @@ def test_main_worker_rank_waits_for_termination(
     assert fake_manager.exit_called is False
     assert runtime_configs[0].device == "cuda:1"
     assert runtime_configs[0].context_parallel_size == 2
+    assert manager_fps == [16]

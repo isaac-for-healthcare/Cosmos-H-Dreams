@@ -17,8 +17,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import io
 import json
-import logging
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections import deque
 from dataclasses import dataclass, field
 from enum import IntEnum
 from pathlib import Path
@@ -28,36 +32,161 @@ import cv2
 import numpy as np
 import torch
 import torch.distributed as dist
-from aiortc import RTCPeerConnection, RTCSessionDescription
+from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
+from loguru import logger
 
 from flashdreams.core.distributed.rank_orchestration import (
     RankCoordinator,
     distributed_op,
 )
 from flashdreams.infra.config import derive_config
-from flashdreams.recipes.lingbot_world.config import LINGBOT_WORLD_CONFIGS
-from flashdreams.recipes.lingbot_world.encoder.camctrl import CamCtrlInput
-from flashdreams.recipes.lingbot_world.encoder.utils import (
-    get_Ks_transformed,
-    preprocess_example_poses,
-)
-from lingbot.webrtc.controls import (
+from flashdreams.serving.webrtc.controls import (
     CameraPoseIntegrator,
     KeyboardResampler,
     PoseSegment,
 )
-from lingbot.webrtc.media import LingbotVideoTrack
+from flashdreams.serving.webrtc.media import BufferedVideoTrack
+from flashdreams.serving.webrtc.server import SessionBusyError
+from flashdreams.serving.webrtc.warmup import (
+    run_loopback_warmup_session,
+    wait_for_ice_gathering_complete,
+)
+from lingbot.encoder.utils import preprocess_example_poses
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
-LOGGER = logging.getLogger(__name__)
+DEFAULT_CLIENT_LIVENESS_TIMEOUT_S = 10.0
+_CLIENT_LIVENESS_CHECK_INTERVAL_S = 1.0
+_INTRINSICS_REFERENCE_HEIGHT = 480
+_INTRINSICS_REFERENCE_WIDTH = 832
+_DEFAULT_INTRINSICS = (
+    502.9115905761719,
+    503.1081237792969,
+    415.7778625488281,
+    239.7777862548828,
+)
+# Aligned with the world scale computed from the first LingBot World demo scene.
+_DEFAULT_WORLD_SCALE = 1.271182656288147
+_DEFAULT_PROMPT = (
+    "The video presents a soaring journey through a fantasy jungle. The wind whips "
+    "past the rider's blue hands gripping the reins, causing the leather straps to "
+    "vibrate. The ancient gothic castle approaches steadily, its stone details "
+    "becoming clearer against the backdrop of floating islands and distant waterfalls."
+)
+_DEFAULT_DEMO_BASE_URL = (
+    "https://raw.githubusercontent.com/robbyant/lingbot-world/main/examples/00"
+)
+_DEFAULT_IMAGE_URL = f"{_DEFAULT_DEMO_BASE_URL}/image.jpg"
+_DEFAULT_INTRINSICS_URL = f"{_DEFAULT_DEMO_BASE_URL}/intrinsics.npy"
+_DEFAULT_POSES_URL = f"{_DEFAULT_DEMO_BASE_URL}/poses.npy"
+_MAX_REMOTE_IMAGE_BYTES = 15 * 1024 * 1024
+_MAX_REMOTE_NUMPY_BYTES = 64 * 1024 * 1024
+_REMOTE_READ_TIMEOUT_S = 20.0
 
 
 class LingbotRuntimeError(RuntimeError):
     """Raised when the Lingbot runtime is used incorrectly."""
 
 
-class SessionBusyError(RuntimeError):
-    """Raised when a second peer tries to open a session."""
+def _content_type_for_image_path(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix in {".jpg", ".jpeg"}:
+        return "image/jpeg"
+    if suffix == ".png":
+        return "image/png"
+    if suffix == ".webp":
+        return "image/webp"
+    return "application/octet-stream"
+
+
+def _normalize_github_blob_url(url: str, parsed: urllib.parse.ParseResult) -> str:
+    hostname = (parsed.hostname or "").lower()
+    if hostname not in {"github.com", "www.github.com"}:
+        return url
+
+    path_parts = [part for part in parsed.path.split("/") if part]
+    if len(path_parts) < 5 or path_parts[2] != "blob":
+        return url
+
+    owner, repo, _, ref, *file_path = path_parts
+    raw_path = "/" + "/".join([owner, repo, ref, *file_path])
+    return urllib.parse.urlunparse(
+        ("https", "raw.githubusercontent.com", raw_path, "", "", "")
+    )
+
+
+def _validate_remote_url(url: str, *, field_name: str) -> str:
+    normalized = url.strip()
+    parsed = urllib.parse.urlparse(normalized)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(f"{field_name} must be an http(s) URL.")
+    return _normalize_github_blob_url(normalized, parsed)
+
+
+def _read_remote_bytes(
+    url: str, *, max_bytes: int, field_name: str
+) -> tuple[bytes, str]:
+    normalized = _validate_remote_url(url, field_name=field_name)
+    request = urllib.request.Request(
+        normalized,
+        headers={"User-Agent": "flashdreams-lingbot-webrtc/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(
+            request, timeout=_REMOTE_READ_TIMEOUT_S
+        ) as response:
+            data = response.read(max_bytes + 1)
+            content_type = response.headers.get_content_type()
+    except urllib.error.URLError as exc:
+        raise ValueError(f"Failed to fetch {field_name}: {exc.reason}") from exc
+    if len(data) > max_bytes:
+        raise ValueError(f"{field_name} exceeds {max_bytes} bytes.")
+    if not data:
+        raise ValueError(f"{field_name} returned an empty response.")
+    return data, content_type
+
+
+def _decode_image_bytes_rgb(image_bytes: bytes, *, field_name: str) -> np.ndarray:
+    encoded = np.frombuffer(image_bytes, dtype=np.uint8)
+    image_bgr = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+    if image_bgr is None:
+        raise ValueError(f"{field_name} could not be decoded as an image.")
+    return cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+
+
+def _load_npy_payload(source: Path | str, *, field_name: str) -> np.ndarray:
+    if isinstance(source, Path):
+        return np.load(source, allow_pickle=False)
+    data, _ = _read_remote_bytes(
+        source, max_bytes=_MAX_REMOTE_NUMPY_BYTES, field_name=field_name
+    )
+    return np.load(io.BytesIO(data), allow_pickle=False)
+
+
+def _pipeline_configs() -> dict[str, Any]:
+    from lingbot.config import PIPELINE_CONFIGS  # noqa: PLC0415
+
+    return PIPELINE_CONFIGS
+
+
+def _transform_intrinsics(
+    intrinsics: torch.Tensor,
+    *,
+    height_org: int,
+    width_org: int,
+    height_resize: int,
+    width_resize: int,
+    height_final: int,
+    width_final: int,
+) -> torch.Tensor:
+    fx, fy, cx, cy = intrinsics.chunk(4, dim=-1)
+    scale_x = width_resize / width_org
+    scale_y = height_resize / height_org
+    transformed = torch.zeros_like(intrinsics)
+    transformed[..., 0:1] = fx * scale_x
+    transformed[..., 1:2] = fy * scale_y
+    transformed[..., 2:3] = cx * scale_x - (width_resize - width_final) / 2
+    transformed[..., 3:4] = cy * scale_y - (height_resize - height_final) / 2
+    return transformed
 
 
 class LingbotControlSignal(IntEnum):
@@ -70,7 +199,7 @@ class LingbotControlSignal(IntEnum):
 
 @dataclass(slots=True)
 class LingbotRuntimeConfig:
-    config_name: str = "lingbot-world-fast-flash"
+    config_name: str = "lingbot-world-fast-taehv-window15-sink3"
     compile_network: bool = True
     seed: int = 42
     context_parallel_size: int = 1
@@ -78,12 +207,37 @@ class LingbotRuntimeConfig:
     video_height: int = 464
     video_width: int = 832
     world_scale: float | None = None
+    default_intrinsics: tuple[float, float, float, float] | None = None
+    default_prompt: str = _DEFAULT_PROMPT
+    default_image_url: str | None = _DEFAULT_IMAGE_URL
+    default_intrinsics_url: str | None = _DEFAULT_INTRINSICS_URL
+    default_poses_url: str | None = _DEFAULT_POSES_URL
+    warmup_chunks: int = 10
+    warmup_timeout_s: float = 600.0
 
     example_data_dir: Path = REPO_ROOT / "assets/example_data/lingbot_world"
     first_frame_filename: str = "image.jpg"
     intrinsics_filename: str = "intrinsics.npy"
     poses_filename: str = "poses.npy"
     prompt_filename: str = "prompt.txt"
+
+
+@dataclass(frozen=True, slots=True)
+class LingbotSessionInput:
+    prompt: str | None = None
+    first_frame_image_bytes: bytes | None = None
+    first_frame_image_url: str | None = None
+    first_frame_content_type: str = "image/jpeg"
+
+
+@dataclass(frozen=True, slots=True)
+class LingbotImagePayload:
+    data: bytes
+    content_type: str
+
+
+def normalize_prompt_text(prompt: str) -> str:
+    return " ".join(prompt.split())
 
 
 @dataclass(slots=True)
@@ -147,12 +301,14 @@ class LingbotInferenceRuntime:
             return
         await asyncio.to_thread(self._initialize_sync_all_ranks)
 
-    async def reset_for_new_session(self) -> None:
+    async def reset_for_new_session(
+        self, session_input: LingbotSessionInput | None = None
+    ) -> None:
         if self._closed:
             raise LingbotRuntimeError("Runtime is closed.")
         if self._pipeline is None:
             raise LingbotRuntimeError("Runtime is not initialized.")
-        await asyncio.to_thread(self._reset_rollout_sync_all_ranks)
+        await asyncio.to_thread(self._reset_rollout_sync_all_ranks, session_input)
 
     async def close(self) -> None:
         self._closed = True
@@ -236,8 +392,10 @@ class LingbotInferenceRuntime:
         self._initialize_sync()
 
     @distributed_op(LingbotControlSignal.RESET_SESSION)
-    def _reset_rollout_sync_all_ranks(self) -> None:
-        self._reset_rollout_sync()
+    def _reset_rollout_sync_all_ranks(
+        self, session_input: LingbotSessionInput | None = None
+    ) -> None:
+        self._reset_rollout_sync(session_input=session_input)
 
     @distributed_op(LingbotControlSignal.ACTION_STEP)
     def _generate_chunk_sync_all_ranks(
@@ -255,36 +413,149 @@ class LingbotInferenceRuntime:
         if self._pipeline is not None:
             return
 
-        data_dir = self.config.example_data_dir
-        first_frame_path = data_dir / self.config.first_frame_filename
-        intrinsics_path = data_dir / self.config.intrinsics_filename
-        poses_path = data_dir / self.config.poses_filename
-        prompt_path = data_dir / self.config.prompt_filename
-
-        missing_paths = [
-            str(path)
-            for path in (first_frame_path, intrinsics_path, prompt_path)
-            if not path.exists()
-        ]
-        if missing_paths:
-            raise FileNotFoundError(
-                "Missing Lingbot example assets: " + ", ".join(missing_paths)
-            )
-
-        if self.config.config_name not in LINGBOT_WORLD_CONFIGS:
-            supported = ", ".join(sorted(LINGBOT_WORLD_CONFIGS))
+        pipeline_configs = _pipeline_configs()
+        if self.config.config_name not in pipeline_configs:
+            supported = ", ".join(sorted(pipeline_configs))
             raise ValueError(
-                f"Unknown config_name={self.config.config_name!r}. Supported: {supported}"
+                f"Unknown config_name={self.config.config_name!r}. "
+                f"Supported: {supported}"
             )
 
         self._device = torch.device(self.config.device)
         if self._device.type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("CUDA is required for Lingbot runtime.")
 
-        image_bgr = cv2.imread(str(first_frame_path), cv2.IMREAD_COLOR)
-        if image_bgr is None:
-            raise RuntimeError(f"Failed to read first frame from {first_frame_path}")
-        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        self._base_intrinsics = self._build_base_intrinsics()
+        self._world_scale = self._resolve_world_scale()
+
+        rollout_seed = (
+            self.config.seed + self.rank
+            if self.config.context_parallel_size > 1
+            else self.config.seed
+        )
+        pipeline_config = derive_config(
+            base_config=pipeline_configs[self.config.config_name],
+            enable_sync_and_profile=True,
+            diffusion_model=dict(
+                seed=rollout_seed,
+                transformer=dict(compile_network=self.config.compile_network),
+            ),
+        )
+        self._pipeline = pipeline_config.setup().to(device=self._device)
+        self._reset_rollout_sync()
+
+    def _build_base_intrinsics(self) -> torch.Tensor:
+        if self._device is None:
+            raise LingbotRuntimeError("Runtime device is not initialized.")
+        intrinsics_path = self.config.example_data_dir / self.config.intrinsics_filename
+        if self.config.default_intrinsics is not None:
+            intrinsics = np.asarray(self.config.default_intrinsics, dtype=np.float32)
+        elif intrinsics_path.exists():
+            intrinsics = _load_npy_payload(
+                intrinsics_path, field_name="Lingbot default intrinsics"
+            )
+        elif self.config.default_intrinsics_url:
+            intrinsics = _load_npy_payload(
+                self.config.default_intrinsics_url,
+                field_name="Lingbot default intrinsics URL",
+            )
+        else:
+            intrinsics = np.asarray(_DEFAULT_INTRINSICS, dtype=np.float32)
+
+        base_intrinsics = np.asarray(intrinsics, dtype=np.float32)
+        if base_intrinsics.ndim == 2 and base_intrinsics.shape[1] == 4:
+            base_intrinsics = base_intrinsics[0]
+        if base_intrinsics.shape != (4,):
+            raise ValueError(
+                f"Expected default Lingbot intrinsics shape (4,) or [N, 4], "
+                f"got {base_intrinsics.shape}."
+            )
+
+        base_intrinsics_t = torch.from_numpy(base_intrinsics).to(
+            device=self._device, dtype=torch.float32
+        )
+        return _transform_intrinsics(
+            base_intrinsics_t.view(1, 4),
+            height_org=_INTRINSICS_REFERENCE_HEIGHT,
+            width_org=_INTRINSICS_REFERENCE_WIDTH,
+            height_resize=self.config.video_height,
+            width_resize=self.config.video_width,
+            height_final=self.config.video_height,
+            width_final=self.config.video_width,
+        ).view(4)
+
+    def _resolve_world_scale(self) -> float:
+        if self.config.world_scale is not None:
+            world_scale = float(self.config.world_scale)
+            if world_scale <= 0:
+                raise ValueError(f"world_scale must be > 0, got {world_scale}.")
+            return world_scale
+
+        poses_path = self.config.example_data_dir / self.config.poses_filename
+        if poses_path.exists():
+            poses = _load_npy_payload(poses_path, field_name="Lingbot default poses")
+        elif self.config.default_poses_url:
+            poses = _load_npy_payload(
+                self.config.default_poses_url,
+                field_name="Lingbot default poses URL",
+            )
+        else:
+            return _DEFAULT_WORLD_SCALE
+
+        _, world_scale = preprocess_example_poses(np.asarray(poses, dtype=np.float32))
+        world_scale = float(world_scale)
+        if world_scale <= 0:
+            return _DEFAULT_WORLD_SCALE
+        return world_scale
+
+    def _load_default_prompt(self) -> str:
+        prompt_path = self.config.example_data_dir / self.config.prompt_filename
+        if prompt_path.exists():
+            with prompt_path.open("r", encoding="utf-8") as handle:
+                prompt = normalize_prompt_text(handle.readline())
+            if prompt:
+                return prompt
+        return normalize_prompt_text(self.config.default_prompt) or _DEFAULT_PROMPT
+
+    def _load_default_first_frame_rgb(self) -> np.ndarray:
+        first_frame_path = (
+            self.config.example_data_dir / self.config.first_frame_filename
+        )
+        if first_frame_path.exists():
+            image_bgr = cv2.imread(str(first_frame_path), cv2.IMREAD_COLOR)
+            if image_bgr is None:
+                raise RuntimeError(
+                    f"Failed to read first frame from {first_frame_path}"
+                )
+            return cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+
+        if self.config.default_image_url:
+            return self._load_remote_first_frame_rgb(self.config.default_image_url)
+
+        return np.full(
+            (self.config.video_height, self.config.video_width, 3),
+            127,
+            dtype=np.uint8,
+        )
+
+    def _load_remote_first_frame_rgb(self, image_url: str) -> np.ndarray:
+        image_bytes, _ = _read_remote_bytes(
+            image_url,
+            max_bytes=_MAX_REMOTE_IMAGE_BYTES,
+            field_name="Lingbot first-frame image URL",
+        )
+        return _decode_image_bytes_rgb(
+            image_bytes, field_name="Lingbot first-frame image URL"
+        )
+
+    def _load_uploaded_first_frame_rgb(self, image_bytes: bytes) -> np.ndarray:
+        return _decode_image_bytes_rgb(
+            image_bytes, field_name="Uploaded first-frame image"
+        )
+
+    def _first_frame_to_tensor(self, image_rgb: np.ndarray) -> torch.Tensor:
+        if self._device is None:
+            raise LingbotRuntimeError("Runtime device is not initialized.")
         # Bicubic to match the upstream Lingbot World demo / generate_fast.py
         # (which uses ``F.interpolate(mode='bicubic')`` over the ``[-1, 1]``
         # tensor); bilinear here would give a different first-frame VAE latent.
@@ -298,78 +569,50 @@ class LingbotInferenceRuntime:
             / 127.5
             - 1.0
         )
-        first_frame_t = first_frame_t.permute(2, 0, 1).unsqueeze(0)
-        first_frames_t = first_frame_t.unsqueeze(0).unsqueeze(0)  # [1, 1, 1, C, H, W]
+        # Lingbot's shipped configs pin ``batch_shape=()`` (single-rollout
+        # layout), so the pipeline expects the first frame in shape
+        # ``[T=1, C, H, W]``; the leading ``unsqueeze(0)`` lifts ``[C, H, W]``
+        # to that ``T=1`` axis the I2V encoder pads/slices against.
+        return first_frame_t.permute(2, 0, 1).unsqueeze(0)
 
-        intrinsics_np = np.load(intrinsics_path)
-        if intrinsics_np.ndim == 1:
-            base_intrinsics = intrinsics_np
-        else:
-            base_intrinsics = intrinsics_np[0]
-        if base_intrinsics.shape != (4,):
-            raise ValueError(
-                f"Expected base intrinsics shape (4,), got {base_intrinsics.shape}"
-            )
-        # The provided intrinsics are stored at the original 480x832 image
-        # size; rescale them to the inference resolution so Plücker rays
-        # land on the right pixel centers.
-        base_intrinsics_t = torch.from_numpy(base_intrinsics).to(
-            device=self._device, dtype=torch.float32
+    def _prepare_session_input_state(
+        self, session_input: LingbotSessionInput | None
+    ) -> None:
+        prompt = (
+            normalize_prompt_text(session_input.prompt)
+            if session_input is not None and session_input.prompt is not None
+            else self._load_default_prompt()
         )
-        base_intrinsics_t = get_Ks_transformed(
-            base_intrinsics_t.view(1, 4),
-            height_org=480,
-            width_org=832,
-            height_resize=self.config.video_height,
-            width_resize=self.config.video_width,
-            height_final=self.config.video_height,
-            width_final=self.config.video_width,
-        ).view(4)
-        self._base_intrinsics = base_intrinsics_t
-
-        with prompt_path.open("r", encoding="utf-8") as handle:
-            prompt = handle.readline().strip()
         if not prompt:
-            raise ValueError("Prompt file is empty.")
+            raise ValueError("Lingbot prompt is empty.")
 
-        if self.config.world_scale is not None:
-            self._world_scale = float(self.config.world_scale)
-        elif poses_path.exists():
-            # Match upstream: world-scale normalizer is computed on the
-            # encoded-length poses, not the raw stream. The returned
-            # ``poses`` array (per-pixel-frame cadence) is unused here —
-            # webrtc generates poses live via :class:`CameraPoseIntegrator`.
-            _, self._world_scale = preprocess_example_poses(np.load(poses_path))
-            if self._world_scale <= 0:
-                self._world_scale = 1.0
+        if session_input is not None and session_input.first_frame_image_bytes:
+            image_rgb = self._load_uploaded_first_frame_rgb(
+                session_input.first_frame_image_bytes
+            )
+        elif session_input is not None and session_input.first_frame_image_url:
+            image_rgb = self._load_remote_first_frame_rgb(
+                session_input.first_frame_image_url
+            )
+        else:
+            image_rgb = self._load_default_first_frame_rgb()
 
-        rollout_seed = (
-            self.config.seed + self.rank
-            if self.config.context_parallel_size > 1
-            else self.config.seed
-        )
-        pipeline_config = derive_config(
-            base_config=LINGBOT_WORLD_CONFIGS[self.config.config_name],
-            enable_sync_and_profile=True,
-            diffusion_model=dict(
-                seed=rollout_seed,
-                transformer=dict(compile_network=self.config.compile_network),
-            ),
-        )
-        self._pipeline = pipeline_config.setup().to(device=self._device)
-        self._first_frames = first_frames_t
+        self._first_frames = self._first_frame_to_tensor(image_rgb)
         self._prompt = prompt
-        self._reset_rollout_sync()
 
-    def _reset_rollout_sync(self) -> None:
+    def _reset_rollout_sync(
+        self, session_input: LingbotSessionInput | None = None
+    ) -> None:
         if self._pipeline is None:
             raise LingbotRuntimeError("Runtime pipeline is not initialized.")
-        if self._first_frames is None or self._prompt is None:
-            raise LingbotRuntimeError("Runtime input state is not initialized.")
 
         if self._cache is not None:
             del self._cache
             self._cache = None
+
+        self._prepare_session_input_state(session_input)
+        if self._first_frames is None or self._prompt is None:
+            raise LingbotRuntimeError("Runtime input state is not initialized.")
 
         self.pose_integrator = CameraPoseIntegrator()
         self.autoregressive_index = 0
@@ -423,50 +666,14 @@ class LingbotInferenceRuntime:
             raise LingbotRuntimeError(
                 f"Chunk={self.autoregressive_index} received empty segments."
             )
-        # Union of every state seen in the chunk plus first/last
-        # segment snapshots; one log line summarising the whole chunk.
-        union_keys: set[str] = set().union(*(s for _, _, s in segments))
-        first_keys = segments[0][2]
-        last_keys = segments[-1][2]
         poses = self.pose_integrator.integrate_chunk(
             segments=segments, frame_times=frame_times
         )
-        first_pose = poses[0]
-        last_pose = poses[-1]
-        first_translation = first_pose[:3, 3].tolist()
-        last_translation = last_pose[:3, 3].tolist()
-        first_heading_y = float(np.arctan2(first_pose[0, 2], first_pose[0, 0]))
-        last_heading_y = float(np.arctan2(last_pose[0, 2], last_pose[0, 0]))
-        LOGGER.info(
-            "Rendering chunk=%s num_frames=%s segments=%d union_keys=%s "
-            "first_keys=%s last_keys=%s first_xyz=%s last_xyz=%s "
-            "first_heading_y=%.5f last_heading_y=%.5f",
-            self.autoregressive_index,
-            num_frames,
-            len(segments),
-            sorted(union_keys),
-            sorted(first_keys),
-            sorted(last_keys),
-            [round(float(x), 5) for x in first_translation],
-            [round(float(x), 5) for x in last_translation],
-            first_heading_y,
-            last_heading_y,
-        )
-        LOGGER.info(
-            "Chunk=%s first_pose=%s",
-            self.autoregressive_index,
-            np.array2string(first_pose, precision=4, suppress_small=True),
-        )
-        LOGGER.info(
-            "Chunk=%s last_pose=%s",
-            self.autoregressive_index,
-            np.array2string(last_pose, precision=4, suppress_small=True),
-        )
         poses_t = torch.from_numpy(poses).to(device=self._device, dtype=torch.float32)
-        poses_t = poses_t.view(1, 1, num_frames, 4, 4)
-        intrinsics_t = self._base_intrinsics.view(1, 1, 1, 4).repeat(
-            1, 1, num_frames, 1
-        )
+        poses_t = poses_t.view(num_frames, 4, 4)
+        intrinsics_t = self._base_intrinsics.view(1, 4).repeat(num_frames, 1)
+
+        from lingbot.encoder.camctrl import CamCtrlInput  # noqa: PLC0415
 
         camctrl_input = CamCtrlInput(
             intrinsics=intrinsics_t,
@@ -493,7 +700,7 @@ class LingbotInferenceRuntime:
 @dataclass(slots=True)
 class _ManagedLingbotSession:
     runtime: LingbotInferenceRuntime
-    video_track: LingbotVideoTrack
+    video_track: BufferedVideoTrack
     peer_connection: Any
     resampler: KeyboardResampler
     """Per-session sparse-edge resampler; produces the per-frame keyboard
@@ -514,6 +721,13 @@ class _ManagedLingbotSession:
     virtual clock to ``loop.time()`` so chunk 0's window starts at the
     moment of first interaction, not at data-channel open time."""
 
+    pending_action_arrivals: deque[float] = field(default_factory=deque)
+    """Accepted control-edge arrival times not yet reported in latency telemetry."""
+
+    last_client_message_at: float = 0.0
+    liveness_task: asyncio.Task[Any] | None = None
+    """Watchdog that closes the session when browser heartbeats stop."""
+
     closed: bool = False
 
     async def close(self) -> None:
@@ -521,11 +735,26 @@ class _ManagedLingbotSession:
             return
         self.closed = True
 
-        if self.generation_task is not None and not self.generation_task.done():
+        current_task = asyncio.current_task()
+        if (
+            self.liveness_task is not None
+            and self.liveness_task is not current_task
+            and not self.liveness_task.done()
+        ):
+            self.liveness_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.liveness_task
+        self.liveness_task = None
+
+        if (
+            self.generation_task is not None
+            and self.generation_task is not current_task
+            and not self.generation_task.done()
+        ):
             self.generation_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self.generation_task
-            self.generation_task = None
+        self.generation_task = None
 
         await self.video_track.close()
         await self.peer_connection.close()
@@ -539,14 +768,21 @@ class LingbotWebRTCSessionManager:
         *,
         runtime_config: LingbotRuntimeConfig | None = None,
         fps: int = 16,
+        client_liveness_timeout_s: float = DEFAULT_CLIENT_LIVENESS_TIMEOUT_S,
     ) -> None:
         if fps <= 0:
             raise ValueError("fps must be > 0")
+        if client_liveness_timeout_s <= 0:
+            raise ValueError("client_liveness_timeout_s must be > 0")
         self.runtime_config = runtime_config or LingbotRuntimeConfig()
         self.fps = fps
+        self.client_liveness_timeout_s = client_liveness_timeout_s
         self._runtime = LingbotInferenceRuntime(config=self.runtime_config)
         self._runtime_ready = False
+        self._warmup_complete = False
         self._active_session: _ManagedLingbotSession | None = None
+        self._pending_session_input: LingbotSessionInput | None = None
+        self._preload_lock = asyncio.Lock()
         self._session_lock = asyncio.Lock()
 
     def has_active_session(self) -> bool:
@@ -555,109 +791,296 @@ class LingbotWebRTCSessionManager:
     def is_runtime_ready(self) -> bool:
         return self._runtime_ready
 
+    def get_initial_scene(self) -> dict[str, object]:
+        pending_input = self._pending_session_input
+        prompt = (
+            normalize_prompt_text(pending_input.prompt)
+            if pending_input is not None and pending_input.prompt is not None
+            else self._runtime._load_default_prompt()
+        )
+        if pending_input is not None and pending_input.first_frame_image_url:
+            image_url = pending_input.first_frame_image_url
+        else:
+            image_url = self.runtime_config.default_image_url
+        input_source = "uploaded" if pending_input is not None else "default"
+        first_frame_path = (
+            self.runtime_config.example_data_dir
+            / self.runtime_config.first_frame_filename
+        )
+        has_first_frame = (
+            bool(
+                pending_input is not None
+                and (
+                    pending_input.first_frame_image_bytes
+                    or pending_input.first_frame_image_url
+                )
+            )
+            or first_frame_path.exists()
+            or bool(self.runtime_config.default_image_url)
+        )
+        return {
+            "first_frame_url": "/api/session/first_frame",
+            "image_url": image_url,
+            "default_image_url": self.runtime_config.default_image_url,
+            "has_first_frame": has_first_frame,
+            "prompt": prompt,
+            "input_source": input_source,
+            "model": self.runtime_config.config_name,
+            "resolution": {
+                "width": self.runtime_config.video_width,
+                "height": self.runtime_config.video_height,
+            },
+        }
+
+    def get_first_frame(self) -> LingbotImagePayload:
+        pending_input = self._pending_session_input
+        if pending_input is not None and pending_input.first_frame_image_bytes:
+            return LingbotImagePayload(
+                data=pending_input.first_frame_image_bytes,
+                content_type=pending_input.first_frame_content_type,
+            )
+        if pending_input is not None and pending_input.first_frame_image_url:
+            image_bytes, content_type = _read_remote_bytes(
+                pending_input.first_frame_image_url,
+                max_bytes=_MAX_REMOTE_IMAGE_BYTES,
+                field_name="Lingbot first-frame image URL",
+            )
+            return LingbotImagePayload(data=image_bytes, content_type=content_type)
+
+        first_frame_path = (
+            self.runtime_config.example_data_dir
+            / self.runtime_config.first_frame_filename
+        )
+        if first_frame_path.exists():
+            return LingbotImagePayload(
+                data=first_frame_path.read_bytes(),
+                content_type=_content_type_for_image_path(first_frame_path),
+            )
+
+        image_rgb = self._runtime._load_default_first_frame_rgb()
+        ok, encoded = cv2.imencode(".jpg", cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR))
+        if not ok:
+            raise RuntimeError("Failed to encode default Lingbot first frame.")
+        return LingbotImagePayload(data=encoded.tobytes(), content_type="image/jpeg")
+
+    def set_pending_session_input(self, session_input: LingbotSessionInput) -> None:
+        if self.has_active_session():
+            raise SessionBusyError(
+                "Cannot update Lingbot input while a session is active."
+            )
+        if session_input.first_frame_image_bytes is not None:
+            self._runtime._load_uploaded_first_frame_rgb(
+                session_input.first_frame_image_bytes
+            )
+        image_url = None
+        if (
+            session_input.first_frame_image_bytes is None
+            and session_input.first_frame_image_url is not None
+        ):
+            image_url = _validate_remote_url(
+                session_input.first_frame_image_url,
+                field_name="Lingbot first-frame image URL",
+            )
+            self._runtime._load_remote_first_frame_rgb(image_url)
+
+        current = self._pending_session_input
+        self._pending_session_input = LingbotSessionInput(
+            prompt=(
+                normalize_prompt_text(session_input.prompt)
+                if session_input.prompt is not None
+                else (current.prompt if current is not None else None)
+            ),
+            first_frame_image_bytes=(
+                session_input.first_frame_image_bytes
+                if session_input.first_frame_image_bytes is not None
+                else (current.first_frame_image_bytes if current is not None else None)
+            ),
+            first_frame_image_url=(
+                None
+                if session_input.first_frame_image_bytes is not None
+                else (
+                    image_url
+                    if image_url is not None
+                    else (
+                        current.first_frame_image_url if current is not None else None
+                    )
+                )
+            ),
+            first_frame_content_type=(
+                session_input.first_frame_content_type
+                if session_input.first_frame_image_bytes is not None
+                else (
+                    current.first_frame_content_type
+                    if current is not None
+                    else session_input.first_frame_content_type
+                )
+            ),
+        )
+
     async def preload_runtime(self) -> None:
-        if self._runtime_ready:
-            return
-        await self._runtime.initialize()
-        self._runtime_ready = True
+        async with self._preload_lock:
+            if not self._runtime_ready:
+                await self._runtime.initialize()
+                self._runtime_ready = True
+            if not self._warmup_complete:
+                await self._run_loopback_warmup_session(
+                    num_chunks=self.runtime_config.warmup_chunks
+                )
+                self._warmup_complete = True
 
     async def create_answer(self, *, offer_sdp: str, offer_type: str) -> dict[str, str]:
+        if not self._runtime_ready or not self._warmup_complete:
+            await self.preload_runtime()
+
         async with self._session_lock:
             if self._active_session is not None and not self._active_session.closed:
                 raise SessionBusyError("A Lingbot session is already active.")
 
-            if not self._runtime_ready:
-                await self._runtime.initialize()
-                self._runtime_ready = True
-            await self._runtime.reset_for_new_session()
-
-            peer_connection = RTCPeerConnection()
-            # Bounded queue sized to one *steady-state* chunk: ``put``
-            # blocks only when the queue holds a full steady-state chunk
-            # already, which throttles the producer to the consumer's
-            # drain rate.
-            #
-            # Important: AR step 0 emits fewer frames than every
-            # subsequent step (e.g. 9 vs 12 here) due to the decoder's
-            # causal first-frame padding. Sizing the queue to AR 0 would
-            # force the producer to block 3 times on *every* steady-state
-            # chunk, leaving < 1 chunk of buffer at gen-start and
-            # producing a once-per-chunk ~60 ms playback stall. We
-            # therefore size to the steady-state count.
-            num_frames = self._runtime.peek_steady_chunk_num_frames()
-            video_track = LingbotVideoTrack(fps=self.fps, maxsize=num_frames)
-            peer_connection.addTrack(video_track)
-            # Start the resampler's virtual clock at 0; the real anchor
-            # is set inside the ``on_datachannel`` handler so chunk 0's
-            # window starts at the moment input can actually arrive.
-            # Anchoring earlier (at offer time) would make the first few
-            # chunks integrate over an empty pre-channel window.
-            resampler = KeyboardResampler(fps=self.fps, start_v=0.0)
-            managed_session = _ManagedLingbotSession(
-                runtime=self._runtime,
-                video_track=video_track,
-                peer_connection=peer_connection,
-                resampler=resampler,
+            pending_input = self._pending_session_input
+            answer = await self._create_answer_with_runtime_ready_locked(
+                offer_sdp=offer_sdp,
+                offer_type=offer_type,
+                session_input=pending_input,
             )
-            self._active_session = managed_session
+            self._pending_session_input = None
+            return answer
 
-            @peer_connection.on("datachannel")
-            def on_datachannel(channel: Any) -> None:
-                managed_session.control_channel = channel
-                # Belt-and-braces reset of the resampler at channel
-                # open: the resampler is freshly constructed in
-                # ``create_answer`` so this is normally a no-op, but
-                # clearing here guarantees a clean event log even if
-                # the resampler lifecycle ever changes. The real
-                # virtual-clock anchor happens inside
-                # ``_generation_worker`` once the first keyboard event
-                # arrives so chunk 0's window starts at the moment of
-                # first interaction, not at data-channel open.
-                channel_open_v = asyncio.get_running_loop().time()
-                managed_session.resampler.reset(start_v=channel_open_v)
+    async def _create_answer_with_runtime_ready_locked(
+        self,
+        *,
+        offer_sdp: str,
+        offer_type: str,
+        session_input: LingbotSessionInput | None = None,
+        rtc_configuration: RTCConfiguration | None = None,
+        enable_liveness_watchdog: bool = True,
+    ) -> dict[str, str]:
+        if self._active_session is not None and not self._active_session.closed:
+            raise SessionBusyError("A Lingbot session is already active.")
+        if not self._runtime_ready:
+            raise LingbotRuntimeError("Runtime is not initialized.")
 
-                @channel.on("message")
-                def on_message(message: Any) -> None:
-                    asyncio.create_task(
-                        self._handle_datachannel_message(
-                            managed_session=managed_session,
-                            raw_message=message,
-                        )
+        await self._runtime.reset_for_new_session(session_input=session_input)
+
+        peer_connection = RTCPeerConnection(rtc_configuration)
+        # Bounded queue sized to one *steady-state* chunk: ``put``
+        # blocks only when the queue holds a full steady-state chunk
+        # already, which throttles the producer to the consumer's
+        # drain rate.
+        #
+        # Important: AR step 0 emits fewer frames than every
+        # subsequent step (e.g. 9 vs 12 here) due to the decoder's
+        # causal first-frame padding. Sizing the queue to AR 0 would
+        # force the producer to block 3 times on *every* steady-state
+        # chunk, leaving < 1 chunk of buffer at gen-start and
+        # producing a once-per-chunk ~60 ms playback stall. We
+        # therefore size to the steady-state count.
+        num_frames = self._runtime.peek_steady_chunk_num_frames()
+        video_track = BufferedVideoTrack(fps=self.fps, maxsize=num_frames)
+        peer_connection.addTrack(video_track)
+        # Start the resampler's virtual clock at 0; the real anchor
+        # is set inside the ``on_datachannel`` handler so chunk 0's
+        # window starts at the moment input can actually arrive.
+        # Anchoring earlier (at offer time) would make the first few
+        # chunks integrate over an empty pre-channel window.
+        resampler = KeyboardResampler(fps=self.fps, start_v=0.0)
+        loop = asyncio.get_running_loop()
+        managed_session = _ManagedLingbotSession(
+            runtime=self._runtime,
+            video_track=video_track,
+            peer_connection=peer_connection,
+            resampler=resampler,
+            last_client_message_at=loop.time(),
+        )
+        self._active_session = managed_session
+        if enable_liveness_watchdog:
+            managed_session.liveness_task = asyncio.create_task(
+                self._client_liveness_watchdog(managed_session=managed_session)
+            )
+
+        @peer_connection.on("datachannel")
+        def on_datachannel(channel: Any) -> None:
+            managed_session.control_channel = channel
+            # Belt-and-braces reset of the resampler at channel
+            # open: the resampler is freshly constructed in
+            # ``create_answer`` so this is normally a no-op, but
+            # clearing here guarantees a clean event log even if
+            # the resampler lifecycle ever changes. The real
+            # virtual-clock anchor happens inside
+            # ``_generation_worker`` once the first keyboard event
+            # arrives so chunk 0's window starts at the moment of
+            # first interaction, not at data-channel open.
+            channel_open_v = asyncio.get_running_loop().time()
+            managed_session.resampler.reset(start_v=channel_open_v)
+
+            @channel.on("message")
+            def on_message(message: Any) -> None:
+                asyncio.create_task(
+                    self._handle_datachannel_message(
+                        managed_session=managed_session,
+                        raw_message=message,
                     )
-
-                # Spawn the generation worker once the data channel has
-                # been wired up so ``chunk_done`` notifications have a
-                # channel to land on. The worker is per-session and
-                # cancelled in :meth:`_ManagedLingbotSession.close`.
-                managed_session.generation_task = asyncio.create_task(
-                    self._generation_worker(managed_session=managed_session)
                 )
 
-            @peer_connection.on("connectionstatechange")
-            async def on_connectionstatechange() -> None:
-                if peer_connection.connectionState in {
-                    "failed",
-                    "disconnected",
-                    "closed",
-                }:
-                    await self.close_active_session()
+            # Spawn the generation worker once the data channel has
+            # been wired up so ``chunk_done`` notifications have a
+            # channel to land on. The worker is per-session and
+            # cancelled in :meth:`_ManagedLingbotSession.close`.
+            managed_session.generation_task = asyncio.create_task(
+                self._generation_worker(managed_session=managed_session)
+            )
 
-            try:
-                offer = RTCSessionDescription(sdp=offer_sdp, type=offer_type)
-                await peer_connection.setRemoteDescription(offer)
-                answer = await peer_connection.createAnswer()
-                await peer_connection.setLocalDescription(answer)
-                local_description = peer_connection.localDescription
-                if local_description is None:
-                    raise RuntimeError(
-                        "Peer connection did not produce local description."
-                    )
-                return {"sdp": local_description.sdp, "type": local_description.type}
-            except Exception:
-                LOGGER.exception("WebRTC negotiation failed while creating an answer.")
-                await managed_session.close()
-                self._active_session = None
-                raise
+            @channel.on("close")
+            def on_close() -> None:
+                logger.info("Control data channel closed; closing active session.")
+                asyncio.create_task(self.close_active_session())
+
+        @peer_connection.on("connectionstatechange")
+        async def on_connectionstatechange() -> None:
+            if peer_connection.connectionState in {
+                "failed",
+                "disconnected",
+                "closed",
+            }:
+                await self.close_active_session()
+
+        try:
+            offer = RTCSessionDescription(sdp=offer_sdp, type=offer_type)
+            await peer_connection.setRemoteDescription(offer)
+            answer = await peer_connection.createAnswer()
+            await peer_connection.setLocalDescription(answer)
+            await wait_for_ice_gathering_complete(peer_connection)
+            local_description = peer_connection.localDescription
+            if local_description is None:
+                raise RuntimeError("Peer connection did not produce local description.")
+            return {"sdp": local_description.sdp, "type": local_description.type}
+        except Exception:
+            logger.exception("WebRTC negotiation failed while creating an answer.")
+            await managed_session.close()
+            self._active_session = None
+            raise
+
+    async def _run_loopback_warmup_session(self, *, num_chunks: int) -> None:
+        if not self._runtime_ready:
+            raise LingbotRuntimeError("Runtime is not initialized.")
+        await run_loopback_warmup_session(
+            num_chunks=num_chunks,
+            warmup_timeout_s=self.runtime_config.warmup_timeout_s,
+            create_answer=self._create_loopback_warmup_answer,
+            close_active_session=self.close_active_session,
+            label="Lingbot WebRTC",
+            logger=logger,
+        )
+
+    async def _create_loopback_warmup_answer(
+        self, *, offer_sdp: str, offer_type: str
+    ) -> dict[str, str]:
+        async with self._session_lock:
+            return await self._create_answer_with_runtime_ready_locked(
+                offer_sdp=offer_sdp,
+                offer_type=offer_type,
+                rtc_configuration=RTCConfiguration(iceServers=[]),
+                enable_liveness_watchdog=False,
+            )
 
     async def close_active_session(self) -> None:
         async with self._session_lock:
@@ -667,10 +1090,35 @@ class LingbotWebRTCSessionManager:
             self._active_session = None
             await active_session.close()
 
+    async def _client_liveness_watchdog(
+        self, *, managed_session: _ManagedLingbotSession
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        try:
+            while not managed_session.closed:
+                elapsed_s = loop.time() - managed_session.last_client_message_at
+                if elapsed_s >= self.client_liveness_timeout_s:
+                    logger.warning(
+                        "No client heartbeat/control message for {:.1f}s; "
+                        "closing active session.",
+                        elapsed_s,
+                    )
+                    await self.close_active_session()
+                    return
+                await asyncio.sleep(
+                    min(
+                        _CLIENT_LIVENESS_CHECK_INTERVAL_S,
+                        self.client_liveness_timeout_s - elapsed_s,
+                    )
+                )
+        except asyncio.CancelledError:
+            raise
+
     async def shutdown(self) -> None:
         await self.close_active_session()
         await self._runtime.close()
         self._runtime_ready = False
+        self._warmup_complete = False
 
     def wait_for_termination(self) -> None:
         self._runtime.wait_for_termination()
@@ -687,6 +1135,7 @@ class LingbotWebRTCSessionManager:
         channel = managed_session.control_channel
         if channel is None or managed_session.closed:
             return
+        managed_session.last_client_message_at = asyncio.get_running_loop().time()
 
         if not isinstance(raw_message, str):
             self._send_json(
@@ -707,12 +1156,20 @@ class LingbotWebRTCSessionManager:
                 channel, {"type": "error", "message": "Payload must be a JSON object."}
             )
             return
-        if payload.get("type") != "action":
+        message_type = str(payload.get("type", "")).strip().lower()
+        if message_type == "heartbeat":
+            return
+        if message_type == "disconnect":
+            logger.info("Client requested disconnect; closing active session.")
+            await self.close_active_session()
+            return
+        if message_type != "action":
             self._send_json(
                 channel,
                 {
                     "type": "error",
-                    "message": "Unsupported message type, expected 'action'.",
+                    "message": "Unsupported message type, expected "
+                    "'action', 'heartbeat', or 'disconnect'.",
                 },
             )
             return
@@ -730,7 +1187,7 @@ class LingbotWebRTCSessionManager:
         # generation worker now drives the pipeline directly, so they
         # are accepted silently as no-ops to avoid breaking older clients.
         if event == "step":
-            LOGGER.debug("Ignoring legacy 'step' control payload.")
+            logger.debug("Ignoring legacy 'step' control payload.")
             return
         if event not in ("keydown", "keyup"):
             self._send_json(
@@ -758,8 +1215,9 @@ class LingbotWebRTCSessionManager:
         # in :meth:`KeyboardResampler.sample_chunk` are well-defined.
         arrival_t = asyncio.get_running_loop().time()
         managed_session.resampler.on_edge(arrival_t=arrival_t, event=event, key=key)
-        LOGGER.info(
-            "Logged control event=%s key=%s arrival_t=%.3f log_size=%d",
+        managed_session.pending_action_arrivals.append(arrival_t)
+        logger.info(
+            "Logged control event={} key={} arrival_t={:.3f} log_size={}",
             event,
             key,
             arrival_t,
@@ -786,7 +1244,7 @@ class LingbotWebRTCSessionManager:
         ``arrival_t`` falls inside the chunk has a chance to land in
         the timeline before sampling. The track's bounded queue then
         paces the loop to playback via backpressure on
-        :meth:`LingbotVideoTrack.enqueue_chunk`.
+        :meth:`BufferedVideoTrack.enqueue_chunk`.
         """
         loop = asyncio.get_running_loop()
         runtime = managed_session.runtime
@@ -803,17 +1261,17 @@ class LingbotWebRTCSessionManager:
         # triggering event with ``arrival_t < now``, so the resampler's
         # drain path folds it into ``carried_state`` and chunk 0's
         # segments reflect the held-key state from frame 0.
-        LOGGER.info("Generation worker idle; waiting for first action.")
+        logger.info("Generation worker idle; waiting for first action.")
         try:
             await managed_session.first_action_received.wait()
         except asyncio.CancelledError:
-            LOGGER.info("Generation worker cancelled before first action.")
+            logger.info("Generation worker cancelled before first action.")
             raise
         if managed_session.closed:
             return
         resampler.next_chunk_start_v = loop.time()
-        LOGGER.info(
-            "First action received; starting generation at start_v=%.3f",
+        logger.info(
+            "First action received; starting generation at start_v={:.3f}",
             resampler.next_chunk_start_v,
         )
         try:
@@ -821,7 +1279,7 @@ class LingbotWebRTCSessionManager:
                 try:
                     num_frames = runtime.peek_next_chunk_num_frames()
                 except LingbotRuntimeError:
-                    LOGGER.exception("Runtime not ready; stopping generation worker.")
+                    logger.exception("Runtime not ready; stopping generation worker.")
                     return
                 # Trigger when wallclock reaches the chunk's window end
                 # (= the next chunk's start virtual time). Earlier
@@ -851,9 +1309,9 @@ class LingbotWebRTCSessionManager:
                 lag = now - (resampler.next_chunk_start_v + chunk_duration)
                 if lag > chunk_duration:
                     skipped_to = now - chunk_duration
-                    LOGGER.warning(
-                        "Resampler virtual clock lagging wall by %.3fs; "
-                        "skipping next_chunk_start_v %.3f -> %.3f to "
+                    logger.warning(
+                        "Resampler virtual clock lagging wall by {:.3f}s; "
+                        "skipping next_chunk_start_v {:.3f} -> {:.3f} to "
                         "track wall and keep input-to-pixel latency bounded.",
                         lag,
                         resampler.next_chunk_start_v,
@@ -863,12 +1321,21 @@ class LingbotWebRTCSessionManager:
 
                 t_before_gen = loop.time()
                 segments, frame_times = resampler.sample_chunk(num_frames)
+                chunk_end_v = resampler.next_chunk_start_v
+                consumed_action_arrivals: list[float] = []
+                while (
+                    managed_session.pending_action_arrivals
+                    and managed_session.pending_action_arrivals[0] <= chunk_end_v
+                ):
+                    consumed_action_arrivals.append(
+                        managed_session.pending_action_arrivals.popleft()
+                    )
                 try:
                     result = await runtime.generate_chunk(
                         segments=segments, frame_times=frame_times
                     )
                 except Exception as exc:
-                    LOGGER.exception("Chunk generation failed.")
+                    logger.exception("Chunk generation failed.")
                     channel = managed_session.control_channel
                     if channel is not None:
                         self._send_json(channel, {"type": "error", "message": str(exc)})
@@ -888,10 +1355,16 @@ class LingbotWebRTCSessionManager:
                 # keeps growing indicates the catch-up branch isn't
                 # firing and end-to-end latency will degrade.
                 lag_ms = (t_after_enqueue - resampler.next_chunk_start_v) * 1e3
-                LOGGER.info(
-                    "Chunk done chunk=%s num_frames=%s segments=%d "
-                    "enqueued=%s gen_ms=%.1f enqueue_ms=%.1f play_ms=%.1f "
-                    "queue_depth=%d next_v=%.3f wall=%.3f lag_ms=%.1f",
+                control_latency_ms = (
+                    (t_after_enqueue - consumed_action_arrivals[0]) * 1e3
+                    if consumed_action_arrivals
+                    else None
+                )
+                logger.debug(
+                    "Chunk done chunk={} num_frames={} segments={} "
+                    "enqueued={} gen_ms={:.1f} enqueue_ms={:.1f} play_ms={:.1f} "
+                    "queue_depth={} next_v={:.3f} wall={:.3f} lag_ms={:.1f} "
+                    "control_latency_ms={} consumed_actions={}",
                     result.chunk_index,
                     result.num_frames,
                     len(segments),
@@ -903,21 +1376,40 @@ class LingbotWebRTCSessionManager:
                     resampler.next_chunk_start_v,
                     t_after_enqueue,
                     lag_ms,
+                    (
+                        f"{control_latency_ms:.1f}"
+                        if control_latency_ms is not None
+                        else "n/a"
+                    ),
+                    len(consumed_action_arrivals),
                 )
 
                 channel = managed_session.control_channel
                 if channel is not None:
-                    self._send_json(
-                        channel,
-                        {
-                            "type": "chunk_done",
-                            "chunk_index": result.chunk_index,
-                            "num_frames": result.num_frames,
-                            "enqueued_frames": enqueued,
+                    payload: dict[str, Any] = {
+                        "type": "chunk_done",
+                        "chunk_index": result.chunk_index,
+                        "num_frames": result.num_frames,
+                        "enqueued_frames": enqueued,
+                        "fps": video_track.fps,
+                        "resolution": {
+                            "width": self.runtime_config.video_width,
+                            "height": self.runtime_config.video_height,
                         },
-                    )
+                        "model": self.runtime_config.config_name,
+                        "gen_ms": round(gen_ms, 1),
+                        "enqueue_ms": round(enqueue_ms, 1),
+                        "play_ms": round(play_ms, 1),
+                        "queue_depth": video_track.qsize(),
+                        "lag_ms": round(lag_ms, 1),
+                    }
+                    if control_latency_ms is not None:
+                        payload["latency_ms"] = round(control_latency_ms, 1)
+                        payload["control_latency_ms"] = round(control_latency_ms, 1)
+                        payload["consumed_actions"] = len(consumed_action_arrivals)
+                    self._send_json(channel, payload)
         except asyncio.CancelledError:
-            LOGGER.info("Generation worker cancelled.")
+            logger.info("Generation worker cancelled.")
             raise
 
     @staticmethod

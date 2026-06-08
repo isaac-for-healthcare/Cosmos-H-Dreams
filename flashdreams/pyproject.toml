@@ -23,11 +23,12 @@ dynamic = ["version"]
 description = "High-performance streaming video diffusion framework with pluggable model backends"
 readme = "PYPI_README.md"
 license = "Apache-2.0"
-requires-python = ">=3.12,<3.13"
+requires-python = ">=3.10"
 dependencies = [
     "boto3>=1.35",
     "botocore>=1.35",
     "einops>=0.7",
+    "filelock>=3",
     "ftfy>=6.0",
     "huggingface-hub>=0.33",
     "loguru>=0.7",
@@ -35,15 +36,20 @@ dependencies = [
     "nvidia-ml-py>=12.0",
     "safetensors>=0.4",
     "tqdm>=4.60",
-    "transformers==4.57.6",
-    "torchvision",
+    "transformers>=5.0,<6",
+    # Security floor for botocore/requests transitive use.
+    "urllib3>=2.7.0",
     # tyro powers the ``flashdreams-run`` console script (subcommand
-    # union over the recipe registry, per-field CLI overrides), so it
+    # union over the integration registry, per-field CLI overrides), so it
     # has to ship as a runtime dependency, not a dev-only one.
-    "tyro>=0.8",
+    # 1.0 introduced ``sort_subcommands`` in
+    # ``tyro.extras.subcommand_type_from_defaults``, used by the CLI union.
+    "tyro>=1.0",
 
-    "torch>=2.11",
-    "torchvision>=0.22",
+    # Minimum is 2.9: context_parallel(buffers=, buffer_seq_dims=,
+    # no_restore_buffers=) and set_rotate_method in
+    # torch.distributed.tensor.experimental require PyTorch 2.9+.
+    "torch>=2.9",
     # ``torch.compile`` lowers conv/elementwise kernels through Inductor +
     # Triton. On Windows the upstream PyPI ``triton`` package is Linux-only,
     # so without ``triton-windows`` Inductor crashes deep inside its
@@ -51,14 +57,13 @@ dependencies = [
     # The maintainers ship a Windows-compatible drop-in under the
     # ``triton-windows`` package; pulling it on win32 keeps every
     # ``use_compile=True`` config path (encoder, decoder, DiT) working
-    # the same way it does on Linux. This is the same fix carried before
-    # on dev/truesight_alpa, scoped to the workspace member that owns
-    # the ``use_compile`` knob.
+    # the same way it does on Linux. This is scoped to the workspace
+    # member that owns the ``use_compile`` knob.
     "triton-windows>=3.5.0; sys_platform == 'win32'",
 ]
 
 [project.scripts]
-# Unified CLI over every registered recipe (in-tree + plugin-discovered).
+# Unified CLI over every registered integration (in-tree + plugin-discovered).
 # Mirrors nerfstudio's ``ns-train`` console script shape (one hyphenated
 # binary, tyro union over runners as direct subcommands).
 flashdreams-run = "flashdreams.scripts.cli:entrypoint"
@@ -72,7 +77,10 @@ Repository = "https://github.com/NVIDIA/flashdreams"
 dev = [
     "pytest>=8.0",
     "mediapy>=1.1",
-    "pytest-manual-marker",
+    # 2.0 rewrote the plugin for pytest 8+ (older versions use the removed
+    # ``Item.get_marker`` API).
+    "pytest-manual-marker>=2.0",
+    "tomli>=2.0",
     # Transformer Engine is the parity / perf reference for the
     # in-house RoPE Triton kernel (see ``tests/test_rope_kernel.py``
     # and ``tests/perf_rope.py``). No runtime code imports it; gate
@@ -83,7 +91,7 @@ dev = [
 # main; the canonical extra is ``runners`` (same package set).
 examples = [
     "mediapy>=1.1",
-    "opencv-python-headless",
+    "opencv-python-headless>=4.5",
     "scipy>=1.11",
 ]
 # I/O dependencies the ``flashdreams-run`` CLI runners lazy-import
@@ -92,8 +100,12 @@ examples = [
 # pipeline (e.g. ``integrations/lingbot``) doesn't pull in ffmpeg / opencv.
 runners = [
     "mediapy>=1.1",
-    "opencv-python-headless",
+    "opencv-python-headless>=4.5",
     "scipy>=1.11",
+]
+serving = [
+    "aiohttp>=3.9",
+    "aiortc>=1.9",
 ]
 
 [tool.setuptools.dynamic]
@@ -104,15 +116,14 @@ version = {attr = "flashdreams._version.__version__"}
 
 [tool.setuptools.packages.find]
 include = ["flashdreams*"]
-exclude = ["tests"]
+exclude = ["tests", "flashdreams._pytest_plugins*"]
 
-# PyPI's default ``torch`` is the CPU build on Windows. The truesight CUDA
-# extensions (built by ``uv run build-truesight``) need a CUDA-enabled
-# PyTorch so PyTorch's ``cpp_extension`` resolves ``CUDA_HOME`` from the
-# env (the gate is ``torch.version.cuda is not None``). On Linux the
+# PyPI's default ``torch`` is the CPU build on Windows. CUDA extensions need a
+# CUDA-enabled PyTorch so PyTorch's ``cpp_extension`` resolves ``CUDA_HOME``
+# from the env (the gate is ``torch.version.cuda is not None``). On Linux the
 # default wheel is already CUDA-enabled; on Windows we have to point at
-# NVIDIA's PyTorch index. Constrain by marker so the override only fires
-# on Windows -- Linux / NGC users keep the upstream wheel.
+# NVIDIA's PyTorch index. Constrain by marker so the override only fires on
+# Windows -- Linux / NGC users keep the upstream wheel.
 [[tool.uv.index]]
 name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
@@ -122,14 +133,6 @@ explicit = true
 torch = [
     { index = "pytorch-cu130", marker = "sys_platform == 'win32'" },
 ]
-torchvision = [
-    { index = "pytorch-cu130", marker = "sys_platform == 'win32'" },
-]
 
-[tool.pytest.ini_options]
-addopts = "--import-mode=importlib"
-markers = [
-    "manual: requires GPU and/or network access (opt-in only)",
-    "ci_gpu: GPU test safe to run in CI on RTX Pro 6000 runners",
-    "slow: long-running test",
-]
+[tool.uv]
+managed = true

@@ -17,8 +17,7 @@ limitations under the License.
 
 # FlashDreams documentation
 
-This directory hosts the Sphinx sources for the FlashDreams API
-reference site.
+This directory hosts the Sphinx sources for the FlashDreams documentation site.
 
 ## Build locally
 
@@ -35,26 +34,30 @@ uv run --group docs sphinx-build -b html docs/source docs/_build/html
 The rendered site lands in `docs/_build/html/index.html`. Open it with
 any browser, e.g. `xdg-open docs/_build/html/index.html`.
 
-## Layout
+## Live preview (auto rebuild)
 
+Use Sphinx live-reload to avoid rerunning build + HTTP server commands on every edit:
+
+```bash
+# from the repo root
+uv run --group docs sphinx-autobuild -E docs/source docs/_build/html --port 8000
 ```
-docs/
-└── source/
-    ├── conf.py             # Sphinx configuration (theme + extensions)
-    ├── index.rst           # landing page + top-level toctree
-    ├── apis/
-    │   ├── core.rst        # flashdreams.core (attention, distributed, …)
-    │   ├── infra.rst       # flashdreams.infra (pipeline, diffusion, …)
-    │   ├── recipes.rst     # flashdreams.recipes (alpadreams, wan, …)
-    │   └── serving.rst     # placeholder for the future serving layer
-    └── examples/           # one rst per inference launcher
-        ├── alpadreams.rst
-        ├── self_forcing.rst
-        ├── causal_forcing.rst
-        ├── causal_wan22.rst
-        ├── lingbot_world.rst
-        └── wan21.rst
-```
+
+Then keep this process running and open:
+`http://127.0.0.1:8000`
+
+Any changes under `docs/source/` rebuild automatically and refresh the page.
+
+Benchmark data now follows a JS + Markdown pipeline:
+
+- Per-model benchmark tables live in
+  ``docs/source/_static/performance/<model>/perf-*.md``.
+- Model pages declare chart metadata with ``data-benchmark-*`` attributes.
+- ``docs/source/_static/js/benchmark_chart.js`` loads those markdown tables at
+  runtime and renders SVG charts in the browser.
+
+The ``docs/benchmarks/`` directory still hosts the benchmark JSON corpus and
+schema used for tracking raw measurements.
 
 ## Hosting on GitHub Pages
 
@@ -91,13 +94,16 @@ to be present.
 
 ## Adding new content
 
-- **A new model recipe** — append a section to `source/apis/recipes.rst`
-  using `.. automodule:: flashdreams.recipes.<name>`, and add a launcher
-  walk-through to `source/examples/<name>.rst`. Wire the new file into
-  the matching toctree in `source/index.rst` (autoregressive vs
-  bidirectional vs serving).
+- **A new model integration** — follow
+  `source/developer_guides/new_integration.rst`, add a model card at
+  `source/models/<name>.rst`, and wire it into the models toctree in
+  `source/index.rst` (and `source/models/index.rst` if you use that
+  index page for grouped links).
 - **A new infra component** — re-export the public symbols from the
   package `__init__.py`, then add an `.. autoclass::` block to the
-  relevant section of `source/apis/infra.rst`.
-- **A new API category** — drop a new `source/apis/<topic>.rst`, add it
-  to `index.rst`, and (optionally) introduce a new captioned toctree.
+  relevant section of `source/api/infra.rst`.
+- **A new API category** — add `source/api/<topic>.rst`, then include it
+  in the API toctree in `source/index.rst`.
+- **Plugin-first note** — most actively developed integrations live under
+  `integrations/<name>/`. Use `source/api/integrations.rst` to document
+  in-tree `flashdreams.recipes.*` API surface that remains public.

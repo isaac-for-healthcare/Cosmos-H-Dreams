@@ -17,13 +17,14 @@
 
 import math
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.distributed import ProcessGroup
 
-from flashdreams.core.attention import BlockKVCache, RingAttention
+from flashdreams.core.attention import BlockKVCache, ContextParallelAttention
 from flashdreams.core.attention.rope import apply_rope_freqs
 
 
@@ -206,18 +207,16 @@ class FinalLayer(nn.Module):
 
         Args:
             x: Input tensor of shape ``[..., L, D]``.
-            emb: Conditioning embedding of shape ``[..., D]``.
-            adaln_lora: Optional LoRA tensor of shape ``[..., 3 * D]``.
+            emb: Conditioning embedding of shape ``[..., L or 1, D]``
+            adaln_lora: Optional LoRA tensor of shape
+                ``[..., L or 1, 3 * D]``.
 
         Returns:
             Output tensor of shape ``[..., L, patch_dim]``.
         """
-        # Insert the per-token broadcast slot: [..., D] -> [..., 1, D].
-        emb = emb.unsqueeze(-2)
-
+        assert emb.ndim == x.ndim, "emb and x must have the same number of dimensions"
         if self.use_adaln_lora:
             assert adaln_lora is not None
-            adaln_lora = adaln_lora.unsqueeze(-2)
             modulation = (
                 self.adaln_modulation(emb) + adaln_lora[..., : 2 * self.hidden_size]
             )
@@ -238,6 +237,7 @@ class MultiHeadAttention(nn.Module):
         context_dim: int | None = None,
         n_heads: int = 8,
         head_dim: int = 64,
+        cp_method: Literal["ring", "ulysses"] = "ring",
     ) -> None:
         """Initialize a multi-head attention module.
 
@@ -264,7 +264,9 @@ class MultiHeadAttention(nn.Module):
         self.q_norm = nn.RMSNorm(self.head_dim, eps=1e-6)
         self.k_norm = nn.RMSNorm(self.head_dim, eps=1e-6)
 
-        self.attn_op = RingAttention(qkv_format="bshd", backend="cudnn")
+        self.attn_op = ContextParallelAttention(
+            qkv_format="bshd", backend="cudnn", method=cp_method
+        )
 
     def set_context_parallel_group(self, cp_group: ProcessGroup | None) -> None:
         """Configure context-parallel process group for the underlying attention op."""
@@ -477,6 +479,7 @@ class Block(nn.Module):
         mlp_ratio: float = 4.0,
         use_adaln_lora: bool = False,
         adaln_lora_dim: int = 256,
+        cp_method: Literal["ring", "ulysses"] = "ring",
     ) -> None:
         super().__init__()
         self.x_dim = x_dim
@@ -490,6 +493,7 @@ class Block(nn.Module):
             context_dim=None,
             n_heads=num_heads,
             head_dim=x_dim // num_heads,
+            cp_method=cp_method,
         )
 
         # Cross-attention
@@ -501,6 +505,7 @@ class Block(nn.Module):
             context_dim=context_dim,
             n_heads=num_heads,
             head_dim=x_dim // num_heads,
+            cp_method=cp_method,
         )
 
         # MLP
@@ -583,21 +588,20 @@ class Block(nn.Module):
 
         Args:
             x: Input tensor with shape ``[..., L, D]``.
-            emb: Timestep embedding with shape ``[..., D]``.
+            emb: Timestep embedding with shape ``[..., L or 1, D]``.
             cache: KV cache container for this block.
             rope_freqs: RoPE frequencies with shape ``[L, 1, 1, D]``.
-            adaln_lora: Optional AdaLN LoRA embedding with shape ``[..., 3 * D]``.
+            adaln_lora: Optional AdaLN LoRA embedding with shape
+                ``[..., L or 1, 3 * D]``.
 
         Returns:
             Updated hidden states with the same shape as ``x``.
         """
-        # Insert the per-token broadcast slot: [..., D] -> [..., 1, D].
-        emb = emb.unsqueeze(-2)
+        assert emb.ndim == x.ndim, "emb and x must have the same number of dimensions"
         if self.use_adaln_lora:
             assert adaln_lora is not None, (
                 "adaln_lora is required when use_adaln_lora is True"
             )
-            adaln_lora = adaln_lora.unsqueeze(-2)
             shift_self, scale_self, gate_self = (
                 self.adaln_modulation_self_attn(emb) + adaln_lora
             ).chunk(3, dim=-1)

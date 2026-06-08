@@ -23,34 +23,51 @@ from dataclasses import dataclass, field
 import torch
 from torch import Tensor
 
-from flashdreams.core.io.internal import use_internal_storage
 from flashdreams.infra.decoder import DecoderConfig, StreamingVideoDecoder
+from flashdreams.recipes.taehv.checkpoint import (
+    StateDictTransform,
+    compose,
+    legacy_to_blocks_keys,
+    truncate_oversize_tgrow_weights,
+)
 from flashdreams.recipes.taehv.impl import TAEHV, TAEHVCache
 
-_INTERNAL_TAEHV_CHECKPOINT_PATHS = {
-    "lighttae": "s3://flashdreams/assets/checkpoints/autoencoders/lighttaew2_1.pth",
-}
-
-_PUBLIC_TAEHV_CHECKPOINT_PATHS = {
+AVAILABLE_TAEHV_CHECKPOINT_PATHS = {
     "lighttae": "https://huggingface.co/lightx2v/Autoencoders/resolve/main/lighttaew2_1.pth",
 }
+"""Checkpoint paths for the TAEHV decoder."""
 
-AVAILABLE_TAEHV_CHECKPOINT_PATHS = (
-    _INTERNAL_TAEHV_CHECKPOINT_PATHS
-    if use_internal_storage()
-    else _PUBLIC_TAEHV_CHECKPOINT_PATHS
+_LIGHTTAE_CHANNELS: tuple[int, int, int, int] = (256, 128, 64, 64)
+"""TAEHV ``Decoder`` block widths the ``lighttae`` weights were trained
+for. Mirrors :attr:`TAEHV.channels` for the default config; kept here so
+:data:`lighttae_state_dict_transform` can pre-compute the per-``TGrow``
+expected output channel widths without an instantiated model."""
+
+
+lighttae_state_dict_transform: StateDictTransform = compose(
+    legacy_to_blocks_keys,
+    truncate_oversize_tgrow_weights(channels=_LIGHTTAE_CHANNELS),
 )
-"""Resolved at module import; set ``FLASHDREAMS_INTERNAL_STORAGE`` first."""
+"""Per-checkpoint remap for the ``lighttae`` weights. Rewrites the flat
+``decoder.<i>.*`` keys to the current ``decoder.blocks.<i>.*`` layout
+and clips the stride=2 ``TGrow`` weights at idx 7 down to the stride=1
+slice the live model expects."""
 
 
 @dataclass(kw_only=True)
 class TeahvVAEDecoderConfig(DecoderConfig):
     """Config for the TAEHV decoder."""
 
-    _target: type = field(default_factory=lambda: TeahvVAEDecoder)
+    _target: type["TeahvVAEDecoder"] = field(default_factory=lambda: TeahvVAEDecoder)
 
     checkpoint_path: str = AVAILABLE_TAEHV_CHECKPOINT_PATHS["lighttae"]
     """Path to a pretrained TAEHV checkpoint. Defaults to the ``lighttae`` weights."""
+
+    state_dict_transform: StateDictTransform | None = lighttae_state_dict_transform
+    """Pre-load state-dict remap. Defaults to
+    :data:`lighttae_state_dict_transform`; ``None`` falls through to the
+    bare :class:`TAEHV` default (see
+    :meth:`~flashdreams.recipes.taehv.impl.TAEHV.load_from_checkpoint`)."""
 
     dtype: torch.dtype = torch.bfloat16
     """Network parameter / activation dtype."""
@@ -106,6 +123,7 @@ class TeahvVAEDecoder(StreamingVideoDecoder[TAEHVCache]):
             checkpoint_path=config.checkpoint_path,
             use_cuda_graph=config.use_cuda_graph,
             use_compile=config.use_compile,
+            state_dict_transform=config.state_dict_transform,
         ).to(dtype=config.dtype)
 
         if self.need_scaled:
@@ -125,6 +143,7 @@ class TeahvVAEDecoder(StreamingVideoDecoder[TAEHVCache]):
             )
 
     def initialize_autoregressive_cache(self) -> TAEHVCache:
+        """Return an empty streaming decoder cache."""
         return self.taehv.prepare_cache()
 
     @torch.inference_mode()
@@ -166,16 +185,22 @@ class TeahvVAEDecoder(StreamingVideoDecoder[TAEHVCache]):
 
     @property
     def temporal_compression_ratio(self) -> int:
+        """Pixel frames / latent frames in steady state (AR >= 1)."""
         return self.TEMPORAL_COMPRESSION_RATIO
 
     @property
     def spatial_compression_ratio(self) -> int:
+        """Pixel side / latent side."""
         return self.SPATIAL_COMPRESSION_RATIO
 
     def get_output_temporal_size(
         self, autoregressive_index: int, input_temporal_size: int
     ) -> int:
-        """Causal: AR 0 first latent frame decodes to a single pixel frame."""
+        """Return pixel frame count from ``input_temporal_size`` latent frames.
+
+        AR 0 applies causal padding: the first latent frame yields one pixel
+        frame, remaining frames yield ``temporal_compression_ratio`` each.
+        AR >= 1 is a plain multiply."""
         r = self.temporal_compression_ratio
         if autoregressive_index == 0:
             return 1 + (input_temporal_size - 1) * r
@@ -184,6 +209,9 @@ class TeahvVAEDecoder(StreamingVideoDecoder[TAEHVCache]):
     def get_input_temporal_size(
         self, autoregressive_index: int, output_temporal_size: int
     ) -> int:
+        """Return latent frame count needed to produce ``output_temporal_size`` pixel frames.
+
+        Inverse of :meth:`get_output_temporal_size`."""
         r = self.temporal_compression_ratio
         if autoregressive_index == 0:
             assert (output_temporal_size - 1) % r == 0, (

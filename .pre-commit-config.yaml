@@ -1,12 +1,12 @@
 default_language_version:
   node: 25.2.1
-  python: python3.12
+  python: python3
 exclude: |
   (?x)(
     ^agents/|
     /protos/|
     ^docker/model_specific/cfg_parallel_state\.py$|
-    ^integrations/alpadreams/ludus-renderer/|
+    ^integrations/omnidreams/ludus-renderer/|
     # Patch files reproduce upstream source byte-for-byte in their context
     # lines, including trailing whitespace and newline-at-eof. Any hook that
     # normalizes whitespace (`trailing-whitespace`, `end-of-file-fixer`) will
@@ -49,13 +49,13 @@ repos:
     hooks:
       - id: sync-version
         name: sync package versions
-        entry: uv run .github/scripts/sync_version.py
+        entry: uv run --no-sync .github/scripts/sync_version.py
         language: system
         files: '(pyproject\.toml|_version\.py)$'
         pass_filenames: false
       - id: ty
         name: ty type check
-        entry: ty check
+        entry: uv run --group lint ty check
         language: system
         types: [python]
         pass_filenames: false

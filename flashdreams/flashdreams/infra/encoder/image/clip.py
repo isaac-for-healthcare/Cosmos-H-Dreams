@@ -26,7 +26,7 @@ from torch import Tensor
 from transformers import BatchFeature, CLIPImageProcessor, CLIPVisionModel
 from transformers.modeling_outputs import BaseModelOutputWithPooling
 
-from flashdreams.core.io.hf import should_use_local_files_only
+from flashdreams.core.io.hf import maybe_download_hf_repo_on_rank0
 from flashdreams.infra.encoder import Encoder, EncoderConfig
 
 
@@ -34,7 +34,7 @@ from flashdreams.infra.encoder import Encoder, EncoderConfig
 class CLIPImageEncoderConfig(EncoderConfig):
     """Config for the Wan I2V CLIP image encoder."""
 
-    _target: type = field(default_factory=lambda: CLIPImageEncoder)
+    _target: type["CLIPImageEncoder"] = field(default_factory=lambda: CLIPImageEncoder)
 
     model_id_or_local_path: Literal[
         "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
@@ -61,20 +61,23 @@ class CLIPImageEncoder(Encoder):
         super().__init__(config)
         self.config: CLIPImageEncoderConfig = config
 
-        local_files_only = should_use_local_files_only(config.model_id_or_local_path)
+        maybe_download_hf_repo_on_rank0(
+            config.model_id_or_local_path,
+            allow_patterns=("image_encoder/**", "image_processor/**"),
+        )
 
         self.image_encoder = CLIPVisionModel.from_pretrained(
             config.model_id_or_local_path,
             subfolder="image_encoder",
             dtype=config.dtype,
-            local_files_only=local_files_only,
+            local_files_only=True,
         )
         self.image_encoder.eval().requires_grad_(False)
 
         self.image_processor = CLIPImageProcessor.from_pretrained(
             config.model_id_or_local_path,
             subfolder="image_processor",
-            local_files_only=local_files_only,
+            local_files_only=True,
         )
 
     @torch.no_grad()

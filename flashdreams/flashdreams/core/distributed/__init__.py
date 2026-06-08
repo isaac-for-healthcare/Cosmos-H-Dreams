@@ -15,15 +15,94 @@
 
 """Distributed-training initialization helpers."""
 
+import atexit
 import ctypes
 import math
 import os
+import sys
 from datetime import timedelta
 
 import pynvml
 import torch
 import torch.distributed as dist
 from loguru import logger
+
+# Side effect: install the stdlib-``logging`` filter that demotes benign
+# Inductor autotuner-fallback ERROR records to WARNING so first-run
+# warmup doesn't look like a hard failure. Pulled in here (rather than
+# from ``flashdreams.core.__init__``) because every FlashDreams entry
+# point that talks to torch.distributed already imports this module at
+# process start, and the filter is process-global and idempotent.
+from flashdreams.core import log_filters  # noqa: F401
+
+DEFAULT_LOG_LEVEL = "INFO"
+
+
+def _safe_destroy_pg() -> None:
+    """Tear down the default process group on interpreter exit.
+
+    Registered via :func:`atexit.register` from :func:`init` so NCCL stops
+    printing the ``destroy_process_group() was not called before program
+    exit`` warning at the end of every ``flashdreams-run`` / ``torchrun``
+    invocation. Best-effort: never raises, so a teardown failure cannot
+    mask the original exit code or exception.
+    """
+    try:
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+    except Exception:  # noqa: BLE001 -- best-effort cleanup at exit
+        pass
+
+
+def is_distributed_initialized() -> bool:
+    """Return True when torch distributed is available and initialized."""
+    return dist.is_available() and dist.is_initialized()
+
+
+def get_global_rank() -> int:
+    """Return the torch distributed global rank, or 0 outside distributed runs."""
+    if is_distributed_initialized():
+        return dist.get_rank()
+    return 0
+
+
+def get_global_rank_from_env() -> int:
+    """Return the launch-provided rank, or 0 when unavailable."""
+    try:
+        return int(os.environ.get("RANK", "0"))
+    except ValueError:
+        return 0
+
+
+def get_global_rank_for_logging() -> int:
+    """Return the best available global rank for early process logging."""
+    if is_distributed_initialized():
+        return get_global_rank()
+    return get_global_rank_from_env()
+
+
+def configure_loguru_for_distributed(world_rank: int | None = None) -> None:
+    """Keep rank 0 log levels intact and demote other ranks to DEBUG."""
+    if world_rank is None:
+        world_rank = get_global_rank_for_logging()
+
+    log_level = os.environ.get("LOGURU_LEVEL", DEFAULT_LOG_LEVEL)
+    debug_level = logger.level("DEBUG")
+
+    def demote_non_rank0(record):
+        if world_rank != 0:
+            record["level"] = type(record["level"])(
+                debug_level.name,
+                debug_level.no,
+                debug_level.icon,
+            )
+
+    logger.remove()
+    logger.configure(patcher=demote_non_rank0)
+    logger.add(sys.stderr, level=log_level)
+
+
+configure_loguru_for_distributed()
 
 
 class Device:
@@ -78,8 +157,14 @@ def init() -> int | None:
             timeout=timeout_timedelta,
             device_id=local_rank,
         )
+        # Always destroy the process group on interpreter shutdown so NCCL
+        # does not warn about a leaked group at the end of every run; the
+        # handler is idempotent if a caller (e.g. a long-lived gRPC server)
+        # already destroyed the group explicitly before exiting.
+        atexit.register(_safe_destroy_pg)
+        configure_loguru_for_distributed(get_global_rank())
         logger.critical(
-            f"Initialized distributed training with local rank {local_rank} with timeout {timeout_seconds}",
+            f"Initialized distributed inference with local rank {local_rank} with timeout {timeout_seconds}",
         )
 
     # Bump cudaLimitMaxL2FetchGranularity (id=0x05) to 128 bytes for better bandwidth.
@@ -87,4 +172,4 @@ def init() -> int | None:
     p_value = ctypes.cast((ctypes.c_int * 1)(), ctypes.POINTER(ctypes.c_int))
     _libcudart.cudaDeviceSetLimit(ctypes.c_int(0x05), ctypes.c_int(128))
     _libcudart.cudaDeviceGetLimit(p_value, ctypes.c_int(0x05))
-    logger.info(f"Training with {dist.get_world_size()} GPUs.")
+    logger.info(f"Inference with {dist.get_world_size()} GPUs.")

@@ -15,14 +15,31 @@
 
 """Hugging Face helpers shared across encoders.
 
-The main goal is to decide when ``from_pretrained`` should be called with
-``local_files_only=True`` so multi-rank loads of fully cached repos do not
-trip HF's per-IP 429 rate limit.
+Remote repos are preloaded before ``from_pretrained(..., local_files_only=True)``
+so multi-rank jobs do not race to download the same snapshot or treat a partial
+cache entry as complete.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
+from collections.abc import Sequence
+from pathlib import Path
+
+import torch.distributed as dist
+from filelock import FileLock
+from huggingface_hub import snapshot_download
+from huggingface_hub.constants import HUGGINGFACE_HUB_CACHE
+
+from flashdreams.core.distributed import get_global_rank, is_distributed_initialized
+from flashdreams.core.io.disk import (
+    CACHE_MIN_FREE_ENV,
+    DiskSpaceError,
+    cache_min_free_bytes,
+    disk_space_error_from_exception,
+    ensure_free_disk,
+)
 
 
 def _str2bool(v: str | bool) -> bool:
@@ -36,49 +53,127 @@ def _str2bool(v: str | bool) -> bool:
     raise ValueError(f"Boolean value expected, got {v!r}")
 
 
-def _hf_repo_is_cached(repo_id: str) -> bool:
-    """Return True if ``repo_id`` is already in the HF hub cache.
+def _hub_cache_dir(cache_dir: str | os.PathLike[str] | None) -> Path:
+    if cache_dir is not None:
+        return Path(cache_dir).expanduser()
+    return Path(HUGGINGFACE_HUB_CACHE).expanduser()
 
-    Probes a few common root-level files (``config.json``,
-    ``model_index.json``, ``tokenizer_config.json``,
-    ``preprocessor_config.json``); the right one depends on whether the
-    repo is a plain transformers model, a Diffusers pipeline, or a
-    tokenizer/processor-only repo. If any one is present, sibling assets
-    downloaded with it also load fine in offline mode.
-    """
-    try:
-        from huggingface_hub import try_to_load_from_cache
-    except Exception:
-        return False
 
-    candidates = (
-        "config.json",
-        "model_index.json",
-        "tokenizer_config.json",
-        "preprocessor_config.json",
+def _lock_path(
+    repo_id: str,
+    revision: str | None,
+    cache_dir: str | os.PathLike[str] | None,
+) -> Path:
+    cache_root = _hub_cache_dir(cache_dir)
+    lock_key = f"{repo_id}@{revision or 'main'}"
+    lock_digest = hashlib.sha256(lock_key.encode("utf-8")).hexdigest()[:16]
+    safe_name = repo_id.replace("/", "--")
+    locks_dir = cache_root / ".flashdreams_locks"
+    return locks_dir / f"{safe_name}-{lock_digest}.lock"
+
+
+def _normalize_patterns(
+    patterns: str | Sequence[str] | None,
+) -> str | list[str] | None:
+    if patterns is None or isinstance(patterns, str):
+        return patterns
+    return list(patterns)
+
+
+def _download_snapshot(
+    repo_id: str,
+    *,
+    revision: str | None,
+    cache_dir: str | os.PathLike[str] | None,
+    allow_patterns: str | Sequence[str] | None,
+    ignore_patterns: str | Sequence[str] | None,
+) -> None:
+    lock_file = _lock_path(repo_id, revision, cache_dir)
+    cache_root = _hub_cache_dir(cache_dir)
+    min_bytes = cache_min_free_bytes()
+    settings: dict[str, object] = {"repo": repo_id}
+    if cache_dir is not None:
+        settings["cache_dir"] = Path(cache_dir).expanduser()
+    ensure_free_disk(
+        cache_root,
+        required_bytes=min_bytes,
+        label="Hugging Face cache",
+        env_vars=("HF_HOME", "HF_HUB_CACHE", CACHE_MIN_FREE_ENV),
+        settings=settings,
     )
-    for filename in candidates:
-        try:
-            if try_to_load_from_cache(repo_id, filename) is not None:
-                return True
-        except Exception:
-            continue
-    return False
+    try:
+        lock_file.parent.mkdir(parents=True, exist_ok=True)
+        with FileLock(str(lock_file)):
+            snapshot_download(
+                repo_id,
+                revision=revision,
+                cache_dir=str(cache_dir) if cache_dir is not None else None,
+                local_files_only=False,
+                allow_patterns=_normalize_patterns(allow_patterns),
+                ignore_patterns=_normalize_patterns(ignore_patterns),
+            )
+    except Exception as exc:
+        disk_error = disk_space_error_from_exception(
+            exc,
+            path=cache_root,
+            label="Hugging Face cache",
+            required_bytes=min_bytes,
+            env_vars=("HF_HOME", "HF_HUB_CACHE", CACHE_MIN_FREE_ENV),
+            settings=settings,
+        )
+        if disk_error is not None:
+            raise disk_error from exc
+        raise
 
 
-def should_use_local_files_only(repo_id_or_path: str) -> bool:
-    """Decide whether to pass ``local_files_only=True`` to ``from_pretrained``.
+def maybe_download_hf_repo_on_rank0(
+    repo_id_or_path: str,
+    *,
+    revision: str | None = None,
+    cache_dir: str | os.PathLike[str] | None = None,
+    allow_patterns: str | Sequence[str] | None = None,
+    ignore_patterns: str | Sequence[str] | None = None,
+) -> None:
+    """Download a remote HF repo snapshot from rank 0 when downloads are allowed.
 
-    True if any of the following hold:
-
-    - ``repo_id_or_path`` is a local directory.
-    - ``HF_HUB_OFFLINE`` is truthy.
-    - ``LOCAL_FILES_ONLY`` is truthy (legacy).
-    - The repo is already cached locally.
+    Local paths and explicit offline/local-only modes are no-ops. For remote
+    repositories, rank 0 preloads the snapshot while other distributed ranks
+    wait for its success/failure signal. A filesystem lock serializes
+    independent processes that share the same HF cache directory.
     """
-    return (
+    if (
         os.path.isdir(repo_id_or_path)
         or _str2bool(os.getenv("HF_HUB_OFFLINE", "false"))
         or _str2bool(os.getenv("LOCAL_FILES_ONLY", "false"))
-        or _hf_repo_is_cached(repo_id_or_path)
-    )
+    ):
+        return
+
+    rank = get_global_rank()
+    payload: list[dict[str, str | None]]
+    if rank == 0:
+        try:
+            _download_snapshot(
+                repo_id_or_path,
+                revision=revision,
+                cache_dir=cache_dir,
+                allow_patterns=allow_patterns,
+                ignore_patterns=ignore_patterns,
+            )
+            payload = [{"error": None}]
+        except DiskSpaceError as exc:
+            payload = [{"error": str(exc), "disk_error": "1"}]
+        except Exception as exc:
+            payload = [{"error": f"{type(exc).__name__}: {exc}"}]
+    else:
+        payload = [{"error": None}]
+
+    if is_distributed_initialized():
+        dist.broadcast_object_list(payload, src=0)
+
+    error = payload[0]["error"]
+    if error is not None:
+        if payload[0].get("disk_error"):
+            raise DiskSpaceError(error)
+        raise RuntimeError(
+            f"Rank 0 failed to download Hugging Face repo {repo_id_or_path!r}: {error}"
+        )
