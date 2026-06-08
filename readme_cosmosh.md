@@ -246,7 +246,7 @@ and asset paths are documented in the YAML itself.
 
 ```bash
 uv run --package flash-cosmosh python -m cosmosh.webrtc.server \
-  --config integrations/cosmosh/configs/keyboard_episode_001867.yaml
+  --config integrations/cosmosh/configs/keyboard_tabletop.yaml
 ```
 
 Then open **<http://0.0.0.0:8080/keyboard>** in any

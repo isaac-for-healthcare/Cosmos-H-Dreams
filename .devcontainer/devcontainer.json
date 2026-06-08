@@ -1,6 +1,6 @@
 {
     "name": "FlashDreams",
-    "image": "flashdreams:latest",
+    "image": "flashdreams:public",
     "runArgs": [
         "--gpus=all",
         "--network=host"

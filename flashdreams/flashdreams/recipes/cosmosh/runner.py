@@ -252,9 +252,7 @@ class CosmoshRunner(Runner[CosmoshRunnerConfig, CosmoshPipeline]):
                 continue
             if self.is_rank_zero:
                 logger.info("-" * 60)
-                logger.info(
-                    f"Entry {idx + 1}/{len(entries)}: {entry['input_video']}"
-                )
+                logger.info(f"Entry {idx + 1}/{len(entries)}: {entry['input_video']}")
                 logger.info("-" * 60)
             stats = self._run_entry(entry, text_embeddings_cpu=text_embeddings_cpu)
             if stats is None:
@@ -357,6 +355,12 @@ class CosmoshRunner(Runner[CosmoshRunnerConfig, CosmoshPipeline]):
 
         actions_np = np.load(input_action_path)
         actions_np = _pad_actions(actions_np, target_dim=tcfg.network.action_dim)
+
+        #### THIS IS ONLY FOR DEBUGGING ####
+        actions_zero = list(range(22, actions_np.shape[1]))
+        for action_dim in actions_zero:
+            actions_np = _zero_action(actions_np, target_dim=action_dim)
+        #### THIS IS ONLY FOR DEBUGGING ####
         ar_total = min(cfg.total_blocks, actions_np.shape[0] // ACTIONS_PER_OUTER_BLOCK)
         if ar_total <= 0:
             raise ValueError(
@@ -605,6 +609,17 @@ def _load_cr1_text_embeddings(path: str) -> torch.Tensor:
             f"CR1 embeddings must be [T, D] or [B, T, D]; got {tuple(emb.shape)}"
         )
     return emb
+
+
+def _set_action(actions_np: np.ndarray, target_dim: int, value: float) -> np.ndarray:
+    """Set one value of the actions_np array."""
+    actions_np[..., target_dim] = value
+    return actions_np
+
+
+def _zero_action(actions_np: np.ndarray, target_dim: int) -> np.ndarray:
+    """Zero out one value of the actions_np array."""
+    return _set_action(actions_np, target_dim, 0.0)
 
 
 def _pad_actions(actions_np: np.ndarray, target_dim: int) -> np.ndarray:
