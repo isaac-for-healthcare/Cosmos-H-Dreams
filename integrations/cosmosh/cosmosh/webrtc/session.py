@@ -15,7 +15,14 @@ import torch
 import torchvision.transforms.functional as TF
 from PIL import Image
 
-from cosmosh.webrtc.controls import CosmoshActionIntegrator, KeyboardState
+from cosmosh.webrtc.controls import (
+    PSM1_GRIPPER_CLOSED,
+    PSM1_GRIPPER_OPEN,
+    PSM2_GRIPPER_CLOSED,
+    PSM2_GRIPPER_OPEN,
+    CosmoshActionIntegrator,
+    KeyboardState,
+)
 from cosmosh.webrtc.controls_quest import (
     VRControllerState,
     compute_action_chunk,
@@ -160,13 +167,96 @@ def _load_conditional_frame(path: str, start_frame_idx: int) -> np.ndarray:
     return video[start_frame_idx]
 
 
-def _load_action_stats(stats_path: str) -> dict[str, np.ndarray]:
-    """Load ``stats_cosmos.json`` and return per-component mean/std slices.
+# Gripper dims within the shared 20-dim prefix (arm-A at 9, arm-B at 19).
+_PSM1_GRIPPER_IDX = 9
+_PSM2_GRIPPER_IDX = 19
 
-    The file's combined ``"action"`` block is the 20-dim normalisation that
-    matches the inference action layout (PSM1 xyz/rot6d/gripper +
-    PSM2 xyz/rot6d/gripper). We slice out the 6-dim PSM1 / PSM2 rot6d
-    means/stds for the rotation integrator's identity-baseline computation.
+
+def _normalise_endpoint(
+    raw: float, mean: float, std: float, *, fallback: float
+) -> float:
+    """Normalise a raw gripper percentile: ``(raw - mean) / std``.
+
+    Falls back to ``fallback`` (the module-constant default) when ``std`` is
+    non-finite or non-positive — guards against a degenerate / constant
+    gripper dim (e.g. the all-zero energy dims in the 28-dim CMR stats).
+    """
+    if not np.isfinite(std) or std <= 0.0:
+        return fallback
+    return float((raw - mean) / std)
+
+
+def _gripper_endpoints_from_stats(
+    action: dict[str, Any], mean: np.ndarray, std: np.ndarray, stats_path: str
+) -> dict[str, float]:
+    """Derive per-arm ``[closed, open]`` gripper endpoints in normalised space.
+
+    Closed = the low raw percentile (``q01``, falling back to ``min``); open =
+    the high raw percentile (``q99``, falling back to ``max``). Each is
+    normalised by the same ``(mean, std)`` the model was trained with, so the
+    integrator clips the latched gripper to the dataset's observed range for
+    the *active* model rather than to hardcoded dVRK constants. Falls back to
+    the module-constant defaults when the percentile arrays are missing.
+    """
+    lo = action.get("q01") or action.get("min")
+    hi = action.get("q99") or action.get("max")
+    if lo is None or hi is None:
+        LOGGER.warning(
+            "stats file %s lacks q01/q99/min/max; using default gripper "
+            "endpoints.",
+            stats_path,
+        )
+        return {
+            "psm1_gripper_closed": PSM1_GRIPPER_CLOSED,
+            "psm1_gripper_open": PSM1_GRIPPER_OPEN,
+            "psm2_gripper_closed": PSM2_GRIPPER_CLOSED,
+            "psm2_gripper_open": PSM2_GRIPPER_OPEN,
+        }
+    lo = np.asarray(lo, dtype=np.float64)
+    hi = np.asarray(hi, dtype=np.float64)
+    return {
+        "psm1_gripper_closed": _normalise_endpoint(
+            lo[_PSM1_GRIPPER_IDX],
+            mean[_PSM1_GRIPPER_IDX],
+            std[_PSM1_GRIPPER_IDX],
+            fallback=PSM1_GRIPPER_CLOSED,
+        ),
+        "psm1_gripper_open": _normalise_endpoint(
+            hi[_PSM1_GRIPPER_IDX],
+            mean[_PSM1_GRIPPER_IDX],
+            std[_PSM1_GRIPPER_IDX],
+            fallback=PSM1_GRIPPER_OPEN,
+        ),
+        "psm2_gripper_closed": _normalise_endpoint(
+            lo[_PSM2_GRIPPER_IDX],
+            mean[_PSM2_GRIPPER_IDX],
+            std[_PSM2_GRIPPER_IDX],
+            fallback=PSM2_GRIPPER_CLOSED,
+        ),
+        "psm2_gripper_open": _normalise_endpoint(
+            hi[_PSM2_GRIPPER_IDX],
+            mean[_PSM2_GRIPPER_IDX],
+            std[_PSM2_GRIPPER_IDX],
+            fallback=PSM2_GRIPPER_OPEN,
+        ),
+    }
+
+
+def _load_action_stats(stats_path: str) -> dict[str, Any]:
+    """Load ``stats_cosmos*.json`` and return per-component normalisation slices.
+
+    The file's combined ``"action"`` block holds raw-space mean/std/q01/q99
+    over the dataset's action layout. The first 20 dims always follow the
+    shared ``[arm-A xyz | arm-A rot6d | arm-A gripper | arm-B xyz |
+    arm-B rot6d | arm-B gripper]`` convention — true of both the dVRK 20-dim
+    layout (``stats_cosmos.json``) and the Open-H/CMR 28-dim layout
+    (``stats_cosmos-28D-exp1.json``). Only the trailing dims differ (energy /
+    thumbstick / buttons for CMR; pure zero-padding for dVRK), and the
+    integrator doesn't drive those, so we only require the 20-dim prefix.
+
+    Returns the per-arm rot6d mean/std (dims 3:9 / 13:19) for the rotation
+    identity baseline, plus the per-arm gripper ``[closed, open]`` endpoints
+    derived from dim 9 / 19's percentiles.
     """
     with open(stats_path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -177,17 +267,29 @@ def _load_action_stats(stats_path: str) -> dict[str, np.ndarray]:
         )
     mean = np.asarray(action["mean"], dtype=np.float64)
     std = np.asarray(action["std"], dtype=np.float64)
-    if mean.shape != (20,) or std.shape != (20,):
-        pass
-        # raise ValueError(
-        #     f"stats action.mean/std must be 20-dim, got {mean.shape}/{std.shape}"
-        # )
-    return {
+    if mean.shape != std.shape:
+        raise ValueError(
+            f"stats action.mean / action.std shape mismatch: "
+            f"{mean.shape} vs {std.shape} in {stats_path}"
+        )
+    if mean.ndim != 1 or mean.shape[0] < 20:
+        raise ValueError(
+            f"stats action.mean/std must be 1-D with at least 20 dims (the "
+            f"shared [xyz|rot6d|gripper] x2 prefix); got shape {mean.shape} in "
+            f"{stats_path}. Supported layouts: 20-dim dVRK, 28-dim Open-H/CMR."
+        )
+    stats: dict[str, Any] = {
         "psm1_rot6d_mean": mean[3:9].copy(),
         "psm1_rot6d_std": std[3:9].copy(),
         "psm2_rot6d_mean": mean[13:19].copy(),
         "psm2_rot6d_std": std[13:19].copy(),
+        # Full-width mean/std for building the resting-neutral fill of the
+        # un-driven action dims (energy / thumbstick / buttons for CMR).
+        "action_mean": mean.copy(),
+        "action_std": std.copy(),
     }
+    stats.update(_gripper_endpoints_from_stats(action, mean, std, stats_path))
+    return stats
 
 
 def _load_cr1_text_embeddings(path: str) -> torch.Tensor:
@@ -214,6 +316,47 @@ def _pad_actions(actions_np: np.ndarray, target_dim: int) -> np.ndarray:
     pad_shape = list(actions_np.shape[:-1]) + [pad_width]
     zeros = np.zeros(pad_shape, dtype=actions_np.dtype)
     return np.concatenate([actions_np, zeros], axis=-1)
+
+
+def _resting_neutral_fill(
+    mean: np.ndarray, std: np.ndarray, action_dim: int
+) -> np.ndarray:
+    """Per-dim normalised value of a raw-``0`` (at-rest) action.
+
+    The model consumes actions in mean-std normalised space, so filling an
+    un-driven dim with ``0`` feeds the raw dataset *mean*, not a neutral input
+    — badly off-centre for the CMR thumbstick dims (e.g. ``thumbstick_y_left``
+    has raw mean ≈ -1956, so normalised 0 is a hard-deflected stick). The
+    resting value of those controls is raw ``0`` (centred stick, unpressed
+    button, zero energy), i.e. ``(0 - mean) / std = -mean / std``.
+
+    Returns a length-``action_dim`` ``float64`` row. Dims with ``std <= 0``
+    (degenerate / constant, e.g. the all-zero energy dims) and dims beyond the
+    stats width (true zero-padding up to the network's ``action_dim``) are
+    left at ``0``.
+    """
+    mean = np.asarray(mean, dtype=np.float64)
+    std = np.asarray(std, dtype=np.float64)
+    row = np.zeros(action_dim, dtype=np.float64)
+    n = min(mean.shape[0], action_dim)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        row[:n] = np.where(std[:n] > 0.0, -mean[:n] / std[:n], 0.0)
+    return row
+
+
+def _fill_to_action_dim(driven: np.ndarray, neutral_row: np.ndarray) -> np.ndarray:
+    """Widen a driven ``[T, D_driven]`` chunk to ``[T, len(neutral_row)]``.
+
+    Starts every frame at ``neutral_row`` (the resting-neutral fill for the
+    un-driven dims) and overwrites the leading ``D_driven`` dims with the
+    integrator's output. For the dVRK 20-dim stats this is identical to
+    zero-padding (dims 20+ of ``neutral_row`` are 0); for CMR it puts the
+    thumbstick / button dims at their resting value instead of the raw mean.
+    """
+    n_frames, n_driven = driven.shape
+    out = np.tile(neutral_row.astype(driven.dtype), (n_frames, 1))
+    out[:, :n_driven] = driven
+    return out
 
 
 def _pixel_frame_to_neg1_pos1(
@@ -261,6 +404,19 @@ class CosmoshInferenceRuntime:
         self._psm2_rot6d_mean: np.ndarray | None = None
         self._psm2_rot6d_std: np.ndarray | None = None
 
+        # Per-arm gripper [closed, open] endpoints derived from the loaded
+        # stats (q01/q99 → normalised); None until stats are loaded, in which
+        # case the integrator keeps its module-constant defaults.
+        self._psm1_gripper_open: float | None = None
+        self._psm1_gripper_closed: float | None = None
+        self._psm2_gripper_open: float | None = None
+        self._psm2_gripper_closed: float | None = None
+
+        # Full-width (= model action_dim) resting-neutral row used to fill the
+        # action dims the integrator doesn't drive. None until stats + target
+        # dim are known; falls back to zero-padding when unset.
+        self._action_neutral_row: np.ndarray | None = None
+
         self._text_embeddings: torch.Tensor | None = None
         self._initial_cond_pixels: torch.Tensor | None = None
         self._cond_pixels: torch.Tensor | None = None
@@ -291,6 +447,12 @@ class CosmoshInferenceRuntime:
         if self._psm2_rot6d_mean is not None and self._psm2_rot6d_std is not None:
             kwargs["psm2_rot6d_mean"] = self._psm2_rot6d_mean
             kwargs["psm2_rot6d_std"] = self._psm2_rot6d_std
+        if self._psm1_gripper_open is not None and self._psm1_gripper_closed is not None:
+            kwargs["gripper_open_psm1"] = self._psm1_gripper_open
+            kwargs["gripper_closed_psm1"] = self._psm1_gripper_closed
+        if self._psm2_gripper_open is not None and self._psm2_gripper_closed is not None:
+            kwargs["gripper_open_psm2"] = self._psm2_gripper_open
+            kwargs["gripper_closed_psm2"] = self._psm2_gripper_closed
         return CosmoshActionIntegrator(**kwargs)
 
     async def initialize(self) -> None:
@@ -536,6 +698,13 @@ class CosmoshInferenceRuntime:
         self._psm1_rot6d_std = stats["psm1_rot6d_std"]
         self._psm2_rot6d_mean = stats["psm2_rot6d_mean"]
         self._psm2_rot6d_std = stats["psm2_rot6d_std"]
+        self._psm1_gripper_open = stats["psm1_gripper_open"]
+        self._psm1_gripper_closed = stats["psm1_gripper_closed"]
+        self._psm2_gripper_open = stats["psm2_gripper_open"]
+        self._psm2_gripper_closed = stats["psm2_gripper_closed"]
+        self._action_neutral_row = _resting_neutral_fill(
+            stats["action_mean"], stats["action_std"], self._action_target_dim
+        )
 
         if (cond_frame.shape[0], cond_frame.shape[1]) != (ht, wt):
             cond_frame = mediapy.resize_image(cond_frame, (ht, wt))
@@ -555,6 +724,15 @@ class CosmoshInferenceRuntime:
             wt,
             self._action_target_dim,
             self._inner_steps_per_block,
+        )
+        LOGGER.info(
+            "Gripper endpoints from %s: psm1=[closed=%.3f, open=%.3f] "
+            "psm2=[closed=%.3f, open=%.3f]",
+            self.config.stats_path,
+            self._psm1_gripper_closed,
+            self._psm1_gripper_open,
+            self._psm2_gripper_closed,
+            self._psm2_gripper_open,
         )
 
     def _reset_rollout_sync(self) -> None:
@@ -616,6 +794,13 @@ class CosmoshInferenceRuntime:
         self._psm1_rot6d_std = stats["psm1_rot6d_std"]
         self._psm2_rot6d_mean = stats["psm2_rot6d_mean"]
         self._psm2_rot6d_std = stats["psm2_rot6d_std"]
+        self._psm1_gripper_open = stats["psm1_gripper_open"]
+        self._psm1_gripper_closed = stats["psm1_gripper_closed"]
+        self._psm2_gripper_open = stats["psm2_gripper_open"]
+        self._psm2_gripper_closed = stats["psm2_gripper_closed"]
+        self._action_neutral_row = _resting_neutral_fill(
+            stats["action_mean"], stats["action_std"], self._action_target_dim
+        )
         self._text_embeddings = text_embeddings
         self._initial_cond_pixels = cond_pixels.clone()
         self._cond_pixels = cond_pixels
@@ -627,10 +812,15 @@ class CosmoshInferenceRuntime:
         self.autoregressive_index = 0
 
         LOGGER.info(
-            "Switched scene to %r (input=%s stats=%s).",
+            "Switched scene to %r (input=%s stats=%s); gripper endpoints "
+            "psm1=[closed=%.3f, open=%.3f] psm2=[closed=%.3f, open=%.3f].",
             scene.name,
             scene.input_path,
             scene.stats_path,
+            self._psm1_gripper_closed,
+            self._psm1_gripper_open,
+            self._psm2_gripper_closed,
+            self._psm2_gripper_open,
         )
 
     def _close_sync(self) -> None:
@@ -717,6 +907,10 @@ class CosmoshInferenceRuntime:
             psm2_rot6d_mean=self.action_integrator.psm2_rot6d_mean,
             psm2_rot6d_std=self.action_integrator.psm2_rot6d_std,
             psm2_rot6d_identity_norm=self.action_integrator._psm2_identity_rot6d_norm,
+            psm1_gripper_open=self.action_integrator.gripper_open_psm1,
+            psm1_gripper_closed=self.action_integrator.gripper_closed_psm1,
+            psm2_gripper_open=self.action_integrator.gripper_open_psm2,
+            psm2_gripper_closed=self.action_integrator.gripper_closed_psm2,
         )
 
         LOGGER.debug(
@@ -757,7 +951,12 @@ class CosmoshInferenceRuntime:
             raise CosmoshRuntimeError("Runtime is not initialized.")
 
         assert actions_np.shape == (self.actions_per_chunk, ACTION_DIM_NORMALISED)
-        actions_np = _pad_actions(actions_np, target_dim=self._action_target_dim)
+        if self._action_neutral_row is not None:
+            # Fill the dims the integrator doesn't drive (energy / thumbstick /
+            # buttons for CMR) with their resting value instead of the raw mean.
+            actions_np = _fill_to_action_dim(actions_np, self._action_neutral_row)
+        else:
+            actions_np = _pad_actions(actions_np, target_dim=self._action_target_dim)
         actions_block = (
             torch.from_numpy(actions_np)
             .to(device=self._device, dtype=self._dtype)
