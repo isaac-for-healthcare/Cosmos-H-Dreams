@@ -356,11 +356,6 @@ class CosmoshRunner(Runner[CosmoshRunnerConfig, CosmoshPipeline]):
         actions_np = np.load(input_action_path)
         actions_np = _pad_actions(actions_np, target_dim=tcfg.network.action_dim)
 
-        #### THIS IS ONLY FOR DEBUGGING ####
-        actions_zero = list(range(22, actions_np.shape[1]))
-        for action_dim in actions_zero:
-            actions_np = _zero_action(actions_np, target_dim=action_dim)
-        #### THIS IS ONLY FOR DEBUGGING ####
         ar_total = min(cfg.total_blocks, actions_np.shape[0] // ACTIONS_PER_OUTER_BLOCK)
         if ar_total <= 0:
             raise ValueError(
