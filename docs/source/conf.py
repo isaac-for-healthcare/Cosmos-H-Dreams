@@ -3,8 +3,16 @@
 #
 # Sphinx configuration for the FlashDreams documentation site.
 
+import sys
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
+from pathlib import Path
+
+# Ensure autodoc imports the in-repo package (flashdreams/flashdreams/*)
+# instead of any older site-packages install missing newer modules.
+_DOCS_SOURCE_DIR = Path(__file__).resolve().parent
+_REPO_SRC_ROOT = _DOCS_SOURCE_DIR.parent.parent / "flashdreams"
+sys.path.insert(0, str(_REPO_SRC_ROOT))
 
 # -- Project information -----------------------------------------------------
 
@@ -26,6 +34,11 @@ version = release if release[:1].isalpha() else f"v{release}"
 # caught early (locally and in CI).
 warningiserror = True
 
+# Auto-generate anchors for markdown headings up to H3 so cross-references
+# like `[Project governance](#project-governance)` resolve when MD is
+# included via `.. include:: ... :parser: myst_parser.sphinx_`.
+myst_heading_anchors = 3
+
 extensions = [
     "sphinx.ext.napoleon",
     "sphinx.ext.autodoc",
@@ -35,6 +48,7 @@ extensions = [
     "sphinx.ext.githubpages",
     "sphinx_copybutton",
     "sphinx_design",
+    "myst_parser",
 ]
 
 intersphinx_mapping = {
@@ -51,20 +65,18 @@ exclude_patterns: list[str] = []
 
 # -- Options for HTML output -------------------------------------------------
 
-html_theme = "nvidia_sphinx_theme"
+html_theme = "furo"
 html_title = f"FlashDreams {version}"
 html_show_sphinx = False
-html_static_path = ["_static"]
+html_static_path = ["_static", "../../assets/logo"]
 
 html_theme_options = {
-    "secondary_sidebar_items": ["page-toc"],
-    "copyright_override": {"start": 2026},
-    "pygments_light_style": "tango",
-    "pygments_dark_style": "monokai",
-    "footer_links": {},
-    "github_url": "https://github.com/NVIDIA/flashdreams",
-    "navigation_depth": -1,
-    "collapse_navigation": False,
+    "source_repository": "https://github.com/NVIDIA/flashdreams/",
+    "source_branch": "main",
+    "source_directory": "docs/source/",
+    "sidebar_hide_name": True,
+    "light_logo": "horizontal-light.svg",
+    "dark_logo": "horizontal-dark.svg",
 }
 
 html_context = {
@@ -76,6 +88,7 @@ html_context = {
 }
 
 html_css_files = ["custom.css"]
+html_js_files = ["js/image_zoom.js"]
 
 # -- Copybutton --------------------------------------------------------------
 

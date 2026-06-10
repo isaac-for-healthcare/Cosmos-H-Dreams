@@ -24,7 +24,10 @@ from typing import Any, overload
 import torch
 from torch import Tensor
 
-from flashdreams.core.attention.rope import RotaryPositionEmbedding3D
+from flashdreams.core.attention.rope import (
+    KVCacheRelativeRotaryPositionEmbedding3D,
+    RotaryPositionEmbedding3D,
+)
 from flashdreams.core.checkpoint.load import load_checkpoint
 from flashdreams.infra.compile import compile_module
 from flashdreams.infra.cuda_graph import CUDAGraphWrapper
@@ -60,12 +63,14 @@ class Wan21TransformerCache(TransformerAutoregressiveCache):
     network_cache_uncond: WanDiTNetworkCache | None = None
     """Unconditional caches; ``None`` disables CFG."""
 
-    rope_adapter: RotaryPositionEmbedding3D
-    """3D RoPE adapter; advances along T per AR step."""
+    rope_adapter: RotaryPositionEmbedding3D | KVCacheRelativeRotaryPositionEmbedding3D
+    """3D RoPE adapter for self-attention position frequencies."""
 
     rope_freqs: Tensor | None = None
     """Self-attention RoPE frequencies for the current AR step.
-    Shape ``[L, 1, 1, head_dim // 2]`` after CP. Recomputed once per
+    Standard mode stores K after applying current-chunk RoPE.
+    KV-cache-relative mode stores unrotated K and applies cache-slot RoPE on cache read.
+    Shape ``[L, 1, 1, head_dim]`` after CP in standard mode. Recomputed once per
     AR step in :meth:`start` and reused across cond and uncond branches
     (and across all scheduler steps within the AR step)."""
 
@@ -98,7 +103,7 @@ class Wan21TransformerCache(TransformerAutoregressiveCache):
 class Wan21TransformerConfig(TransformerConfig):
     """Config for the Wan 2.1 transformer.
 
-    Bakes in the temporal layout (``len_t``, ``window_size_t``,
+    Bakes in the temporal layout (``len_t``, ``window_size_t``, optional
     ``sink_size_t``) and the CFG / compile knobs. Per-rollout spatial
     layout (``height``, ``width``) is supplied to
     :meth:`Wan21Transformer.initialize_autoregressive_cache` so one
@@ -113,7 +118,7 @@ class Wan21TransformerConfig(TransformerConfig):
     - ``stamp_image_latent``: overwrite the noisy latent with the clean
       image latent at masked positions every denoising step, and re-stamp
       the predicted ``x0`` the same way. ``network.in_dim`` unchanged.
-      (flashdreams mask-inject recipe; used by the out-of-tree
+      (flashdreams mask-inject integration; used by the out-of-tree
       ``causal_forcing`` plugin.)
     - ``concat_image_mask_to_latent``: append the 4-channel mask and
       16-channel image latent along the channel dim. Builders that set
@@ -129,6 +134,13 @@ class Wan21TransformerConfig(TransformerConfig):
     network: WanDiTNetworkConfig = field(default_factory=WanDiTNetwork1pt3BConfig)
     dtype: torch.dtype = torch.bfloat16
     checkpoint_path: str | None = None
+    checkpoint_min_free_gb: float | None = None
+    """Optional first-run disk preflight for checkpoint downloads.
+
+    ``None`` uses the generic cache reserve. Larger model integrations can set
+    this to their documented storage requirement; users can still override it
+    with ``FLASHDREAMS_MIN_CACHE_FREE_GB``.
+    """
 
     state_dict_transform: Callable[[dict[str, Tensor]], dict[str, Tensor]] | None = None
     """Pre-load state-dict remap (e.g. Self-Forcing's
@@ -149,7 +161,7 @@ class Wan21TransformerConfig(TransformerConfig):
     """Self-attention sliding-window size (pre-patchify T frames)."""
 
     sink_size_t: int = 0
-    """Number of sink tokens preserved across the window."""
+    """Prefix sink size (pre-patchify T frames) for self-attention KV cache."""
 
     h_extrapolation_ratio: float = 1.0
     w_extrapolation_ratio: float = 1.0
@@ -167,10 +179,40 @@ class Wan21TransformerConfig(TransformerConfig):
     """Eager calls before capture (>= 2 to drain Inductor autotune)."""
 
     stamp_image_latent: bool = False
-    """See class docstring (mask-inject I2V recipe)."""
+    """See class docstring (mask-inject I2V integration)."""
 
     concat_image_mask_to_latent: bool = False
     """See class docstring (channel-concat I2V layout)."""
+
+    ti2v_first_frame_per_token_timestep: bool = False
+    """Wan 2.2 TI2V 5B first-frame conditioning. When ``True`` and an
+    :class:`I2VCtrl` input is provided at AR step 0, ``predict_flow``
+    rewrites the scheduler's scalar timestep into a per-token tensor:
+    ``t = first_frame_timestep_value`` at positions marked by the I2V
+    mask (i.e. the first-frame latent), and the scheduler's ``t``
+    elsewhere. AR steps ``>= 1`` continue to use the scalar timestep,
+    which keeps the CUDA-graph-captured replay branch on a single
+    stable input shape.
+
+    Composes with ``stamp_image_latent``: together they implement the
+    upstream Wan 2.2 5B "VAE-seeded first-frame + per-token ``t=0``"
+    TI2V recipe -- the latent is stamped clean every denoising step
+    while the network sees ``t=0`` for those tokens. The standard
+    mask-inject I2V recipe leaves this flag off and relies on the
+    classifier-free stamp alone."""
+
+    first_frame_timestep_value: float = 0.0
+    """Per-token timestep assigned to first-frame conditioning tokens
+    when :attr:`ti2v_first_frame_per_token_timestep` is ``True``.
+
+    Defaults to ``0.0`` (Wan 2.2 TI2V 5B's base recipe — treats the
+    first frame as fully clean by AdaLN). HY-WorldPlay's distilled
+    WAN-5B raises it to ``14.0`` (vendor's
+    ``stabilization_level - 1``) so the AdaLN table sees a small
+    nonzero sigma at the first frame.
+
+    Unused when :attr:`ti2v_first_frame_per_token_timestep` is ``False``.
+    """
 
 
 class Wan21Transformer(Transformer[Wan21TransformerCache]):
@@ -194,12 +236,27 @@ class Wan21Transformer(Transformer[Wan21TransformerCache]):
         else:
             self._cp_size = 1
             self._cp_group = None
-
         # Pre-patchify temporal divisibility check; per-rollout
         # (height, width) is populated by initialize_autoregressive_cache.
         kt, _, _ = config.network.patch_size
         assert config.len_t % kt == 0, (
             f"len_t ({config.len_t}) must be divisible by patch_size[0] ({kt})."
+        )
+        assert config.window_size_t % kt == 0, (
+            f"window_size_t ({config.window_size_t}) must be divisible by "
+            f"patch_size[0] ({kt})."
+        )
+        assert config.sink_size_t % kt == 0, (
+            f"sink_size_t ({config.sink_size_t}) must be divisible by "
+            f"patch_size[0] ({kt})"
+        )
+        len_t = config.len_t // kt
+        window_size_t = config.window_size_t // kt
+        sink_size_t = config.sink_size_t // kt
+        assert (sink_size_t + window_size_t) % len_t == 0, (
+            f"sink_size_t + window_size_t ({sink_size_t + window_size_t}) must be "
+            f"divisible by post-patch len_t ({len_t}) so the BlockKVCache can "
+            f"fit a whole number of AR chunks."
         )
         self._output_height: int | None = None
         self._output_width: int | None = None
@@ -210,7 +267,10 @@ class Wan21Transformer(Transformer[Wan21TransformerCache]):
         self.network.set_context_parallel_group(cp_group=self._cp_group)
 
         if config.checkpoint_path is not None:
-            state_dict = load_checkpoint(config.checkpoint_path)
+            state_dict = load_checkpoint(
+                config.checkpoint_path,
+                checkpoint_min_free_gb=config.checkpoint_min_free_gb,
+            )
             if config.state_dict_transform is not None:
                 state_dict = config.state_dict_transform(state_dict)
             self.network.load_state_dict(state_dict)
@@ -227,13 +287,8 @@ class Wan21Transformer(Transformer[Wan21TransformerCache]):
         # matches the KV cache's filling -> steady transition so the captured
         # region only sees steady-state paths.
         self._use_cuda_graph = config.use_cuda_graph
-        chunks_total = config.sink_size_t + config.window_size_t
-        assert chunks_total % config.len_t == 0, (
-            f"sink_size_t + window_size_t ({chunks_total}) must be "
-            f"divisible by len_t ({config.len_t}) so the BlockKVCache can "
-            f"fit a whole number of AR chunks."
-        )
-        self._cuda_graph_capture_ar_idx: int = chunks_total // config.len_t
+        chunks_total = sink_size_t + window_size_t
+        self._cuda_graph_capture_ar_idx: int = chunks_total // len_t
         self._network_call: CUDAGraphWrapper | WanDiTNetwork = (
             CUDAGraphWrapper(self.network, warmup_iters=config.cuda_graph_warmup_iters)
             if config.use_cuda_graph
@@ -292,8 +347,18 @@ class Wan21Transformer(Transformer[Wan21TransformerCache]):
         pHW = (self._output_height // kh) * (self._output_width // kw)
         cp_size = self._cp_size
         chunk_size = self.latent_shape[-2]  # already CP-divided
-        window_size = (cfg.window_size_t // kt * pHW) // cp_size
-        sink_size = (cfg.sink_size_t // kt * pHW) // cp_size
+        window_size_t = cfg.window_size_t // kt
+        sink_size_t = cfg.sink_size_t // kt
+        assert (window_size_t * pHW) % cp_size == 0, (
+            f"window_size_t * frame_token_count ({window_size_t * pHW}) must be "
+            f"divisible by cp_size ({cp_size})"
+        )
+        assert (sink_size_t * pHW) % cp_size == 0, (
+            f"sink_size_t * frame_token_count ({sink_size_t * pHW}) must be "
+            f"divisible by cp_size ({cp_size})"
+        )
+        window_size = (window_size_t * pHW) // cp_size
+        sink_size = (sink_size_t * pHW) // cp_size
         return self.network.initialize_cache(
             chunk_size=chunk_size,
             window_size=window_size,
@@ -369,16 +434,22 @@ class Wan21Transformer(Transformer[Wan21TransformerCache]):
             )
 
         head_dim = self.config.network.dim // self.config.network.num_heads
-        rope_adapter = RotaryPositionEmbedding3D(
-            len_t=cfg.len_t // kt,
-            len_h=height // kh,
-            len_w=width // kw,
-            head_dim=head_dim,
-            h_extrapolation_ratio=self.config.h_extrapolation_ratio,
-            w_extrapolation_ratio=self.config.w_extrapolation_ratio,
-            interleaved=True,
-            device=self.device,
-        )
+        rope_kwargs: dict[str, Any] = {
+            "len_t": cfg.len_t // kt,
+            "len_h": height // kh,
+            "len_w": width // kw,
+            "head_dim": head_dim,
+            "h_extrapolation_ratio": self.config.h_extrapolation_ratio,
+            "w_extrapolation_ratio": self.config.w_extrapolation_ratio,
+            "interleaved": True,
+            "device": self.device,
+        }
+        if cfg.network.apply_rope_before_kvcache:
+            rope_adapter = RotaryPositionEmbedding3D(**rope_kwargs)
+        else:
+            rope_kwargs["sink_size_t"] = cfg.sink_size_t // kt
+            rope_kwargs["window_size_t"] = cfg.window_size_t // kt
+            rope_adapter = KVCacheRelativeRotaryPositionEmbedding3D(**rope_kwargs)
         rope_adapter.set_context_parallel_group(cp_group=self._cp_group)
 
         # Reset any prior CUDA graph: it refers to slot pointers from the
@@ -394,6 +465,51 @@ class Wan21Transformer(Transformer[Wan21TransformerCache]):
             network_cache_uncond=network_cache_uncond,
             rope_adapter=rope_adapter,
         )
+
+    def _maybe_build_per_token_timestep(
+        self,
+        timestep: Tensor,
+        input: I2VCtrl | None,
+        autoregressive_index: int,
+    ) -> Tensor:
+        """Optionally rewrite ``timestep`` into a per-token tensor for TI2V.
+
+        Off-path for everything except Wan 2.2 TI2V 5B AR-step 0 with a
+        non-``None`` :class:`I2VCtrl`. When on-path, the scalar scheduler
+        timestep is broadcast to ``[..., L]`` then zeroed at positions
+        marked by the I2V mask, so the first-frame conditioning tokens
+        see ``t=0`` while the rest of the chunk denoises at the current
+        scheduler step.
+
+        The post-patchify mask is constant across the patchified channel
+        axis (the encoder fills a per-pixel binary mask, and patchify
+        concatenates channel * kt * kh * kw entries that all share the
+        same value), so ``mask[..., 0]`` recovers a per-token boolean
+        without an ``any`` reduction.
+        """
+        if not self.config.ti2v_first_frame_per_token_timestep:
+            return timestep
+        if autoregressive_index != 0:
+            # CUDA-graph capture starts at AR ``_cuda_graph_capture_ar_idx``;
+            # AR>=1 must keep the scalar shape stable across the captured
+            # replay branch.
+            return timestep
+        if input is None:
+            return timestep
+        assert isinstance(input, I2VCtrl), (
+            "ti2v_first_frame_per_token_timestep requires the I2V control "
+            f"payload to be an I2VCtrl (got {type(input).__name__})"
+        )
+        per_token_mask = input.mask[..., 0]  # [..., L]
+        # Broadcast scalar / per-batch ``timestep`` to ``[..., L]`` and
+        # blend with ``first_frame_timestep_value`` at masked positions.
+        # Multiplying preserves the scheduler dtype so downstream
+        # sinusoidal embedding stays bit-identical to the scalar path
+        # on non-masked tokens.
+        timestep = timestep.to(per_token_mask.device)
+        mask = per_token_mask.to(timestep.dtype)
+        first_frame_value = timestep.new_tensor(self.config.first_frame_timestep_value)
+        return timestep.unsqueeze(-1) * (1.0 - mask) + first_frame_value * mask
 
     def _stamp_image_latent(
         self,
@@ -467,6 +583,9 @@ class Wan21Transformer(Transformer[Wan21TransformerCache]):
             "uncond=True requires cache.network_cache_uncond, but it is None "
             "(CFG was not enabled at cache build time)."
         )
+        assert cache.rope_freqs is not None, (
+            "Wan21TransformerCache.start() must populate rope_freqs before predict_flow"
+        )
         return self._select_network(autoregressive_index, uncond=uncond)(
             x=network_input,
             timesteps=timestep,
@@ -485,6 +604,24 @@ class Wan21Transformer(Transformer[Wan21TransformerCache]):
         input: I2VCtrl | None = None,
         network_extra_kwargs: dict[str, Any] | None = None,
     ) -> Tensor:
+        """Predict the flow for one denoising step.
+
+        ``timestep`` may be a scalar / per-batch tensor (standard Wan
+        2.1 / 14B path) or a per-token tensor with the same trailing
+        token axis as ``noisy_latent`` (Wan 2.2 TI2V 5B first-frame
+        seeding at AR step 0). The per-token layout flows through
+        :meth:`WanDiTNetwork.forward`, which dispatches the sinusoidal
+        embedding + AdaLN modulation on the native shape.
+
+        CUDA-graph capture is shape-sensitive: the captured replay
+        region only sees AR step ``>= self._cuda_graph_capture_ar_idx``
+        (steady state). TI2V 5B is configured with ``len_t ==
+        window_size_t`` so the threshold lands at AR 1, putting the
+        per-token AR-0 step inside the eager ``.drain`` branch where
+        shape changes are safe. After AR 0 the pipeline switches back
+        to scalar timesteps, so the captured branch sees a single
+        stable shape across all AR steps it owns.
+        """
         ar_idx = cache.autoregressive_index
         assert ar_idx >= 0, (
             "Wan21TransformerCache.start(autoregressive_index) must be called "
@@ -492,6 +629,9 @@ class Wan21Transformer(Transformer[Wan21TransformerCache]):
         )
         network_extra_kwargs = network_extra_kwargs or {}
         network_input = self._build_network_input(noisy_latent, input)
+        timestep = self._maybe_build_per_token_timestep(
+            timestep=timestep, input=input, autoregressive_index=ar_idx
+        )
 
         flow_cond = self._predict_flow(
             network_input=network_input,

@@ -66,7 +66,7 @@ class WanDiTNetworkCache:
 class WanDiTNetworkConfig(InstantiateConfig):
     """Configuration for the Wan DiT network."""
 
-    _target: type = field(default_factory=lambda: WanDiTNetwork)
+    _target: type["WanDiTNetwork"] = field(default_factory=lambda: WanDiTNetwork)
 
     patch_size: tuple[int, int, int] = (1, 2, 2)
     """Patch size for the input tensor."""
@@ -99,6 +99,11 @@ class WanDiTNetworkConfig(InstantiateConfig):
     patch_embedding_type: Literal["linear", "conv3d"] = "conv3d"
     """Type of patch embedding: ``"linear"`` (flattened patch MLP) or ``"conv3d"`` (strided conv)."""
 
+    apply_rope_before_kvcache: bool = True
+    """If True, apply RoPE to keys before storing them in the KV cache."""
+    cp_method: Literal["ring", "ulysses"] = "ring"
+    """Context-parallel attention method for transformer attention ops."""
+
 
 @dataclass
 class WanDiTNetwork1pt3BConfig(WanDiTNetworkConfig):
@@ -118,6 +123,29 @@ class WanDiTNetwork14BConfig(WanDiTNetworkConfig):
     ffn_dim: int = 13824
     num_heads: int = 40
     num_layers: int = 40
+
+
+@dataclass
+class WanDiTNetworkTI2V5BConfig(WanDiTNetworkConfig):
+    """Configuration for the Wan 2.2 TI2V 5B DiT network.
+
+    Mirrors the official ``Wan-AI/Wan2.2-TI2V-5B-Diffusers/transformer``
+    config: 24 heads * 128 head_dim = 3072 inner dim, 30 layers, ffn_dim
+    14336, and 48-channel latent in/out (the matching 16x VAE in
+    ``vae.py`` outputs 48 channels). Unlike Wan 2.1 14B I2V, TI2V 5B has
+    no CLIP cross-attention branch (``cross_attn_enable_img=False``):
+    the first frame is conditioned via a clean VAE-latent seed plus a
+    per-token ``t=0`` timestep on the AR-step-0 first-frame tokens, not
+    via CLIP image features.
+    """
+
+    in_dim: int = 48
+    out_dim: int = 48
+    dim: int = 3072
+    ffn_dim: int = 14336
+    num_heads: int = 24
+    num_layers: int = 30
+    cross_attn_enable_img: bool = False
 
 
 class WanDiTNetwork(nn.Module):
@@ -140,6 +168,8 @@ class WanDiTNetwork(nn.Module):
         self.eps = config.eps
         self.concat_padding_mask = config.concat_padding_mask
         self.patch_embedding_type = config.patch_embedding_type
+        self.apply_rope_before_kvcache = config.apply_rope_before_kvcache
+        self.cp_method = config.cp_method
 
         # Embedding layers
         in_dim = config.in_dim + 1 if self.concat_padding_mask else config.in_dim
@@ -193,6 +223,8 @@ class WanDiTNetwork(nn.Module):
             cross_attn_norm=self.cross_attn_norm,
             eps=self.eps,
             i2v=self.cross_attn_enable_img,
+            apply_rope_before_kvcache=self.apply_rope_before_kvcache,
+            cp_method=self.cp_method,
         )
 
     def set_context_parallel_group(self, cp_group: ProcessGroup | None = None) -> None:
@@ -400,10 +432,22 @@ class WanDiTNetwork(nn.Module):
         Args:
             x: Input tokens after patchify + CP, shape ``[..., L, D_in]``;
                 layout ``"... (t h w) (c kt kh kw)"``.
-            timesteps: Diffusion timesteps, broadcastable to shape ``[...]``.
+            timesteps: Diffusion timesteps. Two layouts are supported:
+
+                * **Scalar (per-batch).** Shape broadcastable to ``[...]``
+                  (i.e., to ``x.shape[:-2]``). The same timestep is shared
+                  across every token, matching the standard Wan 2.1 /
+                  Wan 2.2 14B chunked-denoise path.
+                * **Per-token.** Shape ``[..., L]`` matching ``x``'s post-
+                  patchify token axis. Used by Wan 2.2 TI2V 5B at AR step
+                  0 to stamp ``t=0`` at the first-frame conditioning tokens
+                  while the rest of the chunk denoises at the current
+                  scheduler step. See ``Wan21Transformer.predict_flow`` for
+                  the higher-level entry point.
             cache: Network KV caches.
-            rope_freqs: RoPE frequencies after CP, shape
-                ``[L, 1, 1, head_dim // 2]``.
+            rope_freqs: Full-width RoPE frequencies after CP. Standard mode
+                uses current-chunk frequencies with shape ``[L, 1, 1, d]``;
+                KV-cache-relative mode uses frequencies relative to the KV cache.
             current_chunk_idx: Current chunk index for streaming cache update.
             eager_mode: If ``True``, run cache before/after update hooks.
             block_extra_kwargs: Extra kwargs forwarded to each block.
@@ -415,6 +459,7 @@ class WanDiTNetwork(nn.Module):
             "We expect to have called update_parameters_after_loading_checkpoint() after loading the checkpoint"
         )
         batch_shape = x.shape[:-2]
+        L = x.shape[-2]
 
         # Patch embedding
         if self.patch_embedding_type == "linear":
@@ -430,11 +475,40 @@ class WanDiTNetwork(nn.Module):
                 f"Invalid patch embedding type: {self.patch_embedding_type}"
             )
 
-        # Timestep embedding and modulation projection
+        # Timestep embedding and modulation projection.
+        #
+        # Per-token vs scalar dispatch: ``timesteps`` is per-token iff its
+        # rank exceeds the batch rank and its trailing axis matches the
+        # post-patchify+CP token count. Sinusoidal + MLP both run on the
+        # native shape so per-token tensors stay ``[..., L, D]`` instead
+        # of collapsing to ``[..., D]``. Downstream ``Block`` / ``Head``
+        # squeeze the modulation axis (``[..., 1, D]`` or ``[..., L, 1, D]``)
+        # so the same kernel handles both via broadcast.
+        per_token_timestep = (
+            timesteps.ndim > len(batch_shape) and timesteps.shape[-1] == L
+        )
         e = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, timesteps).type_as(x)
-        )  # [..., D]
-        e0 = self.time_projection(e).unflatten(-1, (6, self.dim))  # [..., 6, D]
+        )  # [..., D] (scalar) or [..., L, D] (per-token)
+        e0 = self.time_projection(e).unflatten(
+            -1, (6, self.dim)
+        )  # [..., 6, D] or [..., L, 6, D]
+
+        # ``broadcast_to`` materialises the broadcast against ``batch_shape``
+        # in case ``timesteps`` was a true scalar / smaller-rank tensor; the
+        # per-token branch already has ``batch_shape`` in its leading dims so
+        # this is just a contiguity-preserving no-op there.
+        if per_token_timestep:
+            block_e_shape = batch_shape + (L, 6, self.dim)
+            head_e = torch.broadcast_to(e, batch_shape + (L, self.dim)).unsqueeze(
+                -2
+            )  # [..., L, 1, D]
+        else:
+            block_e_shape = batch_shape + (6, self.dim)
+            head_e = torch.broadcast_to(e, batch_shape + (self.dim,)).unsqueeze(
+                -2
+            )  # [..., 1, D]
+        block_e = torch.broadcast_to(e0, block_e_shape)
 
         # Transformer blocks
         if eager_mode:
@@ -443,7 +517,7 @@ class WanDiTNetwork(nn.Module):
             assert isinstance(block, Block)
             x = block(
                 x=x,
-                e=torch.broadcast_to(e0, batch_shape + e0.shape[-2:]),
+                e=block_e,
                 rope_freqs=rope_freqs,
                 cache=cache[block_idx],
                 **block_extra_kwargs,
@@ -452,9 +526,7 @@ class WanDiTNetwork(nn.Module):
             cache.after_update(current_chunk_idx)
 
         # Final head
-        x = self.head(
-            x, torch.broadcast_to(e, batch_shape + (1, e.shape[-1]))
-        )  # (..., L, D)
+        x = self.head(x, head_e)  # (..., L, D)
         return x
 
 

@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 
 import torch
 from torch import Tensor
+from tqdm import tqdm
 
 from flashdreams.infra.diffusion.scheduler import (
     FlowPredictor,
@@ -80,6 +81,9 @@ class FlowMatchSchedulerConfig(SchedulerConfig):
     ``scheduler.timesteps`` as ``int64`` and lets the embedding upcast to
     ``float64`` internally."""
 
+    enable_tqdm: bool = False
+    """Whether to enable tqdm progress bar."""
+
 
 class FlowMatchScheduler(Scheduler):
     """Flow-matching scheduler with self-forcing renoise (DiffSynth-style).
@@ -95,7 +99,9 @@ class FlowMatchScheduler(Scheduler):
             x_t = (1 - sigma(t)) * x0 + sigma(t) * eps
         return x0
 
-    Examples:
+    Example:
+
+    .. code-block:: python
 
         scheduler = FlowMatchSchedulerConfig(
             num_inference_steps=4,
@@ -220,7 +226,11 @@ class FlowMatchScheduler(Scheduler):
 
         noisy = initial_noise
         clean: Tensor | None = None
-        for i in range(timesteps.shape[0]):
+        for i in tqdm(
+            range(timesteps.shape[0]),
+            disable=not self.config.enable_tqdm,
+            desc="FlowMatchScheduler",
+        ):
             sigma = sigmas[i]
             # Schedule buffers are pinned to fp32 (to preserve integer
             # timestep values under a stray `module.to(bf16)`), but the

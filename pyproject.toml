@@ -2,21 +2,30 @@
 members = [
     "flashdreams",
     # Each populated subdir under ``integrations/`` is a standalone
-    # external recipe repo (e.g. ``causal_forcing`` / ``self_forcing``
-    # plugins, ``alpadreams`` / ``lingbot`` integrations); empty stub
+    # external integration repo (e.g. ``causal_forcing`` / ``self_forcing``
+    # plugins, ``omnidreams`` / ``lingbot`` integrations); empty stub
     # folders alongside them are intentional placeholders for future
     # extractions and don't ship a ``pyproject.toml`` yet.
     "integrations/*",
     # Nested sub-packages that the ``integrations/*`` glob does not reach.
-    "integrations/alpadreams/ludus-renderer",
+    "integrations/omnidreams/ludus-renderer",
 ]
 
 # Override nvidia-cublas to >=13.4 because transformer-engine-cu13 2.14.0 was
 # compiled against cuBLAS 13.4.x, while torch 2.11 pins nvidia-cublas 13.1.0.3.
 # cuBLAS 13.4 is backwards compatible with 13.1.
 [tool.uv]
+managed = true
 required-version = ">=0.11.8"
-override-dependencies = ["nvidia-cublas>=13.4"]
+override-dependencies = [
+    "nvidia-cublas>=13.4",
+    # Keep transitive HTTP clients off urllib3 versions with sensitive-header
+    # redirect handling vulnerabilities.
+    "urllib3>=2.7.0",
+    # Keep protobuf off the 6.33.x line flagged by BDSA for the ParseDict
+    # recursion-depth follow-up.
+    "protobuf>=7.35.0,<8",
+]
 
 # `transformer-engine-torch` has no prebuilt wheel and must be built against
 # the project's PyTorch + system CUDA. uv's default per-package build isolation
@@ -27,30 +36,21 @@ override-dependencies = ["nvidia-cublas>=13.4"]
 # so TE builds against the resolved torch from the project venv.
 no-build-isolation-package = ["transformer-engine-torch"]
 
-# The `transformer-engine-torch==2.14.0` sdist on PyPI is missing its
-# `build_tools/` directory, so any from-source build (which is the only option
-# since there is no prebuilt wheel) crashes inside setup.py with
-# `ModuleNotFoundError: No module named 'build_tools'`. Tracked upstream in
-# https://github.com/NVIDIA/TransformerEngine/issues/1567 — fixed after 2.14.0.
-# Override the source to build from the v2.14.1 git tag, whose tree includes
-# `build_tools/`. Inside the prebuilt flashdreams container TE is already
-# installed system-wide, so this override is only exercised on host-side
-# `uv sync` runs.
-[tool.uv.sources]
-transformer-engine-torch = { git = "https://github.com/NVIDIA/TransformerEngine.git", tag = "v2.14.1", subdirectory = "transformer_engine/pytorch" }
-
 [tool.pyright]
 extraPaths = [
     "flashdreams",
-    "integrations/alpadreams",
-    "integrations/alpadreams/ludus-renderer",
+    "integrations/omnidreams",
+    "integrations/omnidreams/ludus-renderer",
     "integrations/causal_forcing",
     "integrations/cosmos_predict2",
     "integrations/cosmosh",
     "integrations/fastvideo_causal_wan22",
+    "integrations/flashvsr",
+    "integrations/hy_worldplay",
     "integrations/lingbot",
     "integrations/self_forcing",
     "integrations/wan21",
+    "integrations/wan22",
 ]
 # For pyright to pickup the correct python.
 venvPath = "."
@@ -60,29 +60,41 @@ reportIncompatibleMethodOverride = "none"
 reportIncompatibleVariableOverride = "none"
 
 [tool.ty.environment]
-python-version = "3.12"
+python-version = "3.10"
 extra-paths = [
     "flashdreams",
-    "integrations/alpadreams",
-    "integrations/alpadreams/ludus-renderer",
+    "integrations/omnidreams",
+    "integrations/omnidreams/ludus-renderer",
     "integrations/causal_forcing",
     "integrations/cosmos_predict2",
     "integrations/cosmosh",
     "integrations/fastvideo_causal_wan22",
+    "integrations/flashvsr",
+    "integrations/hy_worldplay",
     "integrations/lingbot",
     "integrations/self_forcing",
     "integrations/wan21",
+    "integrations/wan22",
 ]
 
 [tool.ty.src]
 # Auto-generated protobuf stubs trigger `conflicting-metaclass` errors due to
 # protobuf's EnumTypeWrapper pattern (known ty limitation).
+# The ``omnidreams.interactive_drive`` subpackage's flashdreams / slangpy /
+# numpy interop surface has known-untyped areas; exclude both the
+# subpackage source and its tests so workspace ``ty`` stays clean.
+# (The pre-fold sample's pyright config had a similar exclude list.)
 exclude = [
     "**/protos/*pb2*",
+    "integrations/omnidreams/omnidreams/interactive_drive/**",
+    "integrations/omnidreams/tests/interactive_drive/**",
+    # Bench / parity-debugging scaffolding for the hy_worldplay integration;
+    # not shipped product, mirrors the interactive_drive precedent above.
+    "integrations/hy_worldplay/tests/parity_check/**",
 ]
 
 [tool.ty.rules]
-# Intentional pattern: recipe subclasses override base methods with more specific
+# Intentional pattern: integration subclasses override base methods with more specific
 # signatures (violates Liskov but is the established design in this codebase).
 invalid-method-override = "ignore"
 
@@ -90,17 +102,42 @@ invalid-method-override = "ignore"
 # These packages have no useful type stubs (Triton kernels rewrite their
 # call signatures via ``@triton.jit``) or are unavailable in CI; treat
 # imports as Any.
-replace-imports-with-any = ["transformer_engine.**", "triton.**"]
+replace-imports-with-any = ["flash_attn.**", "transformer_engine.**", "triton.**"]
+
+[tool.pytest.ini_options]
+addopts = "--import-mode=importlib -p flashdreams._pytest_plugins.marker_enforcement"
+norecursedirs = [
+    "parity_check",
+    "baseline_fastvideo",
+    "baseline_lightx2v",
+]
+markers = [
+    "ci_cpu: CPU-safe test, runs on the CPU CI runner",
+    "ci_gpu: requires GPU or libGL (cv2), runs on the GPU CI runner",
+    "manual: heavy or environment-specific test, opt-in only",
+]
 
 [dependency-groups]
-lint = ["pre-commit>=4.3.0", "ty>=0.0.33"]
+# Test-specific dependencies shared across workspace members. Listed here so
+# that the type checker (ty) can resolve imports in test files and in
+# flashdreams/_pytest_plugins.
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-manual-marker>=2.0",
+    "tomli>=2.0",
+    "imageio-ffmpeg>=0.5",
+]
+lint = ["pre-commit>=4.3.0", "ty>=0.0.39", {include-group = "test"}]
 
 # Sphinx toolchain for building docs locally (`uv run --group docs sphinx-build ...`).
 docs = [
-    "nvidia-sphinx-theme",
-    "sphinx",
-    "sphinx-copybutton",
-    "sphinx-design",
+    "furo>=2024.0",
+    "sphinx>=7.0",
+    "sphinx-autobuild>=2024.0",
+    "sphinx-copybutton>=0.5",
+    "sphinx-design>=0.5",
+    "myst-parser>=4.0",
 ]
 
 # CPU-only runtime deps needed by autodoc to import flashdreams on CI.
@@ -115,8 +152,7 @@ docs-ci = [
     "loguru>=0.7",
     "numpy>=1.24",
     "safetensors>=0.4",
-    "torch>=2.11",
-    "torchvision>=0.22",
+    "torch>=2.9",
     "tqdm>=4.60",
-    "transformers==4.57.6",
+    "transformers>=5.0,<6",
 ]

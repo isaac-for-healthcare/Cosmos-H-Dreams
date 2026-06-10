@@ -5,6 +5,8 @@ from aiohttp.test_utils import TestClient, TestServer
 from cosmosh.webrtc.server import create_app
 from cosmosh.webrtc.session import SessionBusyError
 
+pytestmark = pytest.mark.ci_cpu
+
 
 class FakeSessionManager:
     def __init__(self) -> None:

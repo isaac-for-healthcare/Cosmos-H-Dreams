@@ -14,6 +14,8 @@ import numpy as np
 from cosmosh.webrtc.utils import (
     ACTION_DIM_NORMALISED,
     IDENTITY_ROT6D,
+    matrix_to_rot6d,
+    rotvec_to_matrix,
     write_rotation_ramp,
     write_translate_ramp,
 )
@@ -152,10 +154,10 @@ _PSM2_TRANSLATE_KEY_TO_DIM_AND_SIGN: dict[str, tuple[int, float]] = {
 
 def normalize_key(key: str) -> str:
     raw = key.lower()
-    # ``KeyboardEvent.key`` for spacebar is " "; we don't want strip() to
-    # collapse it to "" before we map it to "space".
-    if raw == " " or raw.strip() == "":
-        return PSM1_GRIPPER_OPEN_KEY if " " in raw else raw.strip()
+    # ``KeyboardEvent.key`` for spacebar is " "; map to "space" before
+    # strip() collapses it to "".
+    if raw == " ":
+        return PSM2_GRIPPER_OPEN_KEY
     return raw.strip()
 
 
@@ -202,7 +204,7 @@ class KeyboardState:
     # --- PSM1 resolvers -------------------------------------------------
 
     def psm1_translate_keys(self) -> frozenset[str]:
-        """PSM1 translate intent. WASD gated on Shift not held; R/F always."""
+        """PSM1 translate intent. Arrows gated on Shift not held; PgUp/PgDn always."""
         effective: set[str] = set()
         if SHIFT_KEY not in self.pressed_keys:
             for key in (
@@ -217,18 +219,18 @@ class KeyboardState:
         return frozenset(effective)
 
     def psm1_rotation_keys(self) -> frozenset[str]:
-        """PSM1 rotation tokens. Shift+WASD = pitch/yaw, Q/E = roll."""
+        """PSM1 rotation tokens. Shift+Arrows = pitch/yaw, ,/. = roll."""
         effective: set[str] = set()
         if SHIFT_KEY in self.pressed_keys:
             pitch = self._latest_pressed(_PSM1_TRANSLATE_Y_KEYS)
-            if pitch == "w":
+            if pitch == ARROW_UP_KEY:
                 effective.add(ROT_TOKEN_PITCH_PLUS)
-            elif pitch == "s":
+            elif pitch == ARROW_DOWN_KEY:
                 effective.add(ROT_TOKEN_PITCH_MINUS)
             yaw = self._latest_pressed(_PSM1_TRANSLATE_X_KEYS)
-            if yaw == "a":
+            if yaw == ARROW_LEFT_KEY:
                 effective.add(ROT_TOKEN_YAW_PLUS)
-            elif yaw == "d":
+            elif yaw == ARROW_RIGHT_KEY:
                 effective.add(ROT_TOKEN_YAW_MINUS)
         roll = self._latest_pressed((PSM1_ROLL_PLUS_KEY, PSM1_ROLL_MINUS_KEY))
         if roll == PSM1_ROLL_PLUS_KEY:
@@ -249,7 +251,7 @@ class KeyboardState:
     # --- PSM2 resolvers -------------------------------------------------
 
     def psm2_translate_keys(self) -> frozenset[str]:
-        """PSM2 translate intent. Arrows gated on Shift not held; PgUp/PgDn always."""
+        """PSM2 translate intent. WASD gated on Shift not held; R/F always."""
         effective: set[str] = set()
         if SHIFT_KEY not in self.pressed_keys:
             for key in (
@@ -264,18 +266,18 @@ class KeyboardState:
         return frozenset(effective)
 
     def psm2_rotation_keys(self) -> frozenset[str]:
-        """PSM2 rotation tokens. Shift+Arrows = pitch/yaw, ,/. = roll."""
+        """PSM2 rotation tokens. Shift+WASD = pitch/yaw, Q/E = roll."""
         effective: set[str] = set()
         if SHIFT_KEY in self.pressed_keys:
             pitch = self._latest_pressed(_PSM2_TRANSLATE_Y_KEYS)
-            if pitch == ARROW_UP_KEY:
+            if pitch == "w":
                 effective.add(ROT_TOKEN_PITCH_PLUS)
-            elif pitch == ARROW_DOWN_KEY:
+            elif pitch == "s":
                 effective.add(ROT_TOKEN_PITCH_MINUS)
             yaw = self._latest_pressed(_PSM2_TRANSLATE_X_KEYS)
-            if yaw == ARROW_LEFT_KEY:
+            if yaw == "a":
                 effective.add(ROT_TOKEN_YAW_PLUS)
-            elif yaw == ARROW_RIGHT_KEY:
+            elif yaw == "d":
                 effective.add(ROT_TOKEN_YAW_MINUS)
         roll = self._latest_pressed((PSM2_ROLL_PLUS_KEY, PSM2_ROLL_MINUS_KEY))
         if roll == PSM2_ROLL_PLUS_KEY:

@@ -26,8 +26,14 @@ import torch.nn.functional as F
 
 from flashdreams.core.checkpoint.load import load_checkpoint
 from flashdreams.infra.compile import compile_module
-from flashdreams.infra.cuda_graph import CUDAGraphWrapper
+from flashdreams.infra.cuda_graph import CUDAGraphWrapper, set_or_copy
 from flashdreams.infra.decoder import StreamingDecoderCache
+from flashdreams.recipes.taehv.checkpoint import (
+    StateDictTransform,
+    compose,
+    legacy_to_blocks_keys,
+    truncate_oversize_tgrow_weights_from_blocks,
+)
 
 
 @dataclass
@@ -40,22 +46,6 @@ class TAEHVCache(StreamingDecoderCache):
     """
 
     dec_state: Dict[int, torch.Tensor] = field(default_factory=dict)
-
-
-def _set_or_copy(
-    state: Dict[int, torch.Tensor], key: int, new_value: torch.Tensor
-) -> None:
-    """Write ``new_value`` into ``state[key]``, preserving the storage pointer.
-
-    In-place ``copy_`` once the slot exists at the matching shape, else
-    allocate a fresh clone. Pointer stability is required for CUDA-graph
-    capture, since captured kernels reference the slot's storage address.
-    """
-    cur = state.get(key)
-    if cur is not None and cur.shape == new_value.shape:
-        cur.copy_(new_value)
-    else:
-        state[key] = new_value.clone()
 
 
 def _conv(n_in: int, n_out: int, **kwargs) -> nn.Conv2d:
@@ -97,23 +87,23 @@ class MemBlock(nn.Module):
     def cache_step(
         self, x: torch.Tensor, state: Dict[int, torch.Tensor], batch: int
     ) -> torch.Tensor:
-        """Apply with streaming left-context drawn from ``state``.
+        """Apply with streaming left-context: prepend the previous chunk's
+        last frame to ``x``, run the conv stack, save the new last frame.
 
-        Rolls ``x`` right one step and pads with the previous chunk's last
-        frame (or zeros on the first chunk). Bit-for-bit compatible with the
-        legacy ``cache_mem[i] = _x; ... prev_mem[:, -1:]`` pattern.
+        ``state[id(self)]`` must already exist; :meth:`Decoder.initialize_state`
+        pre-allocates it as a ``[batch, 1, C, H, W]`` zero tensor on the
+        first chunk (bit-equivalent to the legacy ``F.pad`` zero-pad path).
+        Keeping the dict-state lookup branchless lets the compiled decoder
+        be one ``torch.compile``-stable graph across the AR0 -> AR1 transition.
         """
         key = id(self)
         bt, c, h, w = x.shape
         t = bt // batch
         x5 = x.view(batch, t, c, h, w)
-        prev = state.get(key)
-        if prev is None:
-            past = F.pad(x5, (0, 0, 0, 0, 0, 0, 1, 0))[:, :t]
-        else:
-            past = torch.cat([prev, x5[:, :-1]], dim=1)
+        prev = state[key]
+        past = torch.cat([prev, x5[:, :-1]], dim=1)
         out = self.forward(x, past.reshape(bt, c, h, w))
-        _set_or_copy(state, key, x5[:, -1:])
+        set_or_copy(state, key, x5[:, -1:])
         return out
 
 
@@ -190,24 +180,48 @@ class Decoder(nn.Module):
         bt, c_out, h_out, w_out = x.shape
         return x.reshape(b, bt // b, c_out, h_out, w_out)
 
+    @torch.no_grad()
+    def initialize_state(
+        self,
+        z_shape: tuple[int, int, int, int, int],
+        dtype: torch.dtype,
+        device: torch.device,
+        state: Dict[int, torch.Tensor],
+    ) -> None:
+        """Populate ``state`` with one zero ``[B, 1, C_i, H_i, W_i]`` tensor per
+        :class:`MemBlock`.
 
-def _patch_tgrow_state_dict(
-    sd: Dict[str, torch.Tensor], decoder_blocks: nn.Sequential
-) -> Dict[str, torch.Tensor]:
-    """Truncate over-sized TGrow weights in ``sd`` to the model's expected channels.
+        Walks ``self.blocks`` once eagerly with a synthetic zero input to
+        derive each ``MemBlock``'s input shape; the conv outputs are
+        discarded. After this call every ``MemBlock``'s ``id()`` key is in
+        ``state`` so :meth:`MemBlock.cache_step` never raises and Dynamo's
+        first compiled trace already sees the populated branch (no AR0 -> AR1
+        recompile).
 
-    Some shipped checkpoints store TGrow weights for stride=2 even when the
-    model is configured stride=1; keep only the last-timestep slice.
-    """
-    sd = dict(sd)
-    for i, layer in enumerate(decoder_blocks):
-        if isinstance(layer, TGrow):
-            key = f"decoder.blocks.{i}.conv.weight"
-            if key in sd:
-                expected = layer.conv.weight.shape[0]
-                if sd[key].shape[0] > expected:
-                    sd[key] = sd[key][-expected:]
-    return sd
+        Zero ``prev`` makes ``cat([zeros, x5[:, :-1]], dim=1)`` in
+        ``cache_step`` bit-equivalent to the legacy
+        ``F.pad(x5, (.., 1, 0))[:, :t]`` first-chunk path, so AR0 outputs
+        are unchanged.
+        """
+        batch, t, c_z, h_z, w_z = z_shape
+        x = torch.zeros(batch * t, c_z, h_z, w_z, dtype=dtype, device=device)
+        for blk in self.blocks:
+            if isinstance(blk, MemBlock):
+                bt_x, c_x, h_x, w_x = x.shape
+                t_x = bt_x // batch
+                state[id(blk)] = torch.zeros(
+                    batch, 1, c_x, h_x, w_x, dtype=dtype, device=device
+                )
+                # Advance x's shape by running the block with a zero past;
+                # output values are discarded.
+                past = (
+                    state[id(blk)]
+                    .expand(-1, t_x, -1, -1, -1)
+                    .reshape(bt_x, c_x, h_x, w_x)
+                )
+                x = blk.forward(x, past)
+            else:
+                x = blk(x)
 
 
 class TAEHV(nn.Module):
@@ -229,6 +243,24 @@ class TAEHV(nn.Module):
         cache = taehv.prepare_cache()
         x = taehv.decode(z, cache=cache)
 
+    Subclasses that need to mutate the module tree before the weights
+    are loaded (e.g. FlashVSR's identity-deepening of ``decoder.blocks``)
+    pass ``checkpoint_path=None`` to ``super().__init__`` -- which stops
+    after the meta construction -- and then call
+    :meth:`load_from_checkpoint` once the mutation is done. See
+    ``integrations/flashvsr/flashvsr/decoder/network.py`` for the live
+    example.
+
+    Per-checkpoint key remaps and shape patches live in
+    :mod:`flashdreams.recipes.taehv.checkpoint`; pass them in via the
+    ``state_dict_transform`` kwarg (typically declared next to the
+    checkpoint URL in the consuming config -- see ``TeahvVAEDecoderConfig``,
+    ``FlashVSRDecoderConfig``). When left at its default ``None``,
+    :meth:`load_from_checkpoint` applies a generic default: a
+    ``decoder.<i>.*`` → ``decoder.blocks.<i>.*`` rewrite plus a
+    model-aware ``TGrow`` truncation walked off the live
+    ``decoder.blocks``.
+
     Set ``torch.backends.cudnn.benchmark = True`` at process start for ~5%
     extra on the eager seed/tail chunks.
     """
@@ -238,17 +270,24 @@ class TAEHV(nn.Module):
 
     SUPPORTED_MODEL_TYPES = ("wan21", "wan22")
 
+    # Concrete type so ``self.decoder`` access doesn't go through
+    # ``nn.Module.__getattr__``'s ``Tensor | Module``.
+    decoder: "Decoder"
+
     def __init__(
         self,
-        checkpoint_path: str = "taew2_1.pth",
+        checkpoint_path: str | None = "taew2_1.pth",
         decoder_time_upscale: tuple[bool, bool] = (True, True),
         decoder_space_upscale: tuple[bool, bool, bool] = (True, True, True),
         patch_size: int = 1,
         latent_channels: int = 16,
+        channels: tuple[int, int, int, int] = (256, 128, 64, 64),
+        clamp_output: bool = True,
         model_type: str = "wan21",
         use_cuda_graph: bool = True,
         use_compile: bool = False,
         warmup_iters: int = 2,
+        state_dict_transform: StateDictTransform | None = None,
     ):
         super().__init__()
         if model_type not in self.SUPPORTED_MODEL_TYPES:
@@ -271,15 +310,16 @@ class TAEHV(nn.Module):
         self.latent_channels = latent_channels
         self.image_channels = 3
         self.model_type = model_type
+        self.channels = channels
+        self.clamp_output = clamp_output
         # Frames the decoder drops from the front of its first chunk output
         # (matches the legacy 2 ** sum(time_upscale) - 1 formula).
         self.frames_to_trim = 2 ** sum(decoder_time_upscale) - 1
 
-        n_f = (256, 128, 64, 64)
         # Build on meta so only the checkpoint allocates real memory.
         with torch.device("meta"):
             self.decoder = Decoder(
-                n_f=n_f,
+                n_f=self.channels,
                 latent_channels=latent_channels,
                 image_channels=self.image_channels,
                 patch_size=patch_size,
@@ -288,34 +328,84 @@ class TAEHV(nn.Module):
                 act_func=act_func,
             )
 
+        # Runtime knobs consumed by ``load_from_checkpoint``; stashed here
+        # so subclasses that defer the load (``checkpoint_path=None``)
+        # inherit the same wrapper wiring without re-plumbing every flag.
+        self._use_cuda_graph = use_cuda_graph
+        self._use_compile = use_compile
+        self._warmup_iters = warmup_iters
+        self._decoder_wrapper: CUDAGraphWrapper | None = None
+
+        if checkpoint_path is not None:
+            self.load_from_checkpoint(
+                checkpoint_path, state_dict_transform=state_dict_transform
+            )
+
+    def load_from_checkpoint(
+        self,
+        checkpoint_path: str,
+        state_dict_transform: StateDictTransform | None = None,
+    ) -> None:
+        """Load weights and wire up the decode runtime.
+
+        Runs the loaded state dict through ``state_dict_transform``,
+        assigns the result into the meta-built decoder via
+        ``load_state_dict(..., assign=True)``, switches the module to
+        eval / no-grad, applies ``torch.compile``, and constructs the
+        :class:`~flashdreams.infra.cuda_graph.CUDAGraphWrapper`
+        according to the flags captured at ``__init__``. See
+        :class:`TAEHV` for the deferred-load contract used by
+        tree-mutating subclasses. Must be called at most once per
+        instance.
+
+        Args:
+            checkpoint_path: Path / URL handed to
+                :func:`~flashdreams.core.checkpoint.load.load_checkpoint`.
+            state_dict_transform: Per-checkpoint state-dict remap (see
+                :mod:`flashdreams.recipes.taehv.checkpoint`). ``None``
+                applies the generic default:
+                :func:`~flashdreams.recipes.taehv.checkpoint.legacy_to_blocks_keys`
+                composed with
+                :func:`~flashdreams.recipes.taehv.checkpoint.truncate_oversize_tgrow_weights_from_blocks`
+                walked off the live ``self.decoder.blocks``.
+        """
+        if state_dict_transform is None:
+            # Generic default: structural key rewrite + model-aware TGrow
+            # shape patch. Built off the live ``decoder.blocks`` so subclass
+            # mutations (e.g. FlashVSR's identity deepening) are reflected
+            # in the discovered ``TGrow`` indices.
+            state_dict_transform = compose(
+                legacy_to_blocks_keys,
+                truncate_oversize_tgrow_weights_from_blocks(self.decoder.blocks),
+            )
         sd = load_checkpoint(checkpoint_path)
-        # Re-key legacy ``decoder.<i>.*`` to ``decoder.blocks.<i>.*`` because
-        # the new Decoder wraps the Sequential in an attribute.
-        sd = {
-            (
-                k.replace("decoder.", "decoder.blocks.", 1)
-                if k.startswith("decoder.") and not k.startswith("decoder.blocks.")
-                else k
-            ): v
-            for k, v in sd.items()
-        }
-        sd = _patch_tgrow_state_dict(sd, self.decoder.blocks)
+        sd = state_dict_transform(sd)
         # assign=True: meta params become the checkpoint tensors directly;
         # strict=False: silently drop encoder-only weights.
         self.load_state_dict(sd, strict=False, assign=True)
 
         self.eval().requires_grad_(False)
 
-        self._use_cuda_graph = use_cuda_graph
-
-        if use_compile:
+        if self._use_compile:
             self.decoder = compile_module(self.decoder)
-        self._decoder_wrapper: CUDAGraphWrapper | None = (
-            CUDAGraphWrapper(self.decoder, warmup_iters=warmup_iters)
-            if use_cuda_graph
+
+        self._decoder_wrapper = (
+            CUDAGraphWrapper(self.decoder, warmup_iters=self._warmup_iters)
+            if self._use_cuda_graph
             else None
         )
-        self._decoder_call: Callable[..., torch.Tensor] = (
+
+    @property
+    def _decoder_call(self) -> Callable[..., torch.Tensor]:
+        """Steady-state decoder entry point (wrapper if present, else decoder).
+
+        Implemented as a property so the lookup sidesteps
+        ``nn.Module.__setattr__``'s submodule auto-registration. A plain
+        ``self._decoder_call = self.decoder`` fallback would re-register
+        ``decoder`` under a second name and duplicate every key in
+        ``state_dict``.
+        """
+        return (
             self._decoder_wrapper if self._decoder_wrapper is not None else self.decoder
         )
 
@@ -332,7 +422,10 @@ class TAEHV(nn.Module):
 
     @torch.inference_mode()
     def decode(
-        self, z: torch.Tensor, cache: Optional[TAEHVCache] = None
+        self,
+        z: torch.Tensor,
+        cache: Optional[TAEHVCache] = None,
+        **_: object,
     ) -> torch.Tensor:
         """Streaming decode of an ``[N, T, C_z, H, W]`` latent.
 
@@ -344,6 +437,14 @@ class TAEHV(nn.Module):
             cache = self.prepare_cache()
         state = cache.dec_state
         first_decode = not state
+        if first_decode:
+            # Pre-populate state with zeros so Dynamo's first decoder trace
+            # already sees ``state[key]`` as Tensor; without this, AR1 would
+            # recompile when the dict transitions from empty to populated.
+            b, t, c_z, h_z, w_z = z.shape
+            self.decoder.initialize_state(
+                (b, t, c_z, h_z, w_z), z.dtype, z.device, state
+            )
         # Bind decoder before the first call so steady-state goes through the
         # wrapper while the autotune-during-capture shape stays on the eager
         # path.
@@ -359,7 +460,8 @@ class TAEHV(nn.Module):
         x = decoder(z, state, b)
         # Clamp / pixel-shuffle / trim happen outside the captured region;
         # the wrapper returns static_output.clone() so clamp_ is safe in-place.
-        x = x.clamp_(0, 1)
+        if self.clamp_output:
+            x = x.clamp_(0, 1)
         if self.patch_size > 1:
             n, t, c, h, w = x.shape
             x = F.pixel_shuffle(x.reshape(n * t, c, h, w), self.patch_size)

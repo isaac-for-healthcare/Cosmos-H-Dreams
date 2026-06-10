@@ -27,6 +27,7 @@ import torch
 import tyro
 
 from flashdreams.core.distributed import init as init_distributed
+from flashdreams.core.io.disk import preflight_runtime_write_paths
 from flashdreams.infra.config import InstantiateConfig, derive_config
 from flashdreams.infra.pipeline import (
     StreamInferencePipeline,
@@ -41,13 +42,13 @@ def _is_torchrun_env() -> bool:
 
 @dataclass(kw_only=True)
 class RunnerConfig(InstantiateConfig):
-    """Base config every recipe runner extends with its own I/O fields."""
+    """Base config every integration runner extends with its own I/O fields."""
 
-    _target: type = field(default_factory=lambda: Runner)
+    _target: type["Runner"] = field(default_factory=lambda: Runner)
 
     runner_name: str
     """Registry key and ``flashdreams-run`` subcommand name. By convention
-    mirrors the wrapped pipeline's ``recipe_name`` slug."""
+    mirrors the wrapped pipeline's ``name`` slug."""
 
     description: Annotated[str, tyro.conf.Suppress] = ""
     """One-line subcommand description shown next to the slug in
@@ -75,16 +76,16 @@ class RunnerConfig(InstantiateConfig):
 RunnerConfigT = TypeVar("RunnerConfigT", bound=RunnerConfig)
 PipelineT = TypeVar("PipelineT", bound=StreamInferencePipeline[Any, Any, Any])
 """Pipeline type parameter for :class:`Runner`. The bound's three cache
-slots are ``Any`` so recipe pipelines parameterized with their own cache
+slots are ``Any`` so integration pipelines parameterized with their own cache
 subclasses pass ty's invariant generic check."""
 
 
 class Runner(ABC, Generic[RunnerConfigT, PipelineT]):
     """Uniform end-to-end driver around a :class:`StreamInferencePipeline`.
 
-    Subclasses own the recipe-specific :class:`RunnerConfig` and the
+    Subclasses own the integration-specific :class:`RunnerConfig` and the
     body of :meth:`run`. The base ``__init__`` bridges the launcher to
-    ``torch.distributed`` (so recipe transformers auto-detect their CP
+    ``torch.distributed`` (so integration transformers auto-detect their CP
     size from the ``WORLD`` group), pins ``cuda:LOCAL_RANK``, and builds
     the pipeline -- subclasses don't reimplement construction.
 
@@ -102,7 +103,7 @@ class Runner(ABC, Generic[RunnerConfigT, PipelineT]):
 
     def __init__(self, config: RunnerConfigT) -> None:
         # Bridge ``torchrun`` -> ``torch.distributed`` *before*
-        # ``config.pipeline.setup()`` so recipe transformers can pick up
+        # ``config.pipeline.setup()`` so integration transformers can pick up
         # the CP world size at construction time. Idempotent: skipped
         # when distributed is already initialized (long-lived servers
         # that init once and call us repeatedly).
@@ -120,6 +121,7 @@ class Runner(ABC, Generic[RunnerConfigT, PipelineT]):
             self.global_rank = 0
             device = config.device
         self.is_rank_zero = self.global_rank == 0
+        preflight_runtime_write_paths(output_dir=config.output_dir)
 
         # Keep per-rank RNG streams distinct under torchrun without mutating
         # the caller's literal config.
@@ -150,7 +152,7 @@ class Runner(ABC, Generic[RunnerConfigT, PipelineT]):
 
         Implementations:
 
-        1. Resolve recipe-specific I/O (load image, decode prompt file, ...).
+        1. Resolve integration-specific I/O (load image, decode prompt file, ...).
         2. Build the per-rollout cache via ``self.pipeline.initialize_cache(...)``.
         3. Loop ``generate`` + ``finalize`` for the configured number of AR steps.
         4. Persist outputs under ``self.config.output_dir`` and log the

@@ -98,9 +98,8 @@ class Scheduler(nn.Module, ABC):
     ) -> Tensor:
         """Apply the forward corruption ``x_t = (1 - sigma(t)) * x_0 + sigma(t) * eps``.
 
-        Timestep value semantics are scheduler-specific: FlowMatch snaps to
-        the nearest entry of its 1000-step training table; FlowUniPC
-        requires exact membership in its inference schedule.
+        Timestep value semantics are scheduler-specific: all schedulers snap
+        to the nearest entry of their inference schedule.
         """
 
 
@@ -108,4 +107,4 @@ class Scheduler(nn.Module, ABC):
 class SchedulerConfig(InstantiateConfig):
     """Category base for every denoising-scheduler config."""
 
-    _target: type = field(default_factory=lambda: Scheduler)
+    _target: type["Scheduler"] = field(default_factory=lambda: Scheduler)

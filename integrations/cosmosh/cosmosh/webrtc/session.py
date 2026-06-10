@@ -12,9 +12,8 @@ from typing import Any
 import mediapy
 import numpy as np
 import torch
-import torchvision.transforms.functional as TF
-from PIL import Image
 
+from cosmosh.utils import load_cr1_text_embeddings, pad_actions, pixel_frame_to_neg1_pos1
 from cosmosh.webrtc.controls import (
     PSM1_GRIPPER_CLOSED,
     PSM1_GRIPPER_OPEN,
@@ -29,8 +28,8 @@ from cosmosh.webrtc.controls_quest import (
 )
 from cosmosh.webrtc.media import CosmoshVideoTrack
 from cosmosh.webrtc.utils import ACTION_DIM_NORMALISED
-from flashdreams.recipes.cosmosh.config import COSMOSH_CONFIG_BUILDERS
-from flashdreams.recipes.cosmosh.constants import AVAILABLE_COSMOSH_CHECKPOINT_PATHS
+from cosmosh.config import COSMOSH_CONFIG_BUILDERS
+from cosmosh.constants import AVAILABLE_COSMOSH_CHECKPOINT_PATHS
 
 LOGGER = logging.getLogger(__name__)
 
@@ -292,32 +291,6 @@ def _load_action_stats(stats_path: str) -> dict[str, Any]:
     return stats
 
 
-def _load_cr1_text_embeddings(path: str) -> torch.Tensor:
-    """Load CR1 text embeddings and normalise to ``[1, T, D]`` (CPU)."""
-    emb = torch.load(path, map_location="cpu", weights_only=False)
-    if isinstance(emb, (list, tuple)):
-        emb = emb[0]
-    if not torch.is_tensor(emb):
-        raise ValueError(f"CR1 embeddings file is not a torch.Tensor: {path}")
-    if emb.dim() == 2:
-        emb = emb.unsqueeze(0)
-    elif emb.dim() != 3:
-        raise ValueError(
-            f"CR1 embeddings must be [T, D] or [B, T, D]; got {tuple(emb.shape)}"
-        )
-    return emb
-
-
-def _pad_actions(actions_np: np.ndarray, target_dim: int) -> np.ndarray:
-    """Right-pad the last dim with zeros so the action width matches ``action_dim``."""
-    if actions_np.shape[-1] >= target_dim:
-        return actions_np
-    pad_width = target_dim - actions_np.shape[-1]
-    pad_shape = list(actions_np.shape[:-1]) + [pad_width]
-    zeros = np.zeros(pad_shape, dtype=actions_np.dtype)
-    return np.concatenate([actions_np, zeros], axis=-1)
-
-
 def _resting_neutral_fill(
     mean: np.ndarray, std: np.ndarray, action_dim: int
 ) -> np.ndarray:
@@ -357,22 +330,6 @@ def _fill_to_action_dim(driven: np.ndarray, neutral_row: np.ndarray) -> np.ndarr
     out = np.tile(neutral_row.astype(driven.dtype), (n_frames, 1))
     out[:, :n_driven] = driven
     return out
-
-
-def _pixel_frame_to_neg1_pos1(
-    frame_uint8: np.ndarray,
-    *,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """Convert a single ``[H, W, 3]`` uint8 frame to ``[1, 1, 3, H, W]`` in ``[-1, 1]``.
-
-    Mirrors run_cosmosh.py's ``x / 128 - 1`` mapping so VAE-encoder inputs match.
-    """
-    frame_uint8 = np.clip(np.round(frame_uint8), 0, 255).astype(np.uint8)
-    t = TF.to_tensor(Image.fromarray(frame_uint8))  # [3, H, W] in [0, 1]
-    t = t * 255.0 / 128.0 - 1.0
-    return t.to(device=device, dtype=dtype).unsqueeze(0).unsqueeze(0)
 
 
 class CosmoshInferenceRuntime:
@@ -688,7 +645,7 @@ class CosmoshInferenceRuntime:
         self._inner_steps_per_block = 1 + requested // actions_per_latent
         self._action_target_dim = int(cfg.network.action_dim)
 
-        text_embeddings_cpu = _load_cr1_text_embeddings(self.config.cr1_embeddings_path)
+        text_embeddings_cpu = load_cr1_text_embeddings(self.config.cr1_embeddings_path)
         self._text_embeddings = text_embeddings_cpu.to(
             device=self._device, dtype=self._dtype
         )
@@ -708,7 +665,7 @@ class CosmoshInferenceRuntime:
 
         if (cond_frame.shape[0], cond_frame.shape[1]) != (ht, wt):
             cond_frame = mediapy.resize_image(cond_frame, (ht, wt))
-        cond_pixels = _pixel_frame_to_neg1_pos1(
+        cond_pixels = pixel_frame_to_neg1_pos1(
             cond_frame, device=self._device, dtype=self._dtype
         )
         self._initial_cond_pixels = cond_pixels.clone()
@@ -778,11 +735,11 @@ class CosmoshInferenceRuntime:
         cond_frame = _load_conditional_frame(scene.input_path, scene.start_frame_idx)
         if (cond_frame.shape[0], cond_frame.shape[1]) != (ht, wt):
             cond_frame = mediapy.resize_image(cond_frame, (ht, wt))
-        cond_pixels = _pixel_frame_to_neg1_pos1(
+        cond_pixels = pixel_frame_to_neg1_pos1(
             cond_frame, device=self._device, dtype=self._dtype
         )
 
-        text_embeddings_cpu = _load_cr1_text_embeddings(scene.cr1_embeddings_path)
+        text_embeddings_cpu = load_cr1_text_embeddings(scene.cr1_embeddings_path)
         text_embeddings = text_embeddings_cpu.to(
             device=self._device, dtype=self._dtype
         )
@@ -803,13 +760,9 @@ class CosmoshInferenceRuntime:
         )
         self._text_embeddings = text_embeddings
         self._initial_cond_pixels = cond_pixels.clone()
-        self._cond_pixels = cond_pixels
         self._active_scene_name = scene.name
 
-        self.keyboard_state = KeyboardState()
-        self.vr_state = VRControllerState()
-        self.action_integrator = self._build_integrator()
-        self.autoregressive_index = 0
+        self._reset_rollout_sync()
 
         LOGGER.info(
             "Switched scene to %r (input=%s stats=%s); gripper endpoints "
@@ -956,7 +909,7 @@ class CosmoshInferenceRuntime:
             # buttons for CMR) with their resting value instead of the raw mean.
             actions_np = _fill_to_action_dim(actions_np, self._action_neutral_row)
         else:
-            actions_np = _pad_actions(actions_np, target_dim=self._action_target_dim)
+            actions_np = pad_actions(actions_np, target_dim=self._action_target_dim)
         actions_block = (
             torch.from_numpy(actions_np)
             .to(device=self._device, dtype=self._dtype)
@@ -973,7 +926,7 @@ class CosmoshInferenceRuntime:
 
         latent_frames: list[torch.Tensor] = []
         for ar_idx in range(self._inner_steps_per_block):
-            out_5d = self._pipeline.generate(ar_idx, cache)
+            out_5d = self._pipeline.generate(ar_idx, cache, input=True)
             latent_frames.append(out_5d)
             if ar_idx < self._inner_steps_per_block - 1:
                 self._pipeline.finalize(ar_idx, cache)

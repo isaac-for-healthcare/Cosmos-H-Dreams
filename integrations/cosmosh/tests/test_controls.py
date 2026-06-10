@@ -38,6 +38,8 @@ from cosmosh.webrtc.controls import (
     rotvec_to_matrix,
 )
 
+pytestmark = pytest.mark.ci_cpu
+
 
 # ----- KeyboardState basics ---------------------------------------------
 
@@ -83,17 +85,6 @@ def test_psm1_arrows_translate_without_shift() -> None:
     assert state.psm1_rotation_keys() == frozenset()
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Shift+arrows pitch/yaw not wired after the arm-swap refactor: "
-        "psm1_rotation_keys reads from _PSM1_TRANSLATE_Y_KEYS (arrows) but "
-        "its pitch branches compare against 'w'/'s'. Keyboard app still "
-        "works because users don't rely on Shift+pitch/yaw; only roll "
-        "(,/.) is exercised. Remove this xfail once the resolver branches "
-        "are switched to ARROW_UP/DOWN_KEY (or the keys array is changed)."
-    ),
-    strict=True,
-)
 def test_psm1_shift_arrows_rotate_not_translate() -> None:
     state = KeyboardState()
     state.apply_event(event="keydown", key=SHIFT_KEY)
@@ -110,10 +101,6 @@ def test_psm1_pageup_translates_z_regardless_of_shift() -> None:
     assert state.psm1_translate_keys() == frozenset({PAGE_UP_KEY})
 
 
-@pytest.mark.xfail(
-    reason="Same PSM1 Shift+pitch wiring bug as above; remove together.",
-    strict=True,
-)
 def test_psm1_release_shift_restores_translate() -> None:
     state = KeyboardState()
     state.apply_event(event="keydown", key=ARROW_UP_KEY)
@@ -159,14 +146,6 @@ def test_psm2_wasd_translates_without_shift() -> None:
     assert state.psm2_rotation_keys() == frozenset()
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Mirror of the PSM1 bug: psm2_rotation_keys reads from "
-        "_PSM2_TRANSLATE_Y_KEYS ('w','s') but the pitch branches compare "
-        "against ARROW_UP/DOWN_KEY. Same fix applies."
-    ),
-    strict=True,
-)
 def test_psm2_shift_wasd_rotates_not_translate() -> None:
     state = KeyboardState()
     state.apply_event(event="keydown", key=SHIFT_KEY)
@@ -194,10 +173,6 @@ def test_psm2_roll_keys_dont_need_shift() -> None:
 # ----- Cross-arm interactions -------------------------------------------
 
 
-@pytest.mark.xfail(
-    reason="Shift+pitch wiring bug on both arms (see PSM1/PSM2 xfails above).",
-    strict=True,
-)
 def test_shift_rotates_both_arms_independently() -> None:
     """Shift held + ArrowUp (PSM1) + W (PSM2) → both arms rotate pitch+."""
     state = KeyboardState()
