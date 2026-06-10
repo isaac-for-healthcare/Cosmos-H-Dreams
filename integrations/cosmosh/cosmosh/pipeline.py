@@ -38,11 +38,11 @@ from flashdreams.infra.pipeline import (
     StreamInferencePipelineConfig,
 )
 
-from flashdreams.recipes.cosmosh.encoder.action import (
+from cosmosh.encoder.action import (
     ActionEncoderCache,
     ActionEncoderConfig,
 )
-from flashdreams.recipes.cosmosh.transformer import (
+from cosmosh.transformer import (
     CosmosHTransformer,
     CosmosHTransformerCache,
     CosmosHTransformerConfig,
@@ -164,24 +164,4 @@ class CosmoshPipeline(
             encoder_context={"actions": actions},
         )
 
-    @torch.no_grad()
-    def generate(
-        self,
-        autoregressive_index: int,
-        cache: CosmoshPipelineCache,
-    ) -> Tensor:
-        """Generate one chunk for this AR step.
 
-        ``input`` is fixed to a sentinel ``True`` so the base pipeline calls
-        the action encoder; the encoder ignores its input and slices
-        ``cache.encoder_cache.actions``. Returns the unpatchified clean latent
-        (no decoder is wired in Phase 1).
-        """
-        # The base pipeline only invokes the encoder when ``input is not None``.
-        # Pass a non-None sentinel so the encoder's slicing path runs; the
-        # encoder ignores the value.
-        return super().generate(
-            autoregressive_index=autoregressive_index,
-            cache=cache,
-            input=True,
-        )

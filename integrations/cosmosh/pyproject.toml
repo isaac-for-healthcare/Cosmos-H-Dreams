@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 [build-system]
 requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
@@ -26,6 +41,18 @@ dev = [
     "pytest-asyncio>=0.23",
 ]
 
+# Each entry registers one ``runner_name`` slug with ``flashdreams-run``.
+# The discovery layer (``flashdreams.plugins.registry.discover_runners``)
+# scans this group at CLI startup; the entry-point name itself is purely
+# informational, the registry key always comes from ``cfg.runner_name``.
+[project.entry-points."flashdreams.runner_configs"]
+"cosmosh-vae-vae"                    = "cosmosh.config:RUNNER_COSMOSH_VAE_VAE"
+"cosmosh-vae-lighttae"               = "cosmosh.config:RUNNER_COSMOSH_VAE_LIGHTTAE"
+"cosmosh-lightvae-lighttae"          = "cosmosh.config:RUNNER_COSMOSH_LIGHTVAE_LIGHTTAE"
+"cosmosh-2steps-vae-vae"             = "cosmosh.config:RUNNER_COSMOSH_2STEPS_VAE_VAE"
+"cosmosh-2steps-vae-lighttae"        = "cosmosh.config:RUNNER_COSMOSH_2STEPS_VAE_LIGHTTAE"
+"cosmosh-2steps-lightvae-lighttae"   = "cosmosh.config:RUNNER_COSMOSH_2STEPS_LIGHTVAE_LIGHTTAE"
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["cosmosh*"]
@@ -33,3 +60,6 @@ exclude = ["tests*"]
 
 [tool.setuptools.package-data]
 "cosmosh.webrtc" = ["web/*.html", "web/*.css", "web/*.js"]
+
+[tool.uv]
+managed = true

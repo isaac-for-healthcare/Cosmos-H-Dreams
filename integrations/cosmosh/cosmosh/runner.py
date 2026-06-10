@@ -64,11 +64,12 @@ from loguru import logger
 
 from flashdreams.infra.decoder import DecoderConfig
 from flashdreams.infra.runner import Runner, RunnerConfig
-from flashdreams.recipes.cosmosh.pipeline import CosmoshPipeline
-from flashdreams.recipes.cosmosh.transformer import (
+from cosmosh.pipeline import CosmoshPipeline
+from cosmosh.transformer import (
     CosmosHTransformer,
     CosmosHTransformerConfig,
 )
+from cosmosh.utils import load_cr1_text_embeddings, pad_actions, pixel_frame_to_neg1_pos1
 from flashdreams.recipes.wan.autoencoder.vae import WanVAEEncoderConfig
 
 # Wan2.1 VAE temporal / spatial compression ratios. Latent T per block =
@@ -223,7 +224,7 @@ class CosmoshRunner(Runner[CosmoshRunnerConfig, CosmoshPipeline]):
             )
             logger.info("=" * 60)
 
-        text_embeddings_cpu = _load_cr1_text_embeddings(str(cfg.cr1_embeddings_path))
+        text_embeddings_cpu = load_cr1_text_embeddings(str(cfg.cr1_embeddings_path))
         if self.is_rank_zero:
             logger.info(
                 f"Loaded CR1 embeddings shape={tuple(text_embeddings_cpu.shape)} "
@@ -328,6 +329,10 @@ class CosmoshRunner(Runner[CosmoshRunnerConfig, CosmoshPipeline]):
         device = self.pipeline.device
         dtype = tcfg.dtype
         A = tcfg.network.num_action_per_latent_frame
+        assert ACTIONS_PER_OUTER_BLOCK % A == 0, (
+            f"ACTIONS_PER_OUTER_BLOCK={ACTIONS_PER_OUTER_BLOCK} must be divisible by "
+            f"num_action_per_latent_frame={A}."
+        )
         inner_steps_per_block = 1 + ACTIONS_PER_OUTER_BLOCK // A  # 1 cond + 3 gen = 4
 
         # The pipeline's latent dims drive the output pixel size; per-entry
@@ -351,16 +356,11 @@ class CosmoshRunner(Runner[CosmoshRunnerConfig, CosmoshPipeline]):
         cond_frame = video_array[start_frame_idx]
         if (cond_frame.shape[0], cond_frame.shape[1]) != (Ht, Wt):
             cond_frame = mediapy.resize_image(cond_frame, (Ht, Wt))
-        cond_pixels = _pixel_frame_to_neg1_pos1(cond_frame, device=device, dtype=dtype)
+        cond_pixels = pixel_frame_to_neg1_pos1(cond_frame, device=device, dtype=dtype)
 
         actions_np = np.load(input_action_path)
-        actions_np = _pad_actions(actions_np, target_dim=tcfg.network.action_dim)
+        actions_np = pad_actions(actions_np, target_dim=tcfg.network.action_dim)
 
-        #### THIS IS ONLY FOR DEBUGGING ####
-        actions_zero = list(range(22, actions_np.shape[1]))
-        for action_dim in actions_zero:
-            actions_np = _zero_action(actions_np, target_dim=action_dim)
-        #### THIS IS ONLY FOR DEBUGGING ####
         ar_total = min(cfg.total_blocks, actions_np.shape[0] // ACTIONS_PER_OUTER_BLOCK)
         if ar_total <= 0:
             raise ValueError(
@@ -417,7 +417,9 @@ class CosmoshRunner(Runner[CosmoshRunnerConfig, CosmoshPipeline]):
             t = time.perf_counter()
             latent_frames: list[torch.Tensor] = []
             for ar_idx in range(inner_steps_per_block):
-                out_5d = self.pipeline.generate(ar_idx, cache)
+                # input=True triggers the ActionEncoder; the encoder ignores
+                # the value and slices from cache.encoder_cache.actions.
+                out_5d = self.pipeline.generate(ar_idx, cache, input=True)
                 latent_frames.append(out_5d)
                 if ar_idx < inner_steps_per_block - 1:
                     self.pipeline.finalize(ar_idx, cache)
@@ -589,68 +591,6 @@ __all__ = [
 
 
 ## Helpers
-
-
-def _load_cr1_text_embeddings(path: str) -> torch.Tensor:
-    """Load CR1 text embeddings and normalise to ``[1, T, D]``.
-
-    Accepts a bare ``Tensor`` or a list/tuple whose first element is the
-    tensor, and promotes 2-D ``[T, D]`` to a batch of one.
-    """
-    emb = torch.load(path, map_location="cpu", weights_only=False)
-    if isinstance(emb, (list, tuple)):
-        emb = emb[0]
-    if not torch.is_tensor(emb):
-        raise ValueError(f"CR1 embeddings file is not a torch.Tensor: {path}")
-    if emb.dim() == 2:
-        emb = emb.unsqueeze(0)
-    elif emb.dim() != 3:
-        raise ValueError(
-            f"CR1 embeddings must be [T, D] or [B, T, D]; got {tuple(emb.shape)}"
-        )
-    return emb
-
-
-def _set_action(actions_np: np.ndarray, target_dim: int, value: float) -> np.ndarray:
-    """Set one value of the actions_np array."""
-    actions_np[..., target_dim] = value
-    return actions_np
-
-
-def _zero_action(actions_np: np.ndarray, target_dim: int) -> np.ndarray:
-    """Zero out one value of the actions_np array."""
-    return _set_action(actions_np, target_dim, 0.0)
-
-
-def _pad_actions(actions_np: np.ndarray, target_dim: int) -> np.ndarray:
-    """Right-pad the last dim with zeros so the action width matches the
-    network's ``action_dim`` (44 for the canonical CosmosH checkpoint)."""
-    if actions_np.shape[-1] >= target_dim:
-        return actions_np
-    pad_width = target_dim - actions_np.shape[-1]
-    pad_shape = list(actions_np.shape[:-1]) + [pad_width]
-    zeros = np.zeros(pad_shape, dtype=actions_np.dtype)
-    return np.concatenate([actions_np, zeros], axis=-1)
-
-
-def _pixel_frame_to_neg1_pos1(
-    frame_uint8: np.ndarray,
-    *,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """Convert a single ``[H, W, 3]`` uint8 frame to ``[1, 1, 3, H, W]`` in ``[-1, 1]``.
-
-    Uses the same ``x / 128 - 1`` mapping as the upstream deterministic
-    script so VAE-encoder inputs match bit-for-bit.
-    """
-    import torchvision.transforms.functional as TF  # noqa: PLC0415
-    from PIL import Image  # noqa: PLC0415
-
-    frame_uint8 = np.clip(np.round(frame_uint8), 0, 255).astype(np.uint8)
-    t = TF.to_tensor(Image.fromarray(frame_uint8))  # [3, H, W] in [0, 1]
-    t = t * 255.0 / 128.0 - 1.0
-    return t.to(device=device, dtype=dtype).unsqueeze(0).unsqueeze(0)
 
 
 def _annotate_frame_numbers(frames_uint8: np.ndarray) -> np.ndarray:

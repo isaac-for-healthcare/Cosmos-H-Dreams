@@ -42,8 +42,7 @@ from dataclasses import dataclass, field
 
 from torch import Tensor
 
-from flashdreams.infra.config import InstantiateConfig
-from flashdreams.infra.encoder import Encoder, StreamingEncoderCache
+from flashdreams.infra.encoder import EncoderConfig, StreamingEncoder, StreamingEncoderCache
 
 
 @dataclass(kw_only=True)
@@ -59,7 +58,7 @@ class ActionEncoderCache(StreamingEncoderCache):
 
 
 @dataclass(kw_only=True)
-class ActionEncoderConfig(InstantiateConfig):
+class ActionEncoderConfig(EncoderConfig):
     """Config for the per-AR-step action encoder."""
 
     _target: type["ActionEncoder"] = field(default_factory=lambda: ActionEncoder)
@@ -69,7 +68,7 @@ class ActionEncoderConfig(InstantiateConfig):
     temporal compression ratio."""
 
 
-class ActionEncoder(Encoder):
+class ActionEncoder(StreamingEncoder[ActionEncoderCache]):
     """Slices the per-AR-step action chunk out of the cached trajectory.
 
     Pipeline call shape:

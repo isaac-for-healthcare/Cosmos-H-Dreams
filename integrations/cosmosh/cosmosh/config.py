@@ -21,28 +21,27 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import cast
 
-from flashdreams.configs.registry import register_runner
 from flashdreams.infra.config import derive_config
 from flashdreams.infra.diffusion.model import DiffusionModelConfig
 from flashdreams.infra.diffusion.scheduler.fm import FlowMatchSchedulerConfig
 from flashdreams.infra.runner import RunnerConfig
-from flashdreams.recipes.cosmosh.constants import (
+from cosmosh.constants import (
     AVAILABLE_COSMOSH_CHECKPOINT_PATHS,
 )
-from flashdreams.recipes.cosmosh.encoder.action import (
+from cosmosh.encoder.action import (
     ActionEncoder,
     ActionEncoderConfig,
 )
-from flashdreams.recipes.cosmosh.pipeline import (
+from cosmosh.pipeline import (
     CosmoshPipeline,
     CosmoshPipelineConfig,
 )
-from flashdreams.recipes.cosmosh.runner import CosmoshRunnerConfig
-from flashdreams.recipes.cosmosh.transformer import (
+from cosmosh.runner import CosmoshRunnerConfig
+from cosmosh.transformer import (
     CosmosHTransformer,
     CosmosHTransformerConfig,
 )
-from flashdreams.recipes.cosmosh.transformer.impl.network import (
+from cosmosh.transformer.impl.network import (
     CosmosHActionDiTNetwork,
     CosmosHActionDiTNetworkConfig,
 )
@@ -220,7 +219,7 @@ def build_cosmosh_smoke(
         guidance_scale=1.0,
     )
     return CosmoshPipelineConfig(
-        recipe_name=recipe_name,
+        name=recipe_name,
         _target=CosmoshPipeline,
         encoder=ActionEncoderConfig(
             _target=ActionEncoder, num_action_per_latent_frame=4
@@ -369,7 +368,7 @@ def build_cosmosh(
         checkpoint_path=checkpoint_path,
     )
     return CosmoshPipelineConfig(
-        recipe_name=recipe_name,
+        name=recipe_name,
         _target=CosmoshPipeline,
         encoder=ActionEncoderConfig(
             _target=ActionEncoder, num_action_per_latent_frame=4
@@ -628,5 +627,15 @@ def _build_cosmosh_runners() -> dict[str, RunnerConfig]:
 COSMOSH_RUNNERS: dict[str, RunnerConfig] = _build_cosmosh_runners()
 """All shipped CosmosH runners, keyed by ``runner_name``."""
 
-for _name, _cfg in COSMOSH_RUNNERS.items():
-    register_runner(_name, _cfg, source="builtin")
+# Module-level constants for entry-point discovery.
+# Each constant is loaded by ``flashdreams.plugins.registry.discover_runners``
+# via the ``[project.entry-points."flashdreams.runner_configs"]`` table in
+# ``integrations/cosmosh/pyproject.toml``.
+RUNNER_COSMOSH_VAE_VAE = COSMOSH_RUNNERS["cosmosh-vae-vae"]
+RUNNER_COSMOSH_VAE_LIGHTTAE = COSMOSH_RUNNERS["cosmosh-vae-lighttae"]
+RUNNER_COSMOSH_LIGHTVAE_LIGHTTAE = COSMOSH_RUNNERS["cosmosh-lightvae-lighttae"]
+RUNNER_COSMOSH_2STEPS_VAE_VAE = COSMOSH_RUNNERS["cosmosh-2steps-vae-vae"]
+RUNNER_COSMOSH_2STEPS_VAE_LIGHTTAE = COSMOSH_RUNNERS["cosmosh-2steps-vae-lighttae"]
+RUNNER_COSMOSH_2STEPS_LIGHTVAE_LIGHTTAE = COSMOSH_RUNNERS[
+    "cosmosh-2steps-lightvae-lighttae"
+]

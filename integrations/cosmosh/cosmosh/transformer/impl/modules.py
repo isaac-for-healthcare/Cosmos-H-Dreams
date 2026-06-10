@@ -23,7 +23,7 @@ import torch.nn as nn
 from torch import Tensor
 from torch.distributed import ProcessGroup
 
-from flashdreams.core.attention import BlockKVCache, RingAttention
+from flashdreams.core.attention import BlockKVCache, ContextParallelAttention as RingAttention
 
 from .rope import apply_rope_freqs
 

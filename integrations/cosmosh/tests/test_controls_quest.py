@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 from cosmosh.webrtc.controls import (
     PSM1_GRIPPER_CLOSED,
     PSM1_GRIPPER_DIM,
@@ -20,6 +21,8 @@ from cosmosh.webrtc.utils import (
     matrix_to_rot6d,
     rotvec_to_matrix,
 )
+
+pytestmark = pytest.mark.ci_cpu
 
 
 # Default rot6d stats used by the rotation tests below. Identity mean +
