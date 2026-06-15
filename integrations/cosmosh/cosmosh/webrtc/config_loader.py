@@ -6,7 +6,7 @@ cares about. Unknown keys log a warning so typos don't silently no-op.
 Schema (full)::
 
     runtime:
-      config_name: lightvae_lighttae
+      config_name: cosmosh-lightvae-lighttae
       compile_network: true
       device: cuda:0
       seed: 1

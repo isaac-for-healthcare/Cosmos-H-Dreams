@@ -1,9 +1,8 @@
-# Keyboard server — CMR prostatectomy experiment 2.
-# Switch live from the UI's "Scene:" dropdown.
+# Keyboard server — CMR hysterectomy experiment 5 (unified runner naming).
 #
 # Run with:
 #   uv run --package flash-cosmosh python -m cosmosh.webrtc.server \
-#     --config integrations/cosmosh/configs/keyboard_cmr_prost_exp2.yaml
+#     --config integrations/cosmosh/configs/keyboard_cmr_hyst_exp6.yaml
 
 runtime:
   config_name: cosmosh-chunk3-vae-vae
@@ -13,8 +12,6 @@ runtime:
   ckpt_path: checkpoints/cmr/hyst/model_ema_bf16_cmr_hyst_exp5_iter2600.pt
   resolution: [288, 512]
   fps: 30
-  len_t: 3
-  window_size_t: 48
   use_cuda_graph: false
   actions_per_chunk: 12  # 4 / 8 / 12 / 16…; smaller = lower latency, lower fidelity
 

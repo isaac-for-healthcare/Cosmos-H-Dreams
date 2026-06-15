@@ -28,8 +28,8 @@ from cosmosh.webrtc.controls_quest import (
 )
 from cosmosh.webrtc.media import CosmoshVideoTrack
 from cosmosh.webrtc.utils import ACTION_DIM_NORMALISED
-from cosmosh.config import COSMOSH_CONFIG_BUILDERS
-from cosmosh.constants import AVAILABLE_COSMOSH_CHECKPOINT_PATHS
+from cosmosh.config import COSMOSH_RUNNERS
+from flashdreams.infra.config import derive_config
 
 LOGGER = logging.getLogger(__name__)
 
@@ -72,7 +72,7 @@ class Scene:
 
 @dataclass(slots=True)
 class CosmoshRuntimeConfig:
-    config_name: str = "lightvae_lighttae"
+    config_name: str = "cosmosh-lightvae-lighttae"
     compile_network: bool = True
     seed: int = 1
     device: str = "cuda:0"
@@ -349,6 +349,7 @@ class CosmoshInferenceRuntime:
         self._decoder: Any | None = None
         self._action_target_dim: int = 0
         self._inner_steps_per_block: int = 0
+        self._latent_frames_per_step: int = 1  # L = len_t; set in _initialize_sync
         # Populated in _initialize_sync after validating against the model's
         # num_action_per_latent_frame. Exposed publicly for the render loop
         # so it can size its backpressure cap correctly.
@@ -377,6 +378,16 @@ class CosmoshInferenceRuntime:
         self._text_embeddings: torch.Tensor | None = None
         self._initial_cond_pixels: torch.Tensor | None = None
         self._cond_pixels: torch.Tensor | None = None
+
+        # Flat-AR persistent state: initialized on the first chunk of each
+        # rollout, cleared on reset/scene-switch so the next chunk re-anchors.
+        self._cache: Any | None = None
+        self._decoder_cache: Any | None = None
+        # Growing action buffer: each chunk appends its tensor so the
+        # ActionEncoder can slice by absolute autoregressive index.
+        self._accumulated_actions: list[torch.Tensor] = []
+        # Flat AR step counter across all chunks in the current rollout.
+        self._global_ar_idx: int = 0
 
         self._closed = False
         self._step_lock = asyncio.Lock()
@@ -588,8 +599,8 @@ class CosmoshInferenceRuntime:
             raise FileNotFoundError(
                 f"Action stats file not found: {self.config.stats_path}"
             )
-        if self.config.config_name not in COSMOSH_CONFIG_BUILDERS:
-            supported = ", ".join(sorted(COSMOSH_CONFIG_BUILDERS))
+        if self.config.config_name not in COSMOSH_RUNNERS:
+            supported = ", ".join(sorted(COSMOSH_RUNNERS))
             raise ValueError(
                 f"Unknown config_name={self.config.config_name!r}. Supported: {supported}"
             )
@@ -616,18 +627,28 @@ class CosmoshInferenceRuntime:
                 f"compression {WAN_SCR}."
             )
 
-        ckpt_path = self.config.ckpt_path or AVAILABLE_COSMOSH_CHECKPOINT_PATHS["default"]
-        builder = COSMOSH_CONFIG_BUILDERS[self.config.config_name]
-        bundle = builder(
-            seed=self.config.seed,
-            checkpoint_path=ckpt_path,
-            compile_network=self.config.compile_network,
-            height=ht // WAN_SCR,
-            width=wt // WAN_SCR,
+        runner_cfg = COSMOSH_RUNNERS[self.config.config_name]
+        transformer_overrides: dict[str, Any] = {
+            "height": ht // WAN_SCR,
+            "width": wt // WAN_SCR,
+            "compile_network": self.config.compile_network,
+        }
+        if self.config.ckpt_path:
+            transformer_overrides["checkpoint_path"] = self.config.ckpt_path
+        pipeline_cfg = derive_config(
+            runner_cfg.pipeline,
+            diffusion_model=dict(
+                seed=self.config.seed,
+                transformer=transformer_overrides,
+            ),
         )
-        self._pipeline = bundle.pipeline.setup().to(self._device).eval()
-        self._encoder = bundle.vae_encoder.setup().to(self._device).eval()
-        self._decoder = bundle.vae_decoder.setup().to(self._device).eval()
+        # derive_config mutates fields via setattr without calling __post_init__,
+        # so _pT/_pH/_pW would reflect the runner's defaults rather than the
+        # overridden height/width. Re-run it to refresh those derived fields.
+        pipeline_cfg.diffusion_model.transformer.__post_init__()
+        self._pipeline = pipeline_cfg.setup().to(self._device).eval()
+        self._encoder = runner_cfg.vae_encoder.setup().to(self._device).eval()
+        self._decoder = runner_cfg.vae_decoder.setup().to(self._device).eval()
 
         transformer = self._pipeline.diffusion_model.transformer
         cfg = transformer.config
@@ -642,6 +663,7 @@ class CosmoshInferenceRuntime:
                 f"{3*actions_per_latent}, ...)."
             )
         self.actions_per_chunk = requested
+        self._latent_frames_per_step = int(cfg._pT)  # L = len_t
         self._inner_steps_per_block = 1 + requested // actions_per_latent
         self._action_target_dim = int(cfg.network.action_dim)
 
@@ -703,6 +725,11 @@ class CosmoshInferenceRuntime:
         self.action_integrator = self._build_integrator()
         self.autoregressive_index = 0
         self._cond_pixels = self._initial_cond_pixels.clone()
+        # Drop the flat-AR cache; the next chunk will re-encode and reinitialize.
+        self._cache = None
+        self._decoder_cache = None
+        self._accumulated_actions = []
+        self._global_ar_idx = 0
 
     def _set_scene_sync(self, scene: Scene) -> None:
         if self._pipeline is None:
@@ -780,14 +807,19 @@ class CosmoshInferenceRuntime:
         pipeline = self._pipeline
         encoder = self._encoder
         decoder = self._decoder
+        cache = self._cache
+        decoder_cache = self._decoder_cache
         self._pipeline = None
         self._encoder = None
         self._decoder = None
+        self._cache = None
+        self._decoder_cache = None
+        self._accumulated_actions = []
         self._text_embeddings = None
         self._initial_cond_pixels = None
         self._cond_pixels = None
 
-        for obj in (pipeline, encoder, decoder):
+        for obj in (pipeline, encoder, decoder, cache, decoder_cache):
             if obj is not None:
                 del obj
 
@@ -887,10 +919,17 @@ class CosmoshInferenceRuntime:
         """Shared encoder + diffusion + decoder body.
 
         Keyboard and VR paths differ only in how they compute ``actions_np``;
-        from here it's identical work — pad to ``action_target_dim``, run the
-        cache through ``inner_steps_per_block`` AR steps, decode, re-anchor
-        on the last pixel frame, return the 12 generated frames in
-        ``[B=1, C=3, T=12, H, W]`` layout on CPU.
+        from here it's identical flat-AR work — pad to ``action_target_dim``,
+        continue the persistent KV cache through the next AR steps, decode
+        with the persistent decoder cache, return the generated frames in
+        ``[B=1, C=3, T, H, W]`` layout on CPU.
+
+        Chunk 0 (cache is None) encodes the conditioning frame, initializes
+        both caches, and runs ``inner_steps_per_block`` AR steps (1 prefill +
+        S-1 generated).  Chunks 1+ skip the encode and cache init, update
+        only the action tensor in the live encoder cache, and run S-1 AR steps
+        (all generation) — consuming the same ``actions_per_chunk`` actions and
+        producing the same number of pixel frames as chunk 0.
         """
         if (
             self._pipeline is None
@@ -905,8 +944,6 @@ class CosmoshInferenceRuntime:
 
         assert actions_np.shape == (self.actions_per_chunk, ACTION_DIM_NORMALISED)
         if self._action_neutral_row is not None:
-            # Fill the dims the integrator doesn't drive (energy / thumbstick /
-            # buttons for CMR) with their resting value instead of the raw mean.
             actions_np = _fill_to_action_dim(actions_np, self._action_neutral_row)
         else:
             actions_np = pad_actions(actions_np, target_dim=self._action_target_dim)
@@ -916,37 +953,72 @@ class CosmoshInferenceRuntime:
             .unsqueeze(0)
         )  # [1, actions_per_chunk, action_dim]
 
-        image_embeddings = self._encoder(input=self._cond_pixels)
+        is_first_chunk = self._cache is None
 
-        cache = self._pipeline.initialize_cache(
-            text_embeddings=self._text_embeddings,
-            image_embeddings=image_embeddings,
-            actions=actions_block,
-        )
+        if is_first_chunk:
+            # Encode the conditioning frame, initialize pipeline and decoder
+            # caches, then offload the encoder to CPU for the rest of the
+            # rollout.
+            self._encoder.to(self._device)
+            image_embeddings = self._encoder(input=self._cond_pixels)
+            self._encoder.cpu()
+            torch.cuda.empty_cache()
+
+            self._cache = self._pipeline.initialize_cache(
+                text_embeddings=self._text_embeddings,
+                image_embeddings=image_embeddings,
+                actions=actions_block,
+            )
+            self._decoder_cache = self._decoder.initialize_autoregressive_cache()
+            self._accumulated_actions = [actions_block]
+        else:
+            # Append new actions and update the encoder cache in-place so the
+            # ActionEncoder can slice them by absolute autoregressive index.
+            self._accumulated_actions.append(actions_block)
+            self._cache.encoder_cache.actions = torch.cat(
+                self._accumulated_actions, dim=1
+            )
+
+        # Compute how many AR steps fit in this chunk's action budget.
+        # A = actions per generated latent frame; L = latent frames per step.
+        # Chunk 0 includes the AR-0 prefill (which drives L-1 generated latents
+        # using (L-1)*A actions); subsequent AR steps each use L*A actions.
+        # Chunks 1+: each AR step uses L*A actions (all generation).
+        # For L=1: chunk-0 = S, chunks-1+ = S-1 (unchanged from before).
+        # For L>1: chunk-0 may only fit 1 AR step if apc ≈ L*A.
+        A = self.actions_per_chunk // (self._inner_steps_per_block - 1)
+        L = self._latent_frames_per_step
+        if is_first_chunk:
+            inner_steps = (self.actions_per_chunk // A + 1) // L
+        else:
+            inner_steps = self.actions_per_chunk // (L * A)
 
         latent_frames: list[torch.Tensor] = []
-        for ar_idx in range(self._inner_steps_per_block):
-            out_5d = self._pipeline.generate(ar_idx, cache, input=True)
+        for i in range(inner_steps):
+            ar_idx = self._global_ar_idx + i
+            out_5d = self._pipeline.generate(ar_idx, self._cache, input=True)
             latent_frames.append(out_5d)
-            if ar_idx < self._inner_steps_per_block - 1:
-                self._pipeline.finalize(ar_idx, cache)
+            self._pipeline.finalize(ar_idx, self._cache)
+
+        self._global_ar_idx += inner_steps
 
         block_latent = torch.cat(latent_frames, dim=1)
-        block_pixels = self._decoder(input=block_latent).clamp(min=-1.0, max=1.0)
-        # block_pixels layout: [1, T_pix, 3, H, W]; T_pix = 13 (1 cond + 12 gen).
+        block_pixels = self._decoder(
+            input=block_latent, cache=self._decoder_cache
+        ).clamp(min=-1.0, max=1.0)
+        # block_pixels layout: [1, T_pix, 3, H, W]
 
-        # Re-anchor on the last frame for the next outer block.
-        self._cond_pixels = block_pixels[:, -1:, :, :, :]
-
-        # Hand the generated frames to the video track in [1, 3, T, H, W],
-        # where T = self.actions_per_chunk.
-        generated_b3thw = (
-            block_pixels[:, 1:].permute(0, 2, 1, 3, 4).contiguous()
-        )
+        if is_first_chunk:
+            # AR 0 decoded the conditional frame; skip it since it is already
+            # shown as the initial anchor.
+            generated_b3thw = block_pixels[:, 1:].permute(0, 2, 1, 3, 4).contiguous()
+        else:
+            # All decoded frames are newly generated.
+            generated_b3thw = block_pixels.permute(0, 2, 1, 3, 4).contiguous()
 
         result = CosmoshStepResult(
             chunk_index=self.autoregressive_index,
-            num_frames=self.actions_per_chunk,
+            num_frames=generated_b3thw.shape[2],
             video_chunk=generated_b3thw.detach().cpu(),
         )
         self.autoregressive_index += 1
