@@ -49,6 +49,14 @@ on the runner config alongside the streaming pipeline.
     --total-blocks 20 \
     --save-comparison True \
     --pipeline.diffusion-model.transformer.checkpoint-path /localhome/local-javierg/checkpoints/model_ema_jhutabletop_bf16.pt
+
+  uv run flashdreams-run cosmosh-chunk3-vae-vae   \
+    --input-json sf_inference_data/cmr/trajectories/hyst_exp4_test/hyst_exp4_inference_manifest.json \
+    --cr1-embeddings-path sf_inference_data/cr1_empty_string_text_embeddings.pt \
+    --root-dir . \
+    --total-blocks 20 \
+    --save-comparison True \
+    --pipeline.diffusion-model.transformer.checkpoint-path checkpoints/cmr/hyst/model_ema_bf16_cmr_hyst_exp5.pt
 """
 
 from __future__ import annotations
@@ -366,14 +374,7 @@ class CosmoshRunner(Runner[CosmoshRunnerConfig, CosmoshPipeline]):
         dtype = tcfg.dtype
         A = tcfg.network.num_action_per_latent_frame
         L = tcfg._pT  # latent frames generated per feed-forward step (== len_t)
-        S = cfg.steps_per_block  # generate() calls per outer block
-        inner_steps_per_block = S
-        # A block runs S steps producing S*L latent frames; AR step 0 leads with
-        # the conditional (image-anchored) frame, so it has S*L - 1 generated
-        # latent frames and consumes that many action rows times A.
-        gen_latent_per_block = S * L - 1
-        actions_per_block = gen_latent_per_block * A
-        gen_frames_per_block = gen_latent_per_block * WAN_TCR  # decoded pixels
+        S = cfg.steps_per_block  # generate() calls per block
 
         # The pipeline's latent dims drive the output pixel size; per-entry
         # ``resolution`` overrides (if present) must agree.
@@ -401,23 +402,70 @@ class CosmoshRunner(Runner[CosmoshRunnerConfig, CosmoshPipeline]):
         actions_np = np.load(input_action_path)
         actions_np = pad_actions(actions_np, target_dim=tcfg.network.action_dim)
 
-        ar_total = min(cfg.total_blocks, actions_np.shape[0] // actions_per_block)
+        # Fully flat AR: only one conditional prefill (global AR step 0).
+        # Each block of S AR steps produces S*L latent frames except block 0,
+        # which produces S*L - 1 (one prefill). Total generated latents across
+        # ar_total blocks: ar_total * S * L - 1. Actions needed: (ar_total * S *
+        # L - 1) * A. Solving for ar_total from available actions:
+        #   ar_total <= (N_actions // A + 1) / (S * L)
+        ar_total = min(
+            cfg.total_blocks,
+            (actions_np.shape[0] // A + 1) // (S * L),
+        )
         if ar_total <= 0:
             raise ValueError(
                 f"actions_np has {actions_np.shape[0]} entries; need at least "
-                f"{actions_per_block} for one outer block "
+                f"{(S * L - 1) * A} for one outer block "
                 f"(steps_per_block={S}, len_t={L})."
             )
+        total_ar_steps = ar_total * S
+        total_generated_latents = total_ar_steps * L - 1  # one prefill at AR 0
+        total_actions_needed = total_generated_latents * A
+
         if self.is_rank_zero:
             logger.info(
                 f"Entry {input_video_path}: resolution {Ht}x{Wt}, "
-                f"{ar_total} outer blocks x {S} steps x {L} latent frames/step "
-                f"({actions_per_block} actions/block, "
-                f"{gen_frames_per_block} pixels/block), "
-                f"{ar_total * inner_steps_per_block} inner AR steps."
+                f"{ar_total} blocks x {S} steps x {L} latent frames/step "
+                f"({total_ar_steps} total AR steps, "
+                f"{total_generated_latents} generated latents, "
+                f"{total_generated_latents * WAN_TCR} generated pixel frames)"
             )
 
         text_embeddings = text_embeddings_cpu.to(device=device, dtype=dtype)
+
+        # Encode the conditioning frame exactly once — no per-block re-encoding.
+        # Move the encoder to GPU (no-op after the first entry), encode, then
+        # immediately offload it back to CPU so the generation phase reclaims
+        # its VRAM.
+        self.vae_encoder.to(device)
+        torch.cuda.synchronize()
+        t = time.perf_counter()
+        image_embeddings = self.vae_encoder(input=cond_pixels)
+        torch.cuda.synchronize()
+        t_encode = time.perf_counter() - t
+        self.vae_encoder.cpu()
+        torch.cuda.empty_cache()
+
+        # Load the full action trajectory for the entire rollout at once.
+        all_actions = (
+            torch.from_numpy(actions_np[:total_actions_needed])
+            .to(device=device, dtype=dtype)
+            .unsqueeze(0)
+        )
+
+        # Initialize the pipeline cache once — no reinitialisation across blocks.
+        cache = self.pipeline.initialize_cache(
+            text_embeddings=text_embeddings,
+            image_embeddings=image_embeddings,
+            actions=all_actions,
+        )
+
+        # Persistent decoder cache carries temporal state across block decodes.
+        # Block 0 (fresh cache) uses AR-0 causal semantics: first latent decodes
+        # to 1 pixel frame; we skip it since cond_pixels is already frame 0.
+        # Blocks 1+ (warm cache) use AR-1+ semantics: every latent decodes to
+        # WAN_TCR pixel frames with no wasted frame.
+        decoder_cache = self.vae_decoder.initialize_autoregressive_cache()
 
         final_video_pixels: list[torch.Tensor] = [
             cond_pixels.permute(0, 2, 1, 3, 4).contiguous()  # [1, 3, 1, H, W]
@@ -425,88 +473,84 @@ class CosmoshRunner(Runner[CosmoshRunnerConfig, CosmoshPipeline]):
         latents_per_block: list[torch.Tensor] = []
 
         t_total_start = time.perf_counter()
-        block_encode: list[float] = []
         block_gen: list[float] = []
         block_decode: list[float] = []
         block_total: list[float] = []
 
-        for outer_idx in range(ar_total):
-            block_start = time.perf_counter()
+        latent_buffer: list[torch.Tensor] = []
+        block_gen_accum: float = 0.0
+        block_start: float = t_total_start
+
+        for global_ar_idx in range(total_ar_steps):
+            block_idx = global_ar_idx // S
+            is_last_step = global_ar_idx == total_ar_steps - 1
+            is_block_start = global_ar_idx % S == 0
+            is_block_end = (global_ar_idx + 1) % S == 0
+
+            if is_block_start:
+                block_start = time.perf_counter()
+                block_gen_accum = 0.0
 
             torch.cuda.synchronize()
             t = time.perf_counter()
-            image_embeddings = self.vae_encoder(input=cond_pixels)
+            # input=True triggers the ActionEncoder; the encoder ignores the
+            # value and slices actions from cache.encoder_cache.actions.
+            out_5d = self.pipeline.generate(global_ar_idx, cache, input=True)
+            if not is_last_step:
+                self.pipeline.finalize(global_ar_idx, cache)
             torch.cuda.synchronize()
-            enc_t = time.perf_counter() - t
+            block_gen_accum += time.perf_counter() - t
 
-            actions_slice = actions_np[
-                outer_idx
-                * actions_per_block : (outer_idx + 1)
-                * actions_per_block
-            ]
-            actions_block = (
-                torch.from_numpy(actions_slice)
-                .to(device=device, dtype=dtype)
-                .unsqueeze(0)
-            )
+            latent_buffer.append(out_5d)
 
-            cache = self.pipeline.initialize_cache(
-                text_embeddings=text_embeddings,
-                image_embeddings=image_embeddings,
-                actions=actions_block,
-            )
+            if is_block_end:
+                block_latent = torch.cat(latent_buffer, dim=1)
+                latent_buffer = []
+                latents_per_block.append(block_latent.detach().float().cpu())
 
-            torch.cuda.synchronize()
-            t = time.perf_counter()
-            latent_frames: list[torch.Tensor] = []
-            for ar_idx in range(inner_steps_per_block):
-                # input=True triggers the ActionEncoder; the encoder ignores
-                # the value and slices from cache.encoder_cache.actions.
-                out_5d = self.pipeline.generate(ar_idx, cache, input=True)
-                latent_frames.append(out_5d)
-                if ar_idx < inner_steps_per_block - 1:
-                    self.pipeline.finalize(ar_idx, cache)
-            torch.cuda.synchronize()
-            gen_t = time.perf_counter() - t
-
-            block_latent = torch.cat(latent_frames, dim=1)
-            latents_per_block.append(block_latent.detach().float().cpu())
-
-            torch.cuda.synchronize()
-            t = time.perf_counter()
-            block_pixels = self.vae_decoder(input=block_latent)
-            block_pixels = block_pixels.clamp(min=-1.0, max=1.0)
-            torch.cuda.synchronize()
-            dec_t = time.perf_counter() - t
-
-            block_pixels_b3thw = block_pixels.permute(0, 2, 1, 3, 4).contiguous()
-            final_video_pixels.append(block_pixels_b3thw[:, :, 1:])
-
-            cond_pixels = block_pixels[:, -1:, :, :, :]  # [1, 1, 3, H, W]
-
-            total_t = time.perf_counter() - block_start
-            block_encode.append(enc_t)
-            block_gen.append(gen_t)
-            block_decode.append(dec_t)
-            block_total.append(total_t)
-
-            if self.is_rank_zero:
-                tag = "WARMUP" if outer_idx == 0 else "steady"
-                logger.info(
-                    f"  outer block {outer_idx + 1}/{ar_total} [{tag}]: "
-                    f"encode={enc_t:.2f}s gen={gen_t:.2f}s decode={dec_t:.2f}s "
-                    f"total={total_t:.2f}s"
+                torch.cuda.synchronize()
+                t = time.perf_counter()
+                block_pixels = self.vae_decoder(
+                    input=block_latent, cache=decoder_cache
                 )
+                print("block_pixels.shape", block_pixels.shape)
+                block_pixels = block_pixels.clamp(min=-1.0, max=1.0)
+                torch.cuda.synchronize()
+                dec_t = time.perf_counter() - t
+
+                block_pixels_b3thw = block_pixels.permute(0, 2, 1, 3, 4).contiguous()
+                if block_idx == 0:
+                    # Skip the first decoded pixel frame: it is the VAE's
+                    # reconstruction of the conditional AR-0 latent, already
+                    # held in final_video_pixels[0] as cond_pixels.
+                    final_video_pixels.append(block_pixels_b3thw[:, :, 1:])
+                else:
+                    # All decoded frames are newly generated.
+                    final_video_pixels.append(block_pixels_b3thw)
+
+                total_t = time.perf_counter() - block_start
+                block_gen.append(block_gen_accum)
+                block_decode.append(dec_t)
+                block_total.append(total_t)
+
+                if self.is_rank_zero:
+                    tag = "WARMUP" if block_idx == 0 else "steady"
+                    logger.info(
+                        f"  outer block {block_idx + 1}/{ar_total} [{tag}]: "
+                        f"gen={block_gen_accum:.2f}s decode={dec_t:.2f}s "
+                        f"total={total_t:.2f}s"
+                    )
 
         total_time = time.perf_counter() - t_total_start
-        t_encode_total = sum(block_encode)
         t_gen_total = sum(block_gen)
         t_decode_total = sum(block_decode)
 
         warmup_time = block_total[0] if block_total else 0.0
         steady_blocks_total = sum(block_total[1:])
         steady_blocks_count = max(0, len(block_total) - 1)
-        steady_frames = steady_blocks_count * gen_frames_per_block
+        # Steady blocks use the warm decoder cache (AR-1+ semantics): each of
+        # the S latents decodes to WAN_TCR pixel frames with no skipped frame.
+        steady_frames = steady_blocks_count * S * L * WAN_TCR
         steady_fps = (
             steady_frames / steady_blocks_total if steady_blocks_total > 0 else 0.0
         )
@@ -534,12 +578,11 @@ class CosmoshRunner(Runner[CosmoshRunnerConfig, CosmoshPipeline]):
                 stage_slice = slice(None)
                 avg_count = len(block_total)
                 avg_label = "block (warmup only)"
-            avg_encode_ms = sum(block_encode[stage_slice]) / avg_count * 1000.0
             avg_gen_ms = sum(block_gen[stage_slice]) / avg_count * 1000.0
             avg_decode_ms = sum(block_decode[stage_slice]) / avg_count * 1000.0
             avg_total_ms = sum(block_total[stage_slice]) / avg_count * 1000.0
             logger.info(
-                f"  avg per {avg_label}: encode={avg_encode_ms:.1f}ms "
+                f"  avg per {avg_label}: "
                 f"gen={avg_gen_ms:.1f}ms decode={avg_decode_ms:.1f}ms "
                 f"total={avg_total_ms:.1f}ms"
             )
@@ -615,12 +658,13 @@ class CosmoshRunner(Runner[CosmoshRunnerConfig, CosmoshPipeline]):
             except Exception as e:  # noqa: BLE001 -- comparison is best-effort
                 logger.warning(f"Failed to create comparison video: {e}")
 
+        frames_generated = total_generated_latents * WAN_TCR
         return {
             "total_time": total_time,
-            "encode_time": t_encode_total,
+            "encode_time": t_encode,
             "generation_time": t_gen_total,
             "decode_time": t_decode_total,
-            "frames_generated": float(ar_total * gen_frames_per_block),
+            "frames_generated": float(frames_generated),
             "warmup_time": warmup_time,
             "steady_time": steady_blocks_total,
             "steady_frames": float(steady_frames),
