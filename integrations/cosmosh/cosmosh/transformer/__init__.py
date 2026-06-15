@@ -203,8 +203,14 @@ class CosmosHTransformerConfig(TransformerConfig):
     """Latent width (post-VAE; for 720p Wan VAE that's 1280/8 = 160)."""
 
     len_t: int = 1
-    """Latent frames per AR chunk. Pinned to ``1`` for the streaming
-    self-forcing geometry (one latent frame per AR step)."""
+    """Latent frames generated per AR chunk (per ``generate()`` call).
+
+    Defaults to ``1`` (one latent frame per AR step). Larger values generate
+    ``len_t`` latent frames per feed-forward step; the action chunk is reshaped
+    to one row per frame and the per-frame embedding modulates each frame's
+    spatial tokens (see ``CosmosHActionDiTNetwork.forward``). ``window_size_t``
+    (and ``sink_size_t``) must remain a whole multiple of ``len_t`` so the KV
+    cache holds an integer number of AR chunks."""
 
     cp_size: int = 1
     """Size of the THW context-parallel group. Locked to 1 in Phase 1."""
@@ -261,6 +267,12 @@ class CosmosHTransformerConfig(TransformerConfig):
         self._pT = self.len_t // kt
         self._pH = self.height // kh
         self._pW = self.width // kw
+
+        assert self.window_size_t >= self.len_t, (
+            f"window_size_t ({self.window_size_t}) must be >= len_t "
+            f"({self.len_t}) so at least one AR chunk fits the self-attention "
+            "window."
+        )
 
         # First AR step whose forward sees a fully-filled, steady-state KV
         # cache. With ``len_t == 1`` this is exactly ``sink_size_t + window_size_t``.
@@ -575,6 +587,7 @@ class CosmosHTransformer(Transformer[CosmosHTransformerCache]):
             condition_video_input_mask=cache.mask_other_blocks_patched,
             action=action,
             current_chunk_idx=ar_idx,
+            num_temporal_frames=self.config._pT,
             eager_mode=False,
         )
 

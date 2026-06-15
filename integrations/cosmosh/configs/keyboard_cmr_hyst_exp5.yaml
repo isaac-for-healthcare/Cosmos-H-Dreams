@@ -13,6 +13,9 @@ runtime:
   ckpt_path: checkpoints/cmr/hyst/model_ema_bf16_cmr_hyst_exp5_iter2600.pt
   resolution: [288, 512]
   fps: 30
+  len_t: 3
+  window_size_t: 48
+  use_cuda_graph: false
   actions_per_chunk: 12  # 4 / 8 / 12 / 16…; smaller = lower latency, lower fidelity
 
 # Light-switch contract: the model (config_name / ckpt_path / resolution /

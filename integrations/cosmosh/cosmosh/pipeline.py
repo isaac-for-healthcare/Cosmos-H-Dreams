@@ -118,6 +118,19 @@ class CosmoshPipeline(
             "network.num_action_per_latent_frame "
             f"({transformer.config.network.num_action_per_latent_frame})."
         )
+        # The encoder slices ``latent_frames_per_step`` frames' worth of actions
+        # per AR step; the transformer generates exactly ``_pT`` latent frames
+        # per step. A mismatch would feed the network a wrong-length action
+        # chunk, so pin them together at construction.
+        assert (
+            encoder_cfg.latent_frames_per_step == transformer.config._pT
+        ), (
+            "ActionEncoderConfig.latent_frames_per_step "
+            f"({encoder_cfg.latent_frames_per_step}) must match the "
+            f"transformer's _pT ({transformer.config._pT}) "
+            f"(len_t={transformer.config.len_t}, "
+            f"patch_temporal={transformer.config.network.patch_temporal})."
+        )
 
     @property
     def device(self) -> torch.device:

@@ -232,24 +232,25 @@ class FinalLayer(nn.Module):
 
         Args:
             x: Input tensor of shape (B, ..., D).
-            emb: Conditioning embedding of shape (B, D).
-            adaln_lora: Optional LoRA tensor of shape (B, 3 * D).
+            emb: Token-aligned conditioning embedding with the same shape as
+                ``x`` (B, ..., D).
+            adaln_lora: Optional token-aligned LoRA tensor of shape
+                (B, ..., 3 * D).
 
         Returns:
             Output tensor of shape (B, ..., D') where D' = patch_dim.
         """
         batch_size, *ellipsis_dims, hidden_dim = x.shape
-        assert emb.shape == (batch_size, hidden_dim)
-
-        emb = emb.reshape(batch_size, *([1] * len(ellipsis_dims)), hidden_dim)
+        assert emb.shape == x.shape, (
+            f"emb must be token-aligned with x {tuple(x.shape)}, got "
+            f"{tuple(emb.shape)}"
+        )
 
         if self.use_adaln_lora:
             assert adaln_lora is not None and adaln_lora.shape == (
                 batch_size,
+                *ellipsis_dims,
                 3 * hidden_dim,
-            )
-            adaln_lora = adaln_lora.reshape(
-                batch_size, *([1] * len(ellipsis_dims)), 3 * hidden_dim
             )
             modulation = (
                 self.adaln_modulation(emb) + adaln_lora[..., : 2 * self.hidden_size]
@@ -622,26 +623,33 @@ class Block(nn.Module):
 
         Args:
             x: Input tensor with shape ``[B, L, D]``.
-            emb: Timestep + action embedding with shape ``[B, D]``.
+            emb: Token-aligned timestep + action embedding with shape
+                ``[B, L, D]`` (one modulation per token; the network expands a
+                per-latent-frame embedding across each frame's spatial tokens).
             cache: KV cache container for this block.
             rope_freqs: RoPE frequencies with shape ``[L, 1, 1, D]``.
-            adaln_lora: Optional AdaLN LoRA embedding with shape ``[B, 3D]``.
+            adaln_lora: Optional token-aligned AdaLN LoRA embedding with shape
+                ``[B, L, 3D]``.
 
         Returns:
             Updated hidden states with the same shape as ``x``.
         """
         assert x.ndim == 3, f"x must be a 3D tensor [B, L, D], got shape {x.shape}"
         B, L, D = x.shape
+        assert emb.shape == (B, L, D), (
+            f"emb must be token-aligned [B, L, D] = {(B, L, D)}, got "
+            f"{tuple(emb.shape)}"
+        )
 
-        # Reshape embeddings to be broadcastable with x.
-        emb = emb.reshape(B, 1, D)
-
-        # Compute AdaLN modulation
+        # Compute AdaLN modulation (per token; ``emb`` already carries one row
+        # per token).
         if self.use_adaln_lora:
             assert adaln_lora is not None, (
                 "adaln_lora is required when use_adaln_lora is True"
             )
-            adaln_lora = adaln_lora.reshape(B, 1, 3 * D)
+            assert adaln_lora.shape == (B, L, 3 * D), (
+                f"adaln_lora must be [B, L, 3D], got {tuple(adaln_lora.shape)}"
+            )
             shift_self, scale_self, gate_self = (
                 self.adaln_modulation_self_attn(emb) + adaln_lora
             ).chunk(3, dim=-1)

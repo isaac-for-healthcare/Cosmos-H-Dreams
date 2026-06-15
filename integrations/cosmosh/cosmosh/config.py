@@ -222,7 +222,12 @@ def build_cosmosh_smoke(
         name=recipe_name,
         _target=CosmoshPipeline,
         encoder=ActionEncoderConfig(
-            _target=ActionEncoder, num_action_per_latent_frame=4
+            _target=ActionEncoder,
+            num_action_per_latent_frame=4,
+            # Must equal the transformer's len_t (== _pT); CosmoshPipeline
+            # asserts the match. The offline runner overrides both in lockstep
+            # via its ``len_t`` knob.
+            latent_frames_per_step=1,
         ),
         decoder=None,
         diffusion_model=DiffusionModelConfig(
@@ -251,7 +256,7 @@ _WAN_VAE_SPATIAL_COMPRESSION = 8
 _COSMOSH_HEIGHT_LAT = _DEFAULT_VIDEO_HEIGHT // _WAN_VAE_SPATIAL_COMPRESSION
 _COSMOSH_WIDTH_LAT = _DEFAULT_VIDEO_WIDTH // _WAN_VAE_SPATIAL_COMPRESSION
 
-_COSMOSH_WINDOW_SIZE_T = 13
+_COSMOSH_WINDOW_SIZE_T = 48
 """KV-cache rolling window in latent frames; sized to comfortably hold a
 13-frame conditioning clip's worth of latent K/V (the deterministic
 script's ``cache_frame_size=-1`` means "no cap"; 13 covers the canonical
@@ -264,6 +269,7 @@ def build_cosmosh(
     height: int = _COSMOSH_HEIGHT_LAT,
     width: int = _COSMOSH_WIDTH_LAT,
     window_size_t: int = _COSMOSH_WINDOW_SIZE_T,
+    len_t: int = 1,
     checkpoint_path: str | None = None,
     num_inference_steps: int | None = None,
     compile_network: bool = True,
@@ -283,7 +289,12 @@ def build_cosmosh(
         seed: RNG seed for initial noise.
         height: Latent height. Default 88 (720p ÷ Wan2.1 spatial /8 + pad).
         width: Latent width. Default 160 (1280 ÷ 8).
-        window_size_t: KV cache rolling window in latent frames.
+        window_size_t: KV cache rolling window in latent frames. Must be a
+            whole multiple of ``len_t``.
+        len_t: Latent frames generated per feed-forward (``generate()``) step.
+            Sets the transformer's ``len_t`` and the action encoder's
+            ``latent_frames_per_step`` in lockstep (``CosmoshPipeline`` asserts
+            they match). ``1`` keeps one latent frame per step.
         checkpoint_path: Override the default
             ``AVAILABLE_COSMOSH_CHECKPOINT_PATHS['default']`` location.
             Pass ``None`` to use the default.
@@ -308,6 +319,12 @@ def build_cosmosh(
     """
     if checkpoint_path is None:
         checkpoint_path = AVAILABLE_COSMOSH_CHECKPOINT_PATHS["default"]
+
+    assert len_t >= 1, f"len_t must be >= 1, got {len_t}"
+    assert window_size_t % len_t == 0, (
+        f"window_size_t ({window_size_t}) must be a whole multiple of len_t "
+        f"({len_t}) so the KV cache holds an integer number of AR chunks."
+    )
 
     full_schedule_len = len(denoising_timesteps)
     if num_inference_steps is not None:
@@ -355,7 +372,7 @@ def build_cosmosh(
         network=network,
         height=height,
         width=width,
-        len_t=1,
+        len_t=len_t,
         cp_size=1,
         h_extrapolation_ratio=3.0,
         w_extrapolation_ratio=3.0,
@@ -371,7 +388,12 @@ def build_cosmosh(
         name=recipe_name,
         _target=CosmoshPipeline,
         encoder=ActionEncoderConfig(
-            _target=ActionEncoder, num_action_per_latent_frame=4
+            _target=ActionEncoder,
+            num_action_per_latent_frame=4,
+            # Must equal the transformer's len_t (== _pT); CosmoshPipeline
+            # asserts the match. The offline runner re-applies both in lockstep
+            # via its ``len_t`` knob.
+            latent_frames_per_step=len_t,
         ),
         decoder=None,
         diffusion_model=DiffusionModelConfig(
@@ -432,6 +454,7 @@ def _build_cosmosh_bundle(
     height: int,
     width: int,
     window_size_t: int,
+    len_t: int,
     checkpoint_path: str | None,
     num_inference_steps: int | None,
     compile_network: bool,
@@ -448,6 +471,7 @@ def _build_cosmosh_bundle(
         height=height,
         width=width,
         window_size_t=window_size_t,
+        len_t=len_t,
         checkpoint_path=checkpoint_path,
         num_inference_steps=num_inference_steps,
         compile_network=compile_network,
@@ -487,6 +511,7 @@ def _make_named_builder(
         height: int = _COSMOSH_HEIGHT_LAT,
         width: int = _COSMOSH_WIDTH_LAT,
         window_size_t: int = _COSMOSH_WINDOW_SIZE_T,
+        len_t: int = 1,
         checkpoint_path: str | None = None,
         num_inference_steps: int | None = None,
         compile_network: bool = True,
@@ -499,6 +524,7 @@ def _make_named_builder(
             height=height,
             width=width,
             window_size_t=window_size_t,
+            len_t=len_t,
             checkpoint_path=checkpoint_path,
             num_inference_steps=num_inference_steps,
             compile_network=compile_network,
@@ -621,6 +647,32 @@ def _build_cosmosh_runners() -> dict[str, RunnerConfig]:
             vae_encoder=bundle.vae_encoder,
             vae_decoder=bundle.vae_decoder,
         )
+
+    # ``len_t`` (frames-per-feed-forward) variants: chunk1/2/3 for every shipped
+    # bundle (``steps_per_block`` fixed at 4). Only ``len_t`` differs within a
+    # bundle -- each ``generate()`` call emits ``len_t`` latent frames
+    # (-> ``len_t * WAN_TCR`` pixels) and there are 4 calls per outer block --
+    # so they sweep cleanly on any speed/fidelity point. ``window_size_t`` (48)
+    # is a whole multiple of each ``len_t``, so no per-variant window tuning is
+    # needed.
+    for slug, builder in COSMOSH_CONFIG_BUILDERS.items():
+        dashed = slug.replace("_", "-")
+        base_desc = _COSMOSH_DESCRIPTIONS[f"cosmosh-{dashed}"].rstrip(".")
+        for len_t in (1, 2, 3):
+            runner_name = f"cosmosh-chunk{len_t}-{dashed}"
+            bundle = builder(len_t=len_t)
+            runners[runner_name] = CosmoshRunnerConfig(
+                runner_name=runner_name,
+                description=(
+                    f"{base_desc}; len_t={len_t} ({len_t} latent frame(s) per "
+                    "feed-forward step)."
+                ),
+                pipeline=bundle.pipeline,
+                vae_encoder=bundle.vae_encoder,
+                vae_decoder=bundle.vae_decoder,
+                len_t=len_t,
+                steps_per_block=4,
+            )
     return runners
 
 
@@ -638,4 +690,42 @@ RUNNER_COSMOSH_2STEPS_VAE_VAE = COSMOSH_RUNNERS["cosmosh-2steps-vae-vae"]
 RUNNER_COSMOSH_2STEPS_VAE_LIGHTTAE = COSMOSH_RUNNERS["cosmosh-2steps-vae-lighttae"]
 RUNNER_COSMOSH_2STEPS_LIGHTVAE_LIGHTTAE = COSMOSH_RUNNERS[
     "cosmosh-2steps-lightvae-lighttae"
+]
+
+# len_t (frames-per-feed-forward) variants: chunk1/2/3 for every bundle.
+RUNNER_COSMOSH_CHUNK1_VAE_VAE = COSMOSH_RUNNERS["cosmosh-chunk1-vae-vae"]
+RUNNER_COSMOSH_CHUNK2_VAE_VAE = COSMOSH_RUNNERS["cosmosh-chunk2-vae-vae"]
+RUNNER_COSMOSH_CHUNK3_VAE_VAE = COSMOSH_RUNNERS["cosmosh-chunk3-vae-vae"]
+RUNNER_COSMOSH_CHUNK1_VAE_LIGHTTAE = COSMOSH_RUNNERS["cosmosh-chunk1-vae-lighttae"]
+RUNNER_COSMOSH_CHUNK2_VAE_LIGHTTAE = COSMOSH_RUNNERS["cosmosh-chunk2-vae-lighttae"]
+RUNNER_COSMOSH_CHUNK3_VAE_LIGHTTAE = COSMOSH_RUNNERS["cosmosh-chunk3-vae-lighttae"]
+RUNNER_COSMOSH_CHUNK1_LIGHTVAE_LIGHTTAE = COSMOSH_RUNNERS[
+    "cosmosh-chunk1-lightvae-lighttae"
+]
+RUNNER_COSMOSH_CHUNK2_LIGHTVAE_LIGHTTAE = COSMOSH_RUNNERS[
+    "cosmosh-chunk2-lightvae-lighttae"
+]
+RUNNER_COSMOSH_CHUNK3_LIGHTVAE_LIGHTTAE = COSMOSH_RUNNERS[
+    "cosmosh-chunk3-lightvae-lighttae"
+]
+RUNNER_COSMOSH_CHUNK1_2STEPS_VAE_VAE = COSMOSH_RUNNERS["cosmosh-chunk1-2steps-vae-vae"]
+RUNNER_COSMOSH_CHUNK2_2STEPS_VAE_VAE = COSMOSH_RUNNERS["cosmosh-chunk2-2steps-vae-vae"]
+RUNNER_COSMOSH_CHUNK3_2STEPS_VAE_VAE = COSMOSH_RUNNERS["cosmosh-chunk3-2steps-vae-vae"]
+RUNNER_COSMOSH_CHUNK1_2STEPS_VAE_LIGHTTAE = COSMOSH_RUNNERS[
+    "cosmosh-chunk1-2steps-vae-lighttae"
+]
+RUNNER_COSMOSH_CHUNK2_2STEPS_VAE_LIGHTTAE = COSMOSH_RUNNERS[
+    "cosmosh-chunk2-2steps-vae-lighttae"
+]
+RUNNER_COSMOSH_CHUNK3_2STEPS_VAE_LIGHTTAE = COSMOSH_RUNNERS[
+    "cosmosh-chunk3-2steps-vae-lighttae"
+]
+RUNNER_COSMOSH_CHUNK1_2STEPS_LIGHTVAE_LIGHTTAE = COSMOSH_RUNNERS[
+    "cosmosh-chunk1-2steps-lightvae-lighttae"
+]
+RUNNER_COSMOSH_CHUNK2_2STEPS_LIGHTVAE_LIGHTTAE = COSMOSH_RUNNERS[
+    "cosmosh-chunk2-2steps-lightvae-lighttae"
+]
+RUNNER_COSMOSH_CHUNK3_2STEPS_LIGHTVAE_LIGHTTAE = COSMOSH_RUNNERS[
+    "cosmosh-chunk3-2steps-lightvae-lighttae"
 ]

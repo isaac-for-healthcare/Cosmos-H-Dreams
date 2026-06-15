@@ -31,6 +31,13 @@ loop:
   ``action[(t_idx - start_idx) * A : (t_idx - start_idx + 1) * A]`` with
   ``start_idx == 1``; we mirror it as ``actions[(ar_idx - 1) * A : ar_idx * A]``.
 
+When ``latent_frames_per_step > 1`` each AR step generates several latent
+frames at once, so the slice widens to ``n_gen * A`` actions (``n_gen`` is
+``latent_frames_per_step - 1`` at the conditional step 0, else
+``latent_frames_per_step``). See :meth:`ActionEncoder.forward` for the
+cumulative-offset formula. ``latent_frames_per_step == 1`` reproduces the
+single-frame semantics above exactly.
+
 The action MLPs (``action_embedder_B_D`` / ``B_3D``) live inside the
 network so the upstream checkpoint loads with no key remapping; this
 encoder only handles slicing.
@@ -54,7 +61,13 @@ class ActionEncoderCache(StreamingEncoderCache):
     ``T_actions`` should be at least ``num_ar_steps * num_action_per_latent_frame``."""
 
     num_action_per_latent_frame: int
-    """Number of raw actions consumed per AR step (= VAE temporal compression)."""
+    """Number of raw actions consumed per generated latent frame (= VAE temporal
+    compression)."""
+
+    latent_frames_per_step: int
+    """Latent frames generated per AR step (``= transformer _pT``). AR step 0
+    leads with the conditional (image-anchored) frame so it drives
+    ``latent_frames_per_step - 1`` frames; later steps drive all of them."""
 
 
 @dataclass(kw_only=True)
@@ -64,8 +77,12 @@ class ActionEncoderConfig(EncoderConfig):
     _target: type["ActionEncoder"] = field(default_factory=lambda: ActionEncoder)
 
     num_action_per_latent_frame: int = 4
-    """Default number of raw actions per AR step. Pinned to the Wan2.1 VAE
-    temporal compression ratio."""
+    """Default number of raw actions per generated latent frame. Pinned to the
+    Wan2.1 VAE temporal compression ratio."""
+
+    latent_frames_per_step: int = 1
+    """Latent frames generated per AR step (``= transformer _pT``). Must match
+    the transformer's ``len_t``; validated in ``CosmoshPipeline.__init__``."""
 
 
 class ActionEncoder(StreamingEncoder[ActionEncoderCache]):
@@ -102,6 +119,7 @@ class ActionEncoder(StreamingEncoder[ActionEncoderCache]):
         return ActionEncoderCache(
             actions=actions,
             num_action_per_latent_frame=self.config.num_action_per_latent_frame,
+            latent_frames_per_step=self.config.latent_frames_per_step,
         )
 
     def forward(
@@ -112,28 +130,43 @@ class ActionEncoder(StreamingEncoder[ActionEncoderCache]):
     ) -> Tensor | None:
         """Return the action chunk for AR step ``autoregressive_index``.
 
-        AR 0 is the conditional-frame prefill: matches the upstream's
-        ``action=None`` semantics so the network skips the action MLPs and
-        the K/V cache is seeded purely from the clean image latent.
+        Each AR step generates ``L = latent_frames_per_step`` latent frames.
+        AR step 0 leads with the conditional (image-anchored) frame, so it
+        drives ``L - 1`` generated frames from ``actions[0 : (L-1)*A]``; every
+        later step ``k`` drives ``L`` frames starting at the cumulative
+        generated-frame offset ``g = (L-1) + (k-1)*L``, i.e.
+        ``actions[g*A : (g+L)*A]``.
+
+        With ``L == 1`` this collapses to the original semantics: AR 0 returns
+        ``None`` (pure conditional prefill, matching upstream ``action=None``)
+        and AR ``k>=1`` returns ``actions[(k-1)*A : k*A]``.
 
         Args:
             input: Ignored; the action source is the cached trajectory.
-            autoregressive_index: 0-based AR step index. ``0`` returns
-                ``None``; ``>=1`` returns ``actions[(ar-1)*A : ar*A]``.
+            autoregressive_index: 0-based AR step index.
             cache: Per-rollout cache populated by
                 :meth:`initialize_autoregressive_cache`.
 
         Returns:
-            ``None`` at AR step 0; otherwise the
-            ``[B, num_action_per_latent_frame, action_dim]`` slice.
+            ``None`` when the step drives no generated frame (``L == 1`` at
+            AR step 0); otherwise the ``[B, n_gen * A, action_dim]`` slice
+            where ``n_gen`` is ``L - 1`` at AR step 0 and ``L`` thereafter.
         """
         del input
         assert cache is not None, "ActionEncoder requires a cache for slicing"
-        if autoregressive_index == 0:
-            return None
         A = cache.num_action_per_latent_frame
-        start = (autoregressive_index - 1) * A
-        stop = start + A
+        L = cache.latent_frames_per_step
+        if autoregressive_index == 0:
+            start_gen = 0
+            n_gen = L - 1
+        else:
+            start_gen = (L - 1) + (autoregressive_index - 1) * L
+            n_gen = L
+        if n_gen == 0:
+            # L == 1 at AR step 0: pure conditional prefill, no action.
+            return None
+        start = start_gen * A
+        stop = start + n_gen * A
         assert stop <= cache.actions.shape[1], (
             f"AR step {autoregressive_index} requires actions[{start}:{stop}], "
             f"but trajectory has only {cache.actions.shape[1]} entries."

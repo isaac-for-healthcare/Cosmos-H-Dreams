@@ -46,12 +46,30 @@ dev = [
 # scans this group at CLI startup; the entry-point name itself is purely
 # informational, the registry key always comes from ``cfg.runner_name``.
 [project.entry-points."flashdreams.runner_configs"]
-"cosmosh-vae-vae"                    = "cosmosh.config:RUNNER_COSMOSH_VAE_VAE"
-"cosmosh-vae-lighttae"               = "cosmosh.config:RUNNER_COSMOSH_VAE_LIGHTTAE"
-"cosmosh-lightvae-lighttae"          = "cosmosh.config:RUNNER_COSMOSH_LIGHTVAE_LIGHTTAE"
-"cosmosh-2steps-vae-vae"             = "cosmosh.config:RUNNER_COSMOSH_2STEPS_VAE_VAE"
-"cosmosh-2steps-vae-lighttae"        = "cosmosh.config:RUNNER_COSMOSH_2STEPS_VAE_LIGHTTAE"
-"cosmosh-2steps-lightvae-lighttae"   = "cosmosh.config:RUNNER_COSMOSH_2STEPS_LIGHTVAE_LIGHTTAE"
+"cosmosh-vae-vae" = "cosmosh.config:RUNNER_COSMOSH_VAE_VAE"
+"cosmosh-vae-lighttae" = "cosmosh.config:RUNNER_COSMOSH_VAE_LIGHTTAE"
+"cosmosh-lightvae-lighttae" = "cosmosh.config:RUNNER_COSMOSH_LIGHTVAE_LIGHTTAE"
+"cosmosh-2steps-vae-vae" = "cosmosh.config:RUNNER_COSMOSH_2STEPS_VAE_VAE"
+"cosmosh-2steps-vae-lighttae" = "cosmosh.config:RUNNER_COSMOSH_2STEPS_VAE_LIGHTTAE"
+"cosmosh-2steps-lightvae-lighttae" = "cosmosh.config:RUNNER_COSMOSH_2STEPS_LIGHTVAE_LIGHTTAE"
+"cosmosh-chunk1-vae-vae" = "cosmosh.config:RUNNER_COSMOSH_CHUNK1_VAE_VAE"
+"cosmosh-chunk2-vae-vae" = "cosmosh.config:RUNNER_COSMOSH_CHUNK2_VAE_VAE"
+"cosmosh-chunk3-vae-vae" = "cosmosh.config:RUNNER_COSMOSH_CHUNK3_VAE_VAE"
+"cosmosh-chunk1-vae-lighttae" = "cosmosh.config:RUNNER_COSMOSH_CHUNK1_VAE_LIGHTTAE"
+"cosmosh-chunk2-vae-lighttae" = "cosmosh.config:RUNNER_COSMOSH_CHUNK2_VAE_LIGHTTAE"
+"cosmosh-chunk3-vae-lighttae" = "cosmosh.config:RUNNER_COSMOSH_CHUNK3_VAE_LIGHTTAE"
+"cosmosh-chunk1-lightvae-lighttae" = "cosmosh.config:RUNNER_COSMOSH_CHUNK1_LIGHTVAE_LIGHTTAE"
+"cosmosh-chunk2-lightvae-lighttae" = "cosmosh.config:RUNNER_COSMOSH_CHUNK2_LIGHTVAE_LIGHTTAE"
+"cosmosh-chunk3-lightvae-lighttae" = "cosmosh.config:RUNNER_COSMOSH_CHUNK3_LIGHTVAE_LIGHTTAE"
+"cosmosh-chunk1-2steps-vae-vae" = "cosmosh.config:RUNNER_COSMOSH_CHUNK1_2STEPS_VAE_VAE"
+"cosmosh-chunk2-2steps-vae-vae" = "cosmosh.config:RUNNER_COSMOSH_CHUNK2_2STEPS_VAE_VAE"
+"cosmosh-chunk3-2steps-vae-vae" = "cosmosh.config:RUNNER_COSMOSH_CHUNK3_2STEPS_VAE_VAE"
+"cosmosh-chunk1-2steps-vae-lighttae" = "cosmosh.config:RUNNER_COSMOSH_CHUNK1_2STEPS_VAE_LIGHTTAE"
+"cosmosh-chunk2-2steps-vae-lighttae" = "cosmosh.config:RUNNER_COSMOSH_CHUNK2_2STEPS_VAE_LIGHTTAE"
+"cosmosh-chunk3-2steps-vae-lighttae" = "cosmosh.config:RUNNER_COSMOSH_CHUNK3_2STEPS_VAE_LIGHTTAE"
+"cosmosh-chunk1-2steps-lightvae-lighttae" = "cosmosh.config:RUNNER_COSMOSH_CHUNK1_2STEPS_LIGHTVAE_LIGHTTAE"
+"cosmosh-chunk2-2steps-lightvae-lighttae" = "cosmosh.config:RUNNER_COSMOSH_CHUNK2_2STEPS_LIGHTVAE_LIGHTTAE"
+"cosmosh-chunk3-2steps-lightvae-lighttae" = "cosmosh.config:RUNNER_COSMOSH_CHUNK3_2STEPS_LIGHTVAE_LIGHTTAE"
 
 [tool.setuptools.packages.find]
 where = ["."]

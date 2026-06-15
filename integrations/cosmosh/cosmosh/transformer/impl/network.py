@@ -394,21 +394,30 @@ class CosmosHActionDiTNetwork(nn.Module):
         condition_video_input_mask: Tensor,
         action: Tensor | None = None,
         current_chunk_idx: int = 0,
+        num_temporal_frames: int = 1,
         eager_mode: bool = True,
     ) -> Tensor:
         """Run the DiT forward.
 
         Args:
-            x: Patchified video tokens of shape ``[B, L, D]``.
+            x: Patchified video tokens of shape ``[B, L, D]`` where
+                ``L = num_temporal_frames * H_patch * W_patch``.
             timesteps: Scalar timestep ``[]`` or ``[1]``.
             rope_freqs: RoPE frequencies of shape ``[L, 1, 1, D_head]``.
             cache: Per-block AR cache produced by :meth:`initialize_cache`.
             condition_video_input_mask: Patchified condition mask, same shape as ``x``.
-            action: Optional ``[B, A, action_dim]`` tensor of raw actions for the
-                current AR step; ``A == num_action_per_latent_frame`` per generated
-                latent frame. ``None`` skips action injection (e.g. unconditional
-                first-frame prefill).
+            action: Optional ``[B, n_gen * A, action_dim]`` tensor of raw actions
+                for the current AR step; ``A == num_action_per_latent_frame`` per
+                generated latent frame and ``n_gen`` is the number of
+                action-driven latent frames in this chunk. ``n_gen`` may be less
+                than ``num_temporal_frames`` when the chunk leads with a
+                conditional (image-anchored) frame; the leading
+                ``num_temporal_frames - n_gen`` frames receive the timestep
+                embedding only. ``None`` skips action injection entirely.
             current_chunk_idx: Current chunk index for the KV cache.
+            num_temporal_frames: Number of latent frames in this chunk
+                (``= _pT``); the per-frame action / timestep embedding is
+                expanded across each frame's spatial tokens.
             eager_mode: ``True`` runs cache pre/post-update inside the forward;
                 ``False`` expects the caller to drive ``before_update`` /
                 ``after_update`` outside the (graph-captured) network.
@@ -429,30 +438,60 @@ class CosmosHActionDiTNetwork(nn.Module):
         # Time embedding (scalar -> [D]).
         t_emb, adaln_lora = self.t_embedder(timesteps)
 
-        # Action injection. Mirrors ActionChunkConditionedMinimalV1LVGDiT.forward:
-        # rearrange action to [B, 1, A*action_dim], two MLPs, add to t_emb and adaln_lora,
-        # THEN apply t_embedding_norm.
+        B = x.shape[0]
+        L = num_temporal_frames
+        assert x.shape[1] % L == 0, (
+            f"token count {x.shape[1]} must be divisible by num_temporal_frames "
+            f"{L}"
+        )
+        spatial = x.shape[1] // L
+        D = t_emb.shape[-1]
+
+        # Per-frame conditioning. The timestep embedding is shared across the
+        # chunk's latent frames; the action embedding varies per frame. Mirrors
+        # the upstream ActionChunkConditionedMinimalV1LVGDiT: reshape the action
+        # chunk to one row per latent frame, run the two MLP heads, and add to
+        # the timestep / AdaLN-LoRA streams *before* t_embedding_norm.
+        t_emb = t_emb.reshape(1, 1, D).expand(B, L, D)
+        if adaln_lora is not None:
+            adaln_lora = adaln_lora.reshape(1, 1, 3 * D).expand(B, L, 3 * D)
+
         if action is not None:
-            action_flat = rearrange(action, "b a d -> b (a d)")
-            action_emb_B_D = self.action_embedder_B_D(action_flat)
-            action_emb_B_3D = self.action_embedder_B_3D(action_flat)
+            A = self.config.num_action_per_latent_frame
+            assert action.shape[1] % A == 0, (
+                f"action length {action.shape[1]} must be a multiple of "
+                f"num_action_per_latent_frame {A}"
+            )
+            n_gen = action.shape[1] // A
+            assert n_gen <= L, (
+                f"action carries {n_gen} latent frames but the chunk holds {L}"
+            )
+            action = rearrange(action, "b (t a) d -> b t (a d)", a=A)
+            action_emb_B_D = self.action_embedder_B_D(action)  # [B, n_gen, D]
+            action_emb_B_3D = self.action_embedder_B_3D(action)  # [B, n_gen, 3D]
+            # The leading ``L - n_gen`` frames are conditional (AR step 0's
+            # image-anchored frame): they get the timestep embedding only, so
+            # pad the action contribution with zeros rather than feeding a zero
+            # action through the MLP (``MLP(0) != 0`` due to the biases).
+            num_cond = L - n_gen
+            if num_cond > 0:
+                pad_D = action_emb_B_D.new_zeros(B, num_cond, D)
+                action_emb_B_D = torch.cat([pad_D, action_emb_B_D], dim=1)
+                pad_3D = action_emb_B_3D.new_zeros(B, num_cond, 3 * D)
+                action_emb_B_3D = torch.cat([pad_3D, action_emb_B_3D], dim=1)
             t_emb = t_emb + action_emb_B_D
             if adaln_lora is not None:
                 adaln_lora = adaln_lora + action_emb_B_3D
 
         t_emb = self.t_embedding_norm(t_emb)
 
-        # Broadcast to the batch dim. ``Timesteps`` produces a scalar-style
-        # ``(model_channels,)`` embedding from a 0-d timestep, and the action
-        # MLP output is ``(B, model_channels)``; ``expand`` works for both.
-        B = x.shape[0]
-        if t_emb.ndim == 1:
-            t_emb = t_emb.unsqueeze(0)
-        t_emb = t_emb.expand(B, -1)
+        # Expand per-frame embeddings across each frame's spatial tokens
+        # (token layout is t-major: ``b (t h w) d``), giving per-token AdaLN
+        # modulation. With ``L == 1`` every token shares one embedding, so this
+        # reduces to the previous single-vector broadcast.
+        t_emb = t_emb.repeat_interleave(spatial, dim=1)  # [B, L*spatial, D]
         if adaln_lora is not None:
-            if adaln_lora.ndim == 1:
-                adaln_lora = adaln_lora.unsqueeze(0)
-            adaln_lora = adaln_lora.expand(B, -1)
+            adaln_lora = adaln_lora.repeat_interleave(spatial, dim=1)  # [B, L*spatial, 3D]
 
         # In non-eager mode the caller drives before_update/after_update outside
         # the (graph-captured) network forward.

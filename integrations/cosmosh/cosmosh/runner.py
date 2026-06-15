@@ -64,6 +64,7 @@ from loguru import logger
 
 from flashdreams.infra.decoder import DecoderConfig
 from flashdreams.infra.runner import Runner, RunnerConfig
+from cosmosh.encoder.action import ActionEncoderConfig
 from cosmosh.pipeline import CosmoshPipeline
 from cosmosh.transformer import (
     CosmosHTransformer,
@@ -72,16 +73,19 @@ from cosmosh.transformer import (
 from cosmosh.utils import load_cr1_text_embeddings, pad_actions, pixel_frame_to_neg1_pos1
 from flashdreams.recipes.wan.autoencoder.vae import WanVAEEncoderConfig
 
-# Wan2.1 VAE temporal / spatial compression ratios. Latent T per block =
-# 1 + N_GENERATED_PIXELS / TCR; with N_GENERATED_PIXELS = 12 -> T_lat = 4.
+# Wan2.1 VAE temporal / spatial compression ratios. Each generated latent
+# frame decodes to ``WAN_TCR`` pixel frames; the conditional frame decodes to 1.
 WAN_TCR = 4
 WAN_SCR = 8
 
-# One outer block produces this many pixel frames (1 conditional + 12 generated).
-PIXELS_PER_OUTER_BLOCK = 13
-
-# Generated-pixel-per-block actions consumed.
-ACTIONS_PER_OUTER_BLOCK = 12
+# Per-outer-block sizes are derived at runtime from the transformer's latent
+# frames per step (``_pT == len_t``) and the runner's ``steps_per_block``:
+#   generated latent frames/block = steps_per_block * len_t - 1   (the -1 is the
+#                                   single conditional frame at AR step 0)
+#   actions consumed/block        = (steps_per_block * len_t - 1) * A
+#   decoded pixel frames/block    = (steps_per_block * len_t - 1) * WAN_TCR
+# At the default len_t=1, steps_per_block=4 this is 3 latent frames -> 12 pixels,
+# matching the original fixed 12-action / 13-pixel (1 cond + 12 gen) block.
 
 
 @dataclass(kw_only=True)
@@ -117,8 +121,22 @@ class CosmoshRunnerConfig(RunnerConfig):
     against. Empty means absolute paths in the JSON."""
 
     total_blocks: int = 20
-    """Number of outer 12-frame blocks to attempt. The loop stops early
-    once the action stream is consumed."""
+    """Number of outer blocks to attempt. The loop stops early once the action
+    stream is consumed."""
+
+    len_t: int = 1
+    """Latent frames generated per feed-forward (`generate()`) step. Sets the
+    transformer's ``len_t`` (and the action encoder's ``latent_frames_per_step``)
+    before the pipeline is built. Each generated latent frame decodes to
+    ``WAN_TCR`` pixel frames. ``window_size_t`` must stay a whole multiple of
+    ``len_t``; the product ``steps_per_block * len_t`` must not exceed it."""
+
+    steps_per_block: int = 4
+    """Number of ``generate()`` calls per outer block. AR step 0 leads with the
+    conditional (image-anchored) frame, so a block generates
+    ``steps_per_block * len_t - 1`` latent frames and re-anchors on the last
+    decoded pixel frame. Default ``4`` with ``len_t=1`` reproduces the original
+    12-generated-pixel block."""
 
     start_frame_idx: int = 0
     """Default index of the input-video frame used as the conditional
@@ -176,6 +194,24 @@ class CosmoshRunner(Runner[CosmoshRunnerConfig, CosmoshPipeline]):
         assert isinstance(tcfg, CosmosHTransformerConfig)
         tcfg.height = new_h // WAN_SCR
         tcfg.width = new_w // WAN_SCR
+        # Latent frames generated per feed-forward step. Like the resolution,
+        # this is baked into RoPE tables + KV-cache geometry at ``setup()``, so
+        # it has to land on the config *before* the base ``Runner.__init__``
+        # builds the pipeline. Keep the action encoder's per-step frame count in
+        # lockstep — ``CosmoshPipeline.__init__`` asserts they match ``_pT``.
+        assert config.len_t >= 1, f"len_t must be >= 1, got {config.len_t}"
+        assert config.steps_per_block >= 1, (
+            f"steps_per_block must be >= 1, got {config.steps_per_block}"
+        )
+        assert config.steps_per_block * config.len_t >= 2, (
+            "steps_per_block * len_t must be >= 2 so each outer block generates "
+            f"at least one frame (got steps_per_block={config.steps_per_block}, "
+            f"len_t={config.len_t})."
+        )
+        tcfg.len_t = config.len_t
+        encoder_cfg = config.pipeline.encoder
+        assert isinstance(encoder_cfg, ActionEncoderConfig)
+        encoder_cfg.latent_frames_per_step = config.len_t
         # ``__post_init__`` derives ``_pT / _pH / _pW / _steady_ar_idx`` from
         # the latent dims and runs only once at dataclass construction (during
         # bundle build). The DiT reads those derived fields when ``setup()``
@@ -329,11 +365,15 @@ class CosmoshRunner(Runner[CosmoshRunnerConfig, CosmoshPipeline]):
         device = self.pipeline.device
         dtype = tcfg.dtype
         A = tcfg.network.num_action_per_latent_frame
-        assert ACTIONS_PER_OUTER_BLOCK % A == 0, (
-            f"ACTIONS_PER_OUTER_BLOCK={ACTIONS_PER_OUTER_BLOCK} must be divisible by "
-            f"num_action_per_latent_frame={A}."
-        )
-        inner_steps_per_block = 1 + ACTIONS_PER_OUTER_BLOCK // A  # 1 cond + 3 gen = 4
+        L = tcfg._pT  # latent frames generated per feed-forward step (== len_t)
+        S = cfg.steps_per_block  # generate() calls per outer block
+        inner_steps_per_block = S
+        # A block runs S steps producing S*L latent frames; AR step 0 leads with
+        # the conditional (image-anchored) frame, so it has S*L - 1 generated
+        # latent frames and consumes that many action rows times A.
+        gen_latent_per_block = S * L - 1
+        actions_per_block = gen_latent_per_block * A
+        gen_frames_per_block = gen_latent_per_block * WAN_TCR  # decoded pixels
 
         # The pipeline's latent dims drive the output pixel size; per-entry
         # ``resolution`` overrides (if present) must agree.
@@ -361,16 +401,19 @@ class CosmoshRunner(Runner[CosmoshRunnerConfig, CosmoshPipeline]):
         actions_np = np.load(input_action_path)
         actions_np = pad_actions(actions_np, target_dim=tcfg.network.action_dim)
 
-        ar_total = min(cfg.total_blocks, actions_np.shape[0] // ACTIONS_PER_OUTER_BLOCK)
+        ar_total = min(cfg.total_blocks, actions_np.shape[0] // actions_per_block)
         if ar_total <= 0:
             raise ValueError(
                 f"actions_np has {actions_np.shape[0]} entries; need at least "
-                f"{ACTIONS_PER_OUTER_BLOCK} for one outer block."
+                f"{actions_per_block} for one outer block "
+                f"(steps_per_block={S}, len_t={L})."
             )
         if self.is_rank_zero:
             logger.info(
                 f"Entry {input_video_path}: resolution {Ht}x{Wt}, "
-                f"{ar_total} outer blocks x {ACTIONS_PER_OUTER_BLOCK} actions, "
+                f"{ar_total} outer blocks x {S} steps x {L} latent frames/step "
+                f"({actions_per_block} actions/block, "
+                f"{gen_frames_per_block} pixels/block), "
                 f"{ar_total * inner_steps_per_block} inner AR steps."
             )
 
@@ -398,8 +441,8 @@ class CosmoshRunner(Runner[CosmoshRunnerConfig, CosmoshPipeline]):
 
             actions_slice = actions_np[
                 outer_idx
-                * ACTIONS_PER_OUTER_BLOCK : (outer_idx + 1)
-                * ACTIONS_PER_OUTER_BLOCK
+                * actions_per_block : (outer_idx + 1)
+                * actions_per_block
             ]
             actions_block = (
                 torch.from_numpy(actions_slice)
@@ -463,7 +506,7 @@ class CosmoshRunner(Runner[CosmoshRunnerConfig, CosmoshPipeline]):
         warmup_time = block_total[0] if block_total else 0.0
         steady_blocks_total = sum(block_total[1:])
         steady_blocks_count = max(0, len(block_total) - 1)
-        steady_frames = steady_blocks_count * ACTIONS_PER_OUTER_BLOCK
+        steady_frames = steady_blocks_count * gen_frames_per_block
         steady_fps = (
             steady_frames / steady_blocks_total if steady_blocks_total > 0 else 0.0
         )
@@ -577,7 +620,7 @@ class CosmoshRunner(Runner[CosmoshRunnerConfig, CosmoshPipeline]):
             "encode_time": t_encode_total,
             "generation_time": t_gen_total,
             "decode_time": t_decode_total,
-            "frames_generated": float(ar_total * ACTIONS_PER_OUTER_BLOCK),
+            "frames_generated": float(ar_total * gen_frames_per_block),
             "warmup_time": warmup_time,
             "steady_time": steady_blocks_total,
             "steady_frames": float(steady_frames),
