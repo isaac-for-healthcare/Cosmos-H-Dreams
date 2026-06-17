@@ -14,6 +14,9 @@ Schema (full)::
       resolution: [288, 512]                # or null for native
       fps: 10
       actions_per_chunk: 12                 # Must divide num_action_per_latent_frame
+      window_size_t: 11                     # KV-cache rolling window (latent frames); null → pipeline default
+      debug_action_npy: null                # Debug: replay this actions .npy,
+                                            # ignoring keyboard/VR (see CosmoshRuntimeConfig)
       # Per-scene fields (input_path / stats_path / cr1_embeddings_path /
       # start_frame_idx) can live here as a backwards-compat shorthand for a
       # single 'default' scene. When ``scenes:`` is present they should live
@@ -325,6 +328,10 @@ def build_runtime_config(
         fps=int(runtime.get("fps", defaults.fps)),
         actions_per_chunk=int(
             runtime.get("actions_per_chunk", defaults.actions_per_chunk)
+        ),
+        debug_action_npy=(runtime.get("debug_action_npy") or None),
+        window_size_t=(
+            int(runtime["window_size_t"]) if "window_size_t" in runtime else None
         ),
     )
 

@@ -28,17 +28,27 @@ def write_translate_ramp(
     num_frames: int,
     v_xyz: np.ndarray,
     slice_start: int,
+    start_pos: np.ndarray | None = None,
 ) -> None:
-    """Write a per-frame translate ramp ``(f+1) · v_xyz`` into ``chunk``.
+    """Write per-frame positions ``start_pos + (f+1) · v_xyz`` into ``chunk``.
+
+    ``start_pos`` is the arm's current normalised position at the start of
+    this chunk — carried forward from the previous outer call. When it is
+    non-zero and ``v_xyz`` is zero the function writes a constant
+    ``start_pos`` for every frame (arm holds position). When both are zero
+    the slice is left untouched (arm at the dataset-mean resting position).
 
     Shared between keyboard (where ``v_xyz`` comes from a key-derived sum)
-    and Quest (where it comes from ``dpos * translate_scale``). No-op for an
-    all-zero ``v_xyz`` so an idle frame doesn't touch the chunk.
+    and Quest (where it comes from ``dpos * translate_scale``).
     """
-    if not np.any(v_xyz):
+    if start_pos is None:
+        start_pos = np.zeros(3, dtype=np.float64)
+    if not np.any(v_xyz) and not np.any(start_pos):
         return
     for f in range(num_frames):
-        chunk[f, slice_start : slice_start + 3] = (f + 1) * v_xyz
+        chunk[f, slice_start : slice_start + 3] = (
+            start_pos + (f + 1) * v_xyz
+        ).astype(np.float32)
 
 
 def rotvec_to_matrix(omega: np.ndarray) -> np.ndarray:
