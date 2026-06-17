@@ -1,4 +1,4 @@
-# Keyboard server — CMR hysterectomy experiment 5 (unified runner naming).
+# Keyboard server — CMR hysterectomy experiment 6 (unified runner naming).
 #
 # Run with:
 #   uv run --package flash-cosmosh python -m cosmosh.webrtc.server \
