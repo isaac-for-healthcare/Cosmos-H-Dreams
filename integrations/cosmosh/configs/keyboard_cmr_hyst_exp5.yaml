@@ -1,0 +1,47 @@
+# Keyboard server — CMR prostatectomy experiment 2.
+# Switch live from the UI's "Scene:" dropdown.
+#
+# Run with:
+#   uv run --package flash-cosmosh python -m cosmosh.webrtc.server \
+#     --config integrations/cosmosh/configs/keyboard_cmr_prost_exp2.yaml
+
+runtime:
+  config_name: cosmosh-chunk3-vae-vae
+  compile_network: true
+  device: cuda:0
+  seed: 1
+  ckpt_path: checkpoints/cmr/hyst/model_ema_bf16_cmr_hyst_exp5_iter2600.pt
+  resolution: [288, 512]
+  fps: 30
+  window_size_t: 251
+  use_cuda_graph: false
+  actions_per_chunk: 12  # 4 / 8 / 12 / 16…; smaller = lower latency, lower fidelity
+
+# Light-switch contract: the model (config_name / ckpt_path / resolution /
+# actions_per_chunk) is shared across scenes — only the conditional input,
+# action stats, and CR1 embeddings change at switch time. First scene below
+# is the one the runtime boots into.
+scenes:
+  - name: cmr_hyst_exp5_003
+    input_path: sf_inference_data/cmr/frames/first_frame_000_vidx03690857_ep007470_b00001615.png
+    stats_path: sf_inference_data/cmr/stats_cosmos-28D-exp1.json
+    cr1_embeddings_path: sf_inference_data/cr1_empty_string_text_embeddings.pt
+  - name: cmr_hyst_exp5_001
+    input_path: sf_inference_data/cmr/frames/hyst/first_frame_001_vidx00024280_ep000239_b00001453.png
+    stats_path: sf_inference_data/cmr/stats_cosmos-28D-exp1.json
+    cr1_embeddings_path: sf_inference_data/cr1_empty_string_text_embeddings.pt
+  - name: cmr_hyst_exp5_002
+    input_path: sf_inference_data/cmr/frames/hyst/first_frame_003_vidx00729261_ep006328_b00001347.png
+    stats_path: sf_inference_data/cmr/stats_cosmos-28D-exp1.json
+    cr1_embeddings_path: sf_inference_data/cr1_empty_string_text_embeddings.pt
+
+
+keyboard:
+  translate_v_per_frame: 0.1   # σ/frame; 0.1 ≈ 2.3 mm/s on PSM1 at fps=10
+  gripper_v_per_chunk: 1.0     # σ/chunk while open/close key held
+  rotate_deg_per_frame: 1.0    # degrees/frame while a rotation key held
+  light_mode: false            # true = render only while input is held
+
+server:
+  host: 0.0.0.0
+  port: 8080

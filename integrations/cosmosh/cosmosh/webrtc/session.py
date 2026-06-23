@@ -4,6 +4,8 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,14 +30,77 @@ from cosmosh.webrtc.controls_quest import (
 )
 from cosmosh.webrtc.media import CosmoshVideoTrack
 from cosmosh.webrtc.utils import ACTION_DIM_NORMALISED
-from cosmosh.config import COSMOSH_CONFIG_BUILDERS
-from cosmosh.constants import AVAILABLE_COSMOSH_CHECKPOINT_PATHS
+from cosmosh.config import COSMOSH_RUNNERS
+from flashdreams.infra.config import derive_config
 
 LOGGER = logging.getLogger(__name__)
 
-# Wan2.1 VAE temporal / spatial compression. Mirrors run_cosmosh.py.
-WAN_TCR = 4
+# Wan2.1 VAE spatial compression ratio (pixel resolution -> latent grid).
 WAN_SCR = 8
+
+# ---------------------------------------------------------------------------
+# E2E frame-rate profiling
+# ---------------------------------------------------------------------------
+_PROFILE_FPS_ENV = "COSMOSH_PROFILE_FPS"
+_PROFILE_FPS_INTERVAL_S_ENV = "COSMOSH_PROFILE_FPS_INTERVAL_S"
+_PROFILE_LATENCY_ENV = "COSMOSH_PROFILE_LATENCY"
+
+
+def _fps_profile_enabled() -> bool:
+    return os.environ.get(_PROFILE_FPS_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _latency_profile_enabled() -> bool:
+    return os.environ.get(_PROFILE_LATENCY_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _fps_profile_interval_s() -> float:
+    raw = os.environ.get(_PROFILE_FPS_INTERVAL_S_ENV, "5").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return 5.0
+    return max(0.5, value)
+
+
+@dataclass(slots=True)
+class _ChunkFpsProfile:
+    """Per-session rolling-window FPS accumulator."""
+
+    window_start: float | None = None
+    frame_count: int = 0
+    chunk_count: int = 0
+
+
+def _fps_record_chunk(profile: _ChunkFpsProfile, num_frames: int) -> None:
+    """Accumulate one chunk and log FPS when the reporting window elapses."""
+    if not _fps_profile_enabled():
+        return
+    now = time.monotonic()
+    if profile.window_start is None:
+        profile.window_start = now
+    profile.frame_count += num_frames
+    profile.chunk_count += 1
+    window_s = now - profile.window_start
+    if window_s < _fps_profile_interval_s():
+        return
+    chunk_fps = profile.chunk_count / window_s if window_s > 1e-9 else 0.0
+    frame_fps = profile.frame_count / window_s if window_s > 1e-9 else 0.0
+    LOGGER.info(
+        "[profile] fps chunk_fps=%.2f frame_fps=%.2f samples=%d",
+        chunk_fps,
+        frame_fps,
+        profile.chunk_count,
+    )
+    profile.window_start = now
+    profile.frame_count = 0
+    profile.chunk_count = 0
+
+
+def _fps_reset_profile(profile: _ChunkFpsProfile) -> None:
+    profile.window_start = None
+    profile.frame_count = 0
+    profile.chunk_count = 0
 
 # Default outer block size: 1 conditional + 12 generated pixel frames
 # (= 4 latent frames). The 12 is overridable via
@@ -72,7 +137,7 @@ class Scene:
 
 @dataclass(slots=True)
 class CosmoshRuntimeConfig:
-    config_name: str = "lightvae_lighttae"
+    config_name: str = "cosmosh-lightvae-lighttae"
     compile_network: bool = True
     seed: int = 1
     device: str = "cuda:0"
@@ -84,6 +149,15 @@ class CosmoshRuntimeConfig:
     input_path: str = ""
     stats_path: str = ""
     start_frame_idx: int = 0
+    # Debug only: path to a recorded actions ``.npy`` ([T, >=20]). When set, the
+    # runtime IGNORES live keyboard / VR input and instead drives the model with
+    # successive ``actions_per_chunk``-row slices of this file — the same inputs
+    # the offline runner / replay use — so the browser shows the deterministic
+    # rollout. Only the first ``ACTION_DIM_NORMALISED`` dims are used; the rest
+    # are filled with the resting-neutral fill, exactly as the keyboard path
+    # does. Pair it with ``input_path`` = the matching episode video so the
+    # conditional first frame matches. ``None`` = normal live control.
+    debug_action_npy: str | None = None
     # If None, the first frame's native (H, W) is used.
     resolution: tuple[int, int] | None = None
     fps: int = 10
@@ -109,6 +183,11 @@ class CosmoshRuntimeConfig:
     # value raises ``CosmoshRuntimeError``. The model was trained with 12;
     # other values may produce degraded quality.
     actions_per_chunk: int = DEFAULT_ACTIONS_PER_OUTER_BLOCK
+    # KV-cache rolling window in latent frames. ``None`` keeps the pipeline
+    # config's default (``_WINDOW_SIZE_T = 11``). Must satisfy
+    # ``(sink_size_t + window_size_t) % len_t == 0``; validated by the
+    # transformer config's ``__post_init__`` at init time.
+    window_size_t: int | None = None
     # VR-only: per-arm rotation scale. ``omega = drot × rotate_scale`` per
     # arm. ``drot`` is per-browser-frame axis-angle (radians); browser
     # frames are ~90 Hz vs output frames at ``fps`` (typically 10), so
@@ -345,10 +424,7 @@ class CosmoshInferenceRuntime:
         self._device: torch.device | None = None
         self._dtype: torch.dtype | None = None
         self._pipeline: Any | None = None
-        self._encoder: Any | None = None
-        self._decoder: Any | None = None
         self._action_target_dim: int = 0
-        self._inner_steps_per_block: int = 0
         # Populated in _initialize_sync after validating against the model's
         # num_action_per_latent_frame. Exposed publicly for the render loop
         # so it can size its backpressure cap correctly.
@@ -377,6 +453,23 @@ class CosmoshInferenceRuntime:
         self._text_embeddings: torch.Tensor | None = None
         self._initial_cond_pixels: torch.Tensor | None = None
         self._cond_pixels: torch.Tensor | None = None
+
+        # Flat-AR persistent state: the pipeline cache (which owns the KV +
+        # decoder caches) is built on the first chunk of each rollout and
+        # cleared on reset / scene-switch so the next chunk re-anchors.
+        self._cache: Any | None = None
+        # Flat AR step counter across all chunks in the current rollout.
+        self._global_ar_idx: int = 0
+        # Tracked VR arm positions for the Quest path (keyboard positions are
+        # managed inside CosmoshActionIntegrator which resets on rebuild).
+        self._vr_psm1_pos: np.ndarray = np.zeros(3, dtype=np.float64)
+        self._vr_psm2_pos: np.ndarray = np.zeros(3, dtype=np.float64)
+
+        # Debug action-override stream (set when config.debug_action_npy is
+        # given): a ``[T, ACTION_DIM_NORMALISED]`` float32 array replayed in
+        # ``actions_per_chunk``-row slices instead of live keyboard / VR input.
+        self._debug_actions: np.ndarray | None = None
+        self._debug_cursor: int = 0
 
         self._closed = False
         self._step_lock = asyncio.Lock()
@@ -459,6 +552,11 @@ class CosmoshInferenceRuntime:
     @property
     def active_scene_name(self) -> str | None:
         return self._active_scene_name
+
+    @property
+    def debug_action_override(self) -> bool:
+        """Whether a recorded action stream is replacing live keyboard / VR input."""
+        return self._debug_actions is not None
 
     def set_active_scene_name(self, name: str | None) -> None:
         """Record the initial scene's name (called once at startup by the server)."""
@@ -559,6 +657,47 @@ class CosmoshInferenceRuntime:
                 raise CosmoshRuntimeError("Session is closed.")
             return await asyncio.to_thread(self._generate_one_chunk_vr_sync)
 
+    async def generate_one_chunk_debug(self) -> CosmoshStepResult | None:
+        """Render one chunk from the recorded debug action stream.
+
+        Returns ``None`` once the stream is exhausted. Serialised against the
+        keyboard / VR / reset paths via the step lock, same as the live paths.
+        """
+        if self._closed:
+            raise CosmoshRuntimeError("Session is closed.")
+        if self._pipeline is None:
+            raise CosmoshRuntimeError("Runtime is not initialized.")
+        async with self._step_lock:
+            if self._closed:
+                raise CosmoshRuntimeError("Session is closed.")
+            return await asyncio.to_thread(self._generate_one_chunk_debug_sync)
+
+    @torch.inference_mode()
+    def _generate_one_chunk_debug_sync(self) -> CosmoshStepResult | None:
+        """Slice the next actions from the debug stream and render.
+
+        Mirrors ``cosmosh.webrtc.replay`` exactly: the recorded actions go
+        straight into :meth:`_render_chunk_from_actions`, bypassing the keyboard
+        integrator — so any divergence from the live keyboard rollout isolates
+        to the integrator / action-computation path, not the GPU pipeline.
+
+        The cursor advances by the number of actions actually consumed by the
+        pipeline (not by ``actions_per_chunk``): for len_t > 1 AR step 0 needs
+        fewer actions than ``actions_per_chunk``, so advancing by the full
+        ``actions_per_chunk`` would silently skip recorded actions and feed
+        wrong inputs to every subsequent AR step.
+        """
+        assert self._debug_actions is not None, "debug action stream not loaded"
+
+        consumed = self._count_consumed_actions()
+        if consumed == 0 or self._debug_cursor + consumed > self._debug_actions.shape[0]:
+            return None  # stream exhausted
+
+        driven = self._debug_actions[self._debug_cursor : self._debug_cursor + consumed]
+        block = self._make_action_block(driven, consumed)
+        self._debug_cursor += consumed
+        return self._render_chunk_from_actions(block)
+
     def _initialize_sync(self) -> None:
         if self._pipeline is not None:
             return
@@ -588,8 +727,8 @@ class CosmoshInferenceRuntime:
             raise FileNotFoundError(
                 f"Action stats file not found: {self.config.stats_path}"
             )
-        if self.config.config_name not in COSMOSH_CONFIG_BUILDERS:
-            supported = ", ".join(sorted(COSMOSH_CONFIG_BUILDERS))
+        if self.config.config_name not in COSMOSH_RUNNERS:
+            supported = ", ".join(sorted(COSMOSH_RUNNERS))
             raise ValueError(
                 f"Unknown config_name={self.config.config_name!r}. Supported: {supported}"
             )
@@ -616,18 +755,33 @@ class CosmoshInferenceRuntime:
                 f"compression {WAN_SCR}."
             )
 
-        ckpt_path = self.config.ckpt_path or AVAILABLE_COSMOSH_CHECKPOINT_PATHS["default"]
-        builder = COSMOSH_CONFIG_BUILDERS[self.config.config_name]
-        bundle = builder(
-            seed=self.config.seed,
-            checkpoint_path=ckpt_path,
-            compile_network=self.config.compile_network,
-            height=ht // WAN_SCR,
-            width=wt // WAN_SCR,
+        runner_cfg = COSMOSH_RUNNERS[self.config.config_name]
+        transformer_overrides: dict[str, Any] = {
+            "height": ht // WAN_SCR,
+            "width": wt // WAN_SCR,
+            "compile_network": self.config.compile_network,
+        }
+        if self.config.window_size_t is not None:
+            transformer_overrides["window_size_t"] = self.config.window_size_t
+        if self.config.ckpt_path:
+            transformer_overrides["checkpoint_path"] = self.config.ckpt_path
+        pipeline_cfg = derive_config(
+            runner_cfg.pipeline,
+            diffusion_model=dict(
+                seed=self.config.seed,
+                transformer=transformer_overrides,
+            ),
         )
-        self._pipeline = bundle.pipeline.setup().to(self._device).eval()
-        self._encoder = bundle.vae_encoder.setup().to(self._device).eval()
-        self._decoder = bundle.vae_decoder.setup().to(self._device).eval()
+        # derive_config mutates fields via setattr without calling __post_init__,
+        # so _pT/_pH/_pW would reflect the literal's defaults rather than the
+        # overridden height/width. Re-run it to refresh those derived fields.
+        pipeline_cfg.diffusion_model.transformer.__post_init__()
+        # Wire per-step CUDA-event profiling (encode/diffuse/decode/finalize)
+        # when the env var is set. Adds one torch.cuda.synchronize() per step.
+        pipeline_cfg.enable_sync_and_profile = _latency_profile_enabled()
+        # The pipeline owns the VAE first-frame encoder + decoder, so there is
+        # no separate encoder/decoder to set up here.
+        self._pipeline = pipeline_cfg.setup().to(self._device).eval()
 
         transformer = self._pipeline.diffusion_model.transformer
         cfg = transformer.config
@@ -642,7 +796,6 @@ class CosmoshInferenceRuntime:
                 f"{3*actions_per_latent}, ...)."
             )
         self.actions_per_chunk = requested
-        self._inner_steps_per_block = 1 + requested // actions_per_latent
         self._action_target_dim = int(cfg.network.action_dim)
 
         text_embeddings_cpu = load_cr1_text_embeddings(self.config.cr1_embeddings_path)
@@ -671,16 +824,41 @@ class CosmoshInferenceRuntime:
         self._initial_cond_pixels = cond_pixels.clone()
         self._cond_pixels = cond_pixels
 
+        # Debug action-override: load the recorded .npy and keep its driven
+        # prefix; the render loop replays it instead of live keyboard / VR.
+        if self.config.debug_action_npy:
+            if not Path(self.config.debug_action_npy).exists():
+                raise FileNotFoundError(
+                    f"debug_action_npy not found: {self.config.debug_action_npy}"
+                )
+            debug_actions = np.load(self.config.debug_action_npy)
+            if debug_actions.ndim != 2 or debug_actions.shape[1] < ACTION_DIM_NORMALISED:
+                raise CosmoshRuntimeError(
+                    "debug_action_npy must be [T, >="
+                    f"{ACTION_DIM_NORMALISED}]; got shape {debug_actions.shape}."
+                )
+            self._debug_actions = debug_actions[:, :ACTION_DIM_NORMALISED].astype(
+                np.float32
+            )
+            LOGGER.warning(
+                "DEBUG action override active: replaying %d rows from %s "
+                "(%d chunks of %d) — live keyboard / VR input is IGNORED.",
+                self._debug_actions.shape[0],
+                self.config.debug_action_npy,
+                self._debug_actions.shape[0] // self.actions_per_chunk,
+                self.actions_per_chunk,
+            )
+
         self._reset_rollout_sync()
 
         LOGGER.info(
             "Cosmosh runtime initialized: config_name=%s resolution=%dx%d "
-            "action_dim=%d inner_steps=%d",
+            "action_dim=%d actions_per_chunk=%d",
             self.config.config_name,
             ht,
             wt,
             self._action_target_dim,
-            self._inner_steps_per_block,
+            self.actions_per_chunk,
         )
         LOGGER.info(
             "Gripper endpoints from %s: psm1=[closed=%.3f, open=%.3f] "
@@ -703,6 +881,13 @@ class CosmoshInferenceRuntime:
         self.action_integrator = self._build_integrator()
         self.autoregressive_index = 0
         self._cond_pixels = self._initial_cond_pixels.clone()
+        # Drop the flat-AR cache; the next chunk re-encodes and reinitializes.
+        self._cache = None
+        self._global_ar_idx = 0
+        self._vr_psm1_pos = np.zeros(3, dtype=np.float64)
+        self._vr_psm2_pos = np.zeros(3, dtype=np.float64)
+        # Rewind the debug action stream so a reset replays from the start.
+        self._debug_cursor = 0
 
     def _set_scene_sync(self, scene: Scene) -> None:
         if self._pipeline is None:
@@ -778,22 +963,54 @@ class CosmoshInferenceRuntime:
 
     def _close_sync(self) -> None:
         pipeline = self._pipeline
-        encoder = self._encoder
-        decoder = self._decoder
+        cache = self._cache
         self._pipeline = None
-        self._encoder = None
-        self._decoder = None
+        self._cache = None
         self._text_embeddings = None
         self._initial_cond_pixels = None
         self._cond_pixels = None
 
-        for obj in (pipeline, encoder, decoder):
+        for obj in (pipeline, cache):
             if obj is not None:
                 del obj
 
         if self._device is not None and self._device.type == "cuda":
             torch.cuda.synchronize(device=self._device)
             torch.cuda.empty_cache()
+
+    def _count_consumed_actions(self) -> int:
+        """How many actions the next :meth:`_render_chunk_from_actions` call will consume.
+
+        Simulates the inner while-loop without touching pipeline state so the
+        caller can size the action array to exactly what will be read.  For
+        configs where AR step 0 needs fewer actions than ``actions_per_chunk``
+        (e.g. chunk3: step 0 = 8, step ≥1 = 12) this avoids generating
+        ``actions_per_chunk - consumed`` action frames that the pipeline will
+        never see.
+        """
+        assert self._pipeline is not None
+        ar_idx = self._global_ar_idx
+        consumed = 0
+        while True:
+            need = self._pipeline.get_num_actions(ar_idx)
+            if consumed + need > self.actions_per_chunk:
+                break
+            consumed += need
+            ar_idx += 1
+        return consumed
+
+    def _make_action_block(self, driven: np.ndarray, consumed: int) -> np.ndarray:
+        """Return an ``(actions_per_chunk, D)`` block for :meth:`_render_chunk_from_actions`.
+
+        ``driven`` has shape ``(consumed, D_driven)`` and covers exactly the
+        rows the pipeline will read.  Rows beyond ``consumed`` are zero-padded
+        (they are never accessed by the pipeline).
+        """
+        if consumed == self.actions_per_chunk and driven.shape[0] == self.actions_per_chunk:
+            return driven
+        block = np.zeros((self.actions_per_chunk, driven.shape[1]), dtype=np.float32)
+        block[:consumed] = driven
+        return block
 
     @torch.inference_mode()
     def _generate_one_chunk_sync(self) -> CosmoshStepResult:
@@ -810,19 +1027,24 @@ class CosmoshInferenceRuntime:
         psm1_rotation = self.keyboard_state.psm1_rotation_keys()
         psm2_translate = self.keyboard_state.psm2_translate_keys()
         psm2_rotation = self.keyboard_state.psm2_rotation_keys()
-        actions_np = self.action_integrator.next_action_chunk(
-            num_frames=self.actions_per_chunk,
+
+        consumed = self._count_consumed_actions()
+        actions_driven = self.action_integrator.next_action_chunk(
+            num_frames=consumed,
             psm1_translate_keys=psm1_translate,
             psm1_rotation_keys=psm1_rotation,
             psm2_translate_keys=psm2_translate,
             psm2_rotation_keys=psm2_rotation,
         )
+        actions_np = self._make_action_block(actions_driven, consumed)
 
         LOGGER.debug(
-            "Rendering chunk=%s "
+            "Rendering chunk=%s consumed=%d/%d "
             "psm1_t=%s psm1_r=%s psm1_g=%.3f "
             "psm2_t=%s psm2_r=%s psm2_g=%.3f",
             self.autoregressive_index,
+            consumed,
+            self.actions_per_chunk,
             sorted(psm1_translate),
             sorted(psm1_rotation),
             self.action_integrator.latched_gripper_psm1,
@@ -849,9 +1071,14 @@ class CosmoshInferenceRuntime:
         a second copy through the runtime.
         """
         state = self.vr_state
-        actions_np = compute_action_chunk(
+        consumed = self._count_consumed_actions()
+        # psm1_pos / psm2_pos are mutated in place by compute_action_chunk so
+        # the next outer block continues from the arm's current position.
+        actions_driven = compute_action_chunk(
             state,
-            num_frames=self.actions_per_chunk,
+            num_frames=consumed,
+            psm1_pos=self._vr_psm1_pos,
+            psm2_pos=self._vr_psm2_pos,
             translate_scale=self.config.translate_scale,
             rotate_scale=self.config.rotate_scale,
             psm1_rot6d_mean=self.action_integrator.psm1_rot6d_mean,
@@ -865,12 +1092,15 @@ class CosmoshInferenceRuntime:
             psm2_gripper_open=self.action_integrator.gripper_open_psm2,
             psm2_gripper_closed=self.action_integrator.gripper_closed_psm2,
         )
+        actions_np = self._make_action_block(actions_driven, consumed)
 
         LOGGER.debug(
-            "Rendering VR chunk=%s "
+            "Rendering VR chunk=%s consumed=%d/%d "
             "right(dpos=%s drot=%s trigger=%.3f) "
             "left(dpos=%s drot=%s trigger=%.3f)",
             self.autoregressive_index,
+            consumed,
+            self.actions_per_chunk,
             state.right.dpos.tolist(),
             state.right.drot.tolist(),
             state.right.trigger,
@@ -884,18 +1114,22 @@ class CosmoshInferenceRuntime:
     def _render_chunk_from_actions(
         self, actions_np: np.ndarray
     ) -> CosmoshStepResult:
-        """Shared encoder + diffusion + decoder body.
+        """Shared flat-AR body for the keyboard and VR paths.
 
         Keyboard and VR paths differ only in how they compute ``actions_np``;
-        from here it's identical work — pad to ``action_target_dim``, run the
-        cache through ``inner_steps_per_block`` AR steps, decode, re-anchor
-        on the last pixel frame, return the 12 generated frames in
-        ``[B=1, C=3, T=12, H, W]`` layout on CPU.
+        from here it's identical work — pad to ``action_target_dim``, then spend
+        this chunk's ``actions_per_chunk`` actions across as many flat-AR
+        ``pipeline.generate`` steps as they cover. The pipeline owns the VAE
+        first-frame encoder + decoder, so each ``generate`` call returns decoded
+        pixels; this method just slices per-step action chunks and concatenates
+        the results into ``[B=1, C=3, T, H, W]`` on CPU.
+
+        Chunk 0 (``self._cache is None``) builds the per-rollout cache, which
+        encodes the conditional first frame and seeds the KV + decoder caches.
+        Later chunks reuse the live cache and continue the flat AR index.
         """
         if (
             self._pipeline is None
-            or self._encoder is None
-            or self._decoder is None
             or self._text_embeddings is None
             or self._cond_pixels is None
             or self._device is None
@@ -905,8 +1139,6 @@ class CosmoshInferenceRuntime:
 
         assert actions_np.shape == (self.actions_per_chunk, ACTION_DIM_NORMALISED)
         if self._action_neutral_row is not None:
-            # Fill the dims the integrator doesn't drive (energy / thumbstick /
-            # buttons for CMR) with their resting value instead of the raw mean.
             actions_np = _fill_to_action_dim(actions_np, self._action_neutral_row)
         else:
             actions_np = pad_actions(actions_np, target_dim=self._action_target_dim)
@@ -916,37 +1148,56 @@ class CosmoshInferenceRuntime:
             .unsqueeze(0)
         )  # [1, actions_per_chunk, action_dim]
 
-        image_embeddings = self._encoder(input=self._cond_pixels)
+        if self._cache is None:
+            # The pipeline owns the VAE first-frame encoder + decoder:
+            # ``initialize_cache`` encodes the conditional first frame internally
+            # and seeds the KV + decoder caches.
+            if _latency_profile_enabled() and self._device is not None and self._device.type == "cuda":
+                torch.cuda.synchronize(self._device)
+            _t0_init = time.perf_counter() if _latency_profile_enabled() else 0.0
+            self._cache = self._pipeline.initialize_cache(
+                text_embeddings=self._text_embeddings,
+                image=self._cond_pixels,
+            )
+            if _latency_profile_enabled():
+                if self._device is not None and self._device.type == "cuda":
+                    torch.cuda.synchronize(self._device)
+                LOGGER.info(
+                    "[profile] latency initialize_cache %.2f ms",
+                    (time.perf_counter() - _t0_init) * 1000.0,
+                )
 
-        cache = self._pipeline.initialize_cache(
-            text_embeddings=self._text_embeddings,
-            image_embeddings=image_embeddings,
-            actions=actions_block,
-        )
+        # Spend this chunk's action budget across as many flat-AR steps as it
+        # covers, slicing each step's chunk via the pipeline's action sizing.
+        # ``generate`` returns decoded pixels ``[1, T_pix, 3, H, W]``.
+        pixel_frames: list[torch.Tensor] = []
+        local_offset = 0
+        while True:
+            ar_idx = self._global_ar_idx
+            need = self._pipeline.get_num_actions(ar_idx)
+            if local_offset + need > self.actions_per_chunk:
+                break
+            chunk = (
+                actions_block[:, local_offset : local_offset + need]
+                if need > 0
+                else None
+            )
+            pixels = self._pipeline.generate(ar_idx, self._cache, actions=chunk)
+            pixels = pixels.clamp(min=-1.0, max=1.0)
+            self._pipeline.finalize(ar_idx, self._cache)
+            local_offset += need
+            self._global_ar_idx += 1
+            # AR step 0's first decoded frame is the VAE reconstruction of the
+            # conditional latent (already shown as the initial anchor); drop it.
+            pixel_frames.append(pixels[:, 1:] if ar_idx == 0 else pixels)
 
-        latent_frames: list[torch.Tensor] = []
-        for ar_idx in range(self._inner_steps_per_block):
-            out_5d = self._pipeline.generate(ar_idx, cache, input=True)
-            latent_frames.append(out_5d)
-            if ar_idx < self._inner_steps_per_block - 1:
-                self._pipeline.finalize(ar_idx, cache)
-
-        block_latent = torch.cat(latent_frames, dim=1)
-        block_pixels = self._decoder(input=block_latent).clamp(min=-1.0, max=1.0)
-        # block_pixels layout: [1, T_pix, 3, H, W]; T_pix = 13 (1 cond + 12 gen).
-
-        # Re-anchor on the last frame for the next outer block.
-        self._cond_pixels = block_pixels[:, -1:, :, :, :]
-
-        # Hand the generated frames to the video track in [1, 3, T, H, W],
-        # where T = self.actions_per_chunk.
-        generated_b3thw = (
-            block_pixels[:, 1:].permute(0, 2, 1, 3, 4).contiguous()
-        )
+        # [1, T_pix, 3, H, W] -> [1, 3, T_pix, H, W] for the video track.
+        block_pixels = torch.cat(pixel_frames, dim=1)
+        generated_b3thw = block_pixels.permute(0, 2, 1, 3, 4).contiguous()
 
         result = CosmoshStepResult(
             chunk_index=self.autoregressive_index,
-            num_frames=self.actions_per_chunk,
+            num_frames=generated_b3thw.shape[2],
             video_chunk=generated_b3thw.detach().cpu(),
         )
         self.autoregressive_index += 1
@@ -987,6 +1238,7 @@ class _ManagedCosmoshSession:
     # (default), the loop runs continuously after the first user action.
     light_mode: bool = False
     closed: bool = False
+    fps_profile: _ChunkFpsProfile = field(default_factory=_ChunkFpsProfile)
 
     async def close(self) -> None:
         if self.closed:
@@ -1266,6 +1518,7 @@ class CosmoshWebRTCSessionManager:
             async with managed_session.render_lock:
                 managed_session.pending_actions.clear()
                 await managed_session.runtime.reset()
+                _fps_reset_profile(managed_session.fps_profile)
                 dropped = managed_session.video_track.drain_pending()
                 # Re-arm the input gate so the render loop pauses on its
                 # next iteration, then push the conditional anchor frame so
@@ -1274,6 +1527,10 @@ class CosmoshWebRTCSessionManager:
                 managed_session.first_action_event.clear()
                 initial_chunk = managed_session.runtime.initial_frame_chunk()
                 await managed_session.video_track.enqueue_chunk(initial_chunk)
+                # Debug-override: ``runtime.reset()`` rewound the action cursor,
+                # so re-arm the loop to replay the recorded stream from the top.
+                if managed_session.runtime.debug_action_override:
+                    managed_session.first_action_event.set()
         except Exception as exc:
             LOGGER.exception("Cosmosh runtime reset failed.")
             self._send_json(channel, {"type": "error", "message": str(exc)})
@@ -1364,6 +1621,13 @@ class CosmoshWebRTCSessionManager:
             except Exception:
                 LOGGER.exception("Failed to enqueue initial conditional frame.")
 
+            # Debug action-override: replay a recorded .npy continuously,
+            # ignoring keyboard input. Lets the browser show the same
+            # deterministic rollout the runner / replay produce.
+            if managed_session.runtime.debug_action_override:
+                await self._render_loop_debug(managed_session=managed_session)
+                return
+
             while not managed_session.closed:
                 # Pause until the next user action. Set on action append,
                 # cleared on reset.
@@ -1398,6 +1662,8 @@ class CosmoshWebRTCSessionManager:
                     self._send_json(channel, {"type": "error", "message": str(exc)})
                     break
 
+                _fps_record_chunk(managed_session.fps_profile, result.num_frames)
+
                 # Light mode: idle the loop until the next user action when
                 # there's nothing live to render. Continuous mode leaves the
                 # event set so the next iteration's ``await`` returns
@@ -1430,6 +1696,86 @@ class CosmoshWebRTCSessionManager:
                         "enqueued_frames": enqueued,
                     },
                 )
+        except asyncio.CancelledError:
+            return
+
+    async def _render_loop_debug(
+        self, *, managed_session: _ManagedCosmoshSession
+    ) -> None:
+        """Render loop for debug action-override mode.
+
+        Plays the recorded stream back-to-back without waiting on keyboard
+        input, applying the same backpressure cap as the live loop. When the
+        stream is exhausted it idles on ``first_action_event`` instead of
+        exiting; a ``reset`` datachannel message rewinds the action cursor and
+        re-arms the event (see :meth:`_handle_reset`), replaying from the top.
+        The loop is armed immediately so the first play-through needs no reset.
+        """
+        channel = managed_session.control_channel
+        try:
+            # Arm immediately so playback starts without a keypress.
+            managed_session.first_action_event.set()
+            while not managed_session.closed:
+                # Wait for the go / restart signal (set here, re-set by reset).
+                await managed_session.first_action_event.wait()
+                if managed_session.closed:
+                    break
+
+                exhausted = False
+                while not managed_session.closed:
+                    # Backpressure: don't run ahead of playback by the cap.
+                    while (
+                        not managed_session.closed
+                        and managed_session.video_track.qsize() >= _MAX_BUFFERED_FRAMES
+                    ):
+                        await asyncio.sleep(_BACKPRESSURE_POLL_S)
+                    if managed_session.closed:
+                        break
+
+                    try:
+                        async with managed_session.render_lock:
+                            if managed_session.closed:
+                                break
+                            result = (
+                                await managed_session.runtime.generate_one_chunk_debug()
+                            )
+                            if result is None:
+                                exhausted = True
+                                break
+                            enqueued = await managed_session.video_track.enqueue_chunk(
+                                result.video_chunk
+                            )
+                    except Exception as exc:
+                        LOGGER.exception("Debug render loop chunk failed.")
+                        self._send_json(channel, {"type": "error", "message": str(exc)})
+                        return
+
+                    _fps_record_chunk(managed_session.fps_profile, result.num_frames)
+
+                    LOGGER.debug(
+                        "Debug-rendered chunk=%s num_frames=%s enqueued=%s qsize=%s",
+                        result.chunk_index,
+                        result.num_frames,
+                        enqueued,
+                        managed_session.video_track.qsize(),
+                    )
+                    self._send_json(
+                        channel,
+                        {
+                            "type": "chunk_done",
+                            "chunk_index": result.chunk_index,
+                            "num_frames": result.num_frames,
+                            "enqueued_frames": enqueued,
+                        },
+                    )
+
+                if exhausted and not managed_session.closed:
+                    # Idle until a ``reset`` re-arms the event to replay.
+                    managed_session.first_action_event.clear()
+                    LOGGER.info(
+                        "Debug action stream exhausted; send 'reset' to replay."
+                    )
+                    self._send_json(channel, {"type": "debug_stream_end"})
         except asyncio.CancelledError:
             return
 

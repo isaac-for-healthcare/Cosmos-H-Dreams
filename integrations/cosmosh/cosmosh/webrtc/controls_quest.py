@@ -206,6 +206,7 @@ def _write_arm(
     *,
     arm: VRArmInput,
     num_frames: int,
+    start_pos: np.ndarray | None = None,
     translate_scale: np.ndarray,
     rotate_scale: float,
     translate_slice_start: int,
@@ -219,20 +220,26 @@ def _write_arm(
 ) -> None:
     """Write one arm's (translate + rotation + gripper) slice into ``chunk``.
 
-    Mirrors what the PSM1-only earlier version did but parameterised by the
-    arm's slice starts and gripper endpoints. Rotation is opt-in (skipped
-    when ``rotate_scale == 0`` or any rot6d stat is ``None``).
+    ``start_pos`` is the arm's tracked position in normalised action space
+    (shape ``[3]``). When provided it is mutated in place to reflect the arm's
+    position at the end of this chunk, so the caller can pass it again on the
+    next call to maintain continuity. Defaults to zeros (arm at rest) when
+    ``None``.
 
     ``translate_scale`` is a length-3 float64 vec applied **element-wise to
     play-space dpos** *before* the camera-frame remap — so caller-facing
     [x, y, z] correspond to the user's physical hand axes, not the
     camera-frame action axes.
     """
+    if start_pos is None:
+        start_pos = np.zeros(3, dtype=np.float64)
     scaled_dpos = arm.dpos * translate_scale
-    v_xyz = _quest_to_camera_axes(scaled_dpos).astype(np.float32)
+    v_xyz = _quest_to_camera_axes(scaled_dpos).astype(np.float64)
     write_translate_ramp(
-        chunk, num_frames=num_frames, v_xyz=v_xyz, slice_start=translate_slice_start
+        chunk, num_frames=num_frames, v_xyz=v_xyz, slice_start=translate_slice_start,
+        start_pos=start_pos.copy(),
     )
+    start_pos[:] += num_frames * v_xyz
 
     if (
         rotate_scale > 0.0
@@ -259,6 +266,8 @@ def compute_action_chunk(
     state: VRControllerState,
     *,
     num_frames: int = 12,
+    psm1_pos: np.ndarray | None = None,
+    psm2_pos: np.ndarray | None = None,
     translate_scale: Any,
     rotate_scale: Any = 0.0,
     psm1_rot6d_mean: np.ndarray | None = None,
@@ -311,6 +320,7 @@ def compute_action_chunk(
         chunk,
         arm=state.right,
         num_frames=num_frames,
+        start_pos=psm1_pos,
         translate_scale=right_translate,
         rotate_scale=right_rotate,
         translate_slice_start=_PSM1_TRANSLATE_SLICE_START,
@@ -326,6 +336,7 @@ def compute_action_chunk(
         chunk,
         arm=state.left,
         num_frames=num_frames,
+        start_pos=psm2_pos,
         translate_scale=left_translate,
         rotate_scale=left_rotate,
         translate_slice_start=_PSM2_TRANSLATE_SLICE_START,

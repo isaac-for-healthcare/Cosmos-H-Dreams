@@ -349,6 +349,12 @@ class CosmoshActionIntegrator:
     # rot6d slices regardless of the supplied stats.
     _psm1_identity_rot6d_norm: np.ndarray = field(init=False)
     _psm2_identity_rot6d_norm: np.ndarray = field(init=False)
+    # Tracked arm positions in normalised action space. Updated each chunk so
+    # key-release writes the last position instead of zeros (which the model
+    # interprets as "arm at dataset-mean position" and generates a visual snap
+    # back to the initial frame).
+    _psm1_pos: np.ndarray = field(init=False)
+    _psm2_pos: np.ndarray = field(init=False)
 
     def __post_init__(self) -> None:
         for label, arr in (
@@ -374,6 +380,8 @@ class CosmoshActionIntegrator:
         self._psm2_identity_rot6d_norm = (
             IDENTITY_ROT6D - self.psm2_rot6d_mean
         ) / self.psm2_rot6d_std
+        self._psm1_pos = np.zeros(3, dtype=np.float64)
+        self._psm2_pos = np.zeros(3, dtype=np.float64)
 
     def step_psm1_gripper(self, direction: int) -> None:
         """Apply one chunk's worth of PSM1 gripper motion in ``direction``."""
@@ -421,6 +429,7 @@ class CosmoshActionIntegrator:
             keys=psm1_translate_keys,
             mapping=_PSM1_TRANSLATE_KEY_TO_DIM_AND_SIGN,
             slice_start=0,
+            pos=self._psm1_pos,
         )
         self._write_translate(
             chunk,
@@ -428,6 +437,7 @@ class CosmoshActionIntegrator:
             keys=psm2_translate_keys,
             mapping=_PSM2_TRANSLATE_KEY_TO_DIM_AND_SIGN,
             slice_start=10,
+            pos=self._psm2_pos,
         )
 
         self._write_rotation(
@@ -463,16 +473,24 @@ class CosmoshActionIntegrator:
         keys: frozenset[str],
         mapping: dict[str, tuple[int, float]],
         slice_start: int,
+        pos: np.ndarray,
     ) -> None:
-        v_xyz = np.zeros(3, dtype=np.float32)
+        """Write translate slice and update tracked position in place.
+
+        ``pos`` is mutated: after the call it holds the arm position at the
+        end of this chunk so the next chunk can start from there.
+        """
+        v_xyz = np.zeros(3, dtype=np.float64)
         for key in keys:
             if key not in mapping:
                 continue
             dim, sign = mapping[key]
             v_xyz[dim] += sign * self.translate_v_per_frame
         write_translate_ramp(
-            chunk, num_frames=num_frames, v_xyz=v_xyz, slice_start=slice_start
+            chunk, num_frames=num_frames, v_xyz=v_xyz, slice_start=slice_start,
+            start_pos=pos.copy(),
         )
+        pos[:] += num_frames * v_xyz
 
     def _write_rotation(
         self,

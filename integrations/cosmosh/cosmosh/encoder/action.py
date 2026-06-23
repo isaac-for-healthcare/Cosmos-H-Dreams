@@ -15,25 +15,30 @@
 
 """Per-AR-step action encoder for CosmosH.
 
-The encoder is stateless w.r.t. learned parameters: the full action
-trajectory for the rollout is stashed on the per-rollout cache at
-``initialize_autoregressive_cache``.
+The action chunk for each AR step is supplied per ``generate()`` call (the
+omnidreams per-AR-step control pattern: actions are to CosmosH what the HDMap
+is to Omnidreams). The encoder is a near-passthrough that validates the chunk
+length against the step's generated-frame count and forwards it to the network.
 
 Slicing semantics match the upstream
 ``ActionVideo2WorldModelTrigflowSelfForcingDMD2.generate_streaming_video``
 loop:
 
 - ``ar_idx == 0`` is a **conditional prefill** step (the first frame's VAE
-  latent seeds the K/V cache at zero noise). The reference passes
-  ``action=None`` here so the action MLPs are skipped — there is no
-  motion to drive yet. ``forward`` returns ``None``.
-- ``ar_idx >= 1`` is a **generation** step. The reference uses
-  ``action[(t_idx - start_idx) * A : (t_idx - start_idx + 1) * A]`` with
-  ``start_idx == 1``; we mirror it as ``actions[(ar_idx - 1) * A : ar_idx * A]``.
+  latent seeds the K/V cache at zero noise). With ``latent_frames_per_step == 1``
+  it drives no generated frame, so the caller passes ``input=None`` and the
+  action MLPs are skipped (``forward`` returns ``None``).
+- ``ar_idx >= 1`` is a **generation** step driving ``latent_frames_per_step``
+  latent frames, so the caller passes ``latent_frames_per_step * A`` actions.
 
-The action MLPs (``action_embedder_B_D`` / ``B_3D``) live inside the
-network so the upstream checkpoint loads with no key remapping; this
-encoder only handles slicing.
+When ``latent_frames_per_step > 1`` AR step 0 also generates
+``latent_frames_per_step - 1`` frames (the conditional frame leads), so its
+chunk carries ``(L - 1) * A`` actions. Use
+:meth:`CosmoshPipeline.get_num_actions` to size each step's chunk.
+
+The action MLPs (``action_embedder_B_D`` / ``B_3D``) live inside the network
+so the upstream checkpoint loads with no key remapping; this encoder only
+forwards the per-step slice.
 """
 
 from __future__ import annotations
@@ -47,14 +52,21 @@ from flashdreams.infra.encoder import EncoderConfig, StreamingEncoder, Streaming
 
 @dataclass(kw_only=True)
 class ActionEncoderCache(StreamingEncoderCache):
-    """Per-rollout cache holding the full action trajectory."""
+    """Per-rollout action-encoder cache.
 
-    actions: Tensor
-    """Full-trajectory actions, shape ``[B, T_actions, action_dim]``.
-    ``T_actions`` should be at least ``num_ar_steps * num_action_per_latent_frame``."""
+    Stateless across AR steps now that actions flow per ``generate()`` call;
+    it only carries the per-step sizing knobs so :meth:`ActionEncoder.forward`
+    can validate the chunk length.
+    """
 
     num_action_per_latent_frame: int
-    """Number of raw actions consumed per AR step (= VAE temporal compression)."""
+    """Number of raw actions consumed per generated latent frame (= VAE temporal
+    compression)."""
+
+    latent_frames_per_step: int
+    """Latent frames generated per AR step (``= transformer _pT``). AR step 0
+    leads with the conditional (image-anchored) frame so it drives
+    ``latent_frames_per_step - 1`` frames; later steps drive all of them."""
 
 
 @dataclass(kw_only=True)
@@ -64,44 +76,49 @@ class ActionEncoderConfig(EncoderConfig):
     _target: type["ActionEncoder"] = field(default_factory=lambda: ActionEncoder)
 
     num_action_per_latent_frame: int = 4
-    """Default number of raw actions per AR step. Pinned to the Wan2.1 VAE
-    temporal compression ratio."""
+    """Default number of raw actions per generated latent frame. Pinned to the
+    Wan2.1 VAE temporal compression ratio."""
+
+    latent_frames_per_step: int = 1
+    """Latent frames generated per AR step (``= transformer _pT``). Must match
+    the transformer's ``len_t``; validated in ``CosmoshPipeline.__init__``."""
+
+
+def num_generated_frames(autoregressive_index: int, latent_frames_per_step: int) -> int:
+    """Generated latent frames at ``autoregressive_index``.
+
+    AR step 0 leads with the conditional (image-anchored) frame, so it drives
+    ``latent_frames_per_step - 1`` frames; every later step drives all
+    ``latent_frames_per_step``. Shared by the encoder (chunk validation) and
+    :meth:`CosmoshPipeline.get_num_actions` / ``get_num_frames`` so the AR-0
+    offset is defined in exactly one place.
+    """
+    if autoregressive_index == 0:
+        return latent_frames_per_step - 1
+    return latent_frames_per_step
 
 
 class ActionEncoder(StreamingEncoder[ActionEncoderCache]):
-    """Slices the per-AR-step action chunk out of the cached trajectory.
+    """Forwards (and validates) the per-AR-step action chunk to the network.
 
     Pipeline call shape:
 
-        cache = encoder.initialize_autoregressive_cache(actions=trajectory)
+        cache = encoder.initialize_autoregressive_cache()
         chunk = encoder(input=None, autoregressive_index=0, cache=cache)
-        # chunk: None  (AR 0 is the prefill / conditional step)
-        chunk = encoder(input=None, autoregressive_index=1, cache=cache)
-        # chunk: [B, num_action_per_latent_frame, action_dim]  (= actions[0:A])
+        # chunk: None  (AR 0 prefill when latent_frames_per_step == 1)
+        chunk = encoder(input=actions_step1, autoregressive_index=1, cache=cache)
+        # chunk: [B, latent_frames_per_step * A, action_dim]
     """
 
     def __init__(self, config: ActionEncoderConfig) -> None:
         super().__init__(config)
         self.config: ActionEncoderConfig = config
 
-    def initialize_autoregressive_cache(
-        self,
-        *,
-        actions: Tensor,
-    ) -> ActionEncoderCache:
-        """Stash the full action trajectory for this rollout.
-
-        Args:
-            actions: ``[B, T_actions, action_dim]`` raw actions for the entire
-                rollout. Padding to a fixed ``action_dim`` (e.g. 44 for the
-                CosmosH checkpoint) is the caller's responsibility.
-        """
-        assert actions.ndim == 3, (
-            f"actions must be [B, T_actions, action_dim], got shape {tuple(actions.shape)}"
-        )
+    def initialize_autoregressive_cache(self) -> ActionEncoderCache:
+        """Build the (stateless) per-rollout cache."""
         return ActionEncoderCache(
-            actions=actions,
             num_action_per_latent_frame=self.config.num_action_per_latent_frame,
+            latent_frames_per_step=self.config.latent_frames_per_step,
         )
 
     def forward(
@@ -110,32 +127,37 @@ class ActionEncoder(StreamingEncoder[ActionEncoderCache]):
         autoregressive_index: int = 0,
         cache: ActionEncoderCache | None = None,
     ) -> Tensor | None:
-        """Return the action chunk for AR step ``autoregressive_index``.
-
-        AR 0 is the conditional-frame prefill: matches the upstream's
-        ``action=None`` semantics so the network skips the action MLPs and
-        the K/V cache is seeded purely from the clean image latent.
+        """Validate and return the action chunk for AR step ``autoregressive_index``.
 
         Args:
-            input: Ignored; the action source is the cached trajectory.
-            autoregressive_index: 0-based AR step index. ``0`` returns
-                ``None``; ``>=1`` returns ``actions[(ar-1)*A : ar*A]``.
-            cache: Per-rollout cache populated by
-                :meth:`initialize_autoregressive_cache`.
+            input: The action chunk for this step, ``[B, n_gen * A, action_dim]``
+                where ``n_gen`` is the number of generated latent frames at this
+                step (``L - 1`` at AR 0, else ``L``). Pass ``None`` when the step
+                drives no generated frame (``L == 1`` at AR step 0).
+            autoregressive_index: 0-based AR step index.
+            cache: Per-rollout cache from :meth:`initialize_autoregressive_cache`.
 
         Returns:
-            ``None`` at AR step 0; otherwise the
-            ``[B, num_action_per_latent_frame, action_dim]`` slice.
+            ``None`` when the step drives no generated frame; otherwise the
+            ``[B, n_gen * A, action_dim]`` chunk unchanged.
         """
-        del input
-        assert cache is not None, "ActionEncoder requires a cache for slicing"
-        if autoregressive_index == 0:
-            return None
+        assert cache is not None, "ActionEncoder requires a cache"
         A = cache.num_action_per_latent_frame
-        start = (autoregressive_index - 1) * A
-        stop = start + A
-        assert stop <= cache.actions.shape[1], (
-            f"AR step {autoregressive_index} requires actions[{start}:{stop}], "
-            f"but trajectory has only {cache.actions.shape[1]} entries."
+        n_gen = num_generated_frames(autoregressive_index, cache.latent_frames_per_step)
+        if n_gen == 0:
+            assert input is None, (
+                f"AR step {autoregressive_index} drives no generated frame "
+                f"(latent_frames_per_step={cache.latent_frames_per_step}); pass "
+                f"actions=None, got a chunk of shape {tuple(input.shape)}."
+            )
+            return None
+        assert input is not None, (
+            f"AR step {autoregressive_index} drives {n_gen} frame(s); "
+            f"expected an action chunk of {n_gen * A} rows, got None."
         )
-        return cache.actions[:, start:stop, :]
+        assert input.ndim == 3 and input.shape[1] == n_gen * A, (
+            f"AR step {autoregressive_index} expects actions of shape "
+            f"[B, {n_gen * A}, action_dim] (n_gen={n_gen}, A={A}); got "
+            f"{tuple(input.shape)}."
+        )
+        return input
