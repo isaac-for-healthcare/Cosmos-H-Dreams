@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime
 import json
 import logging
 import os
@@ -111,7 +112,6 @@ class _LatencyLogger:
     """Per-session latency accumulator and JSONL file writer."""
 
     def __init__(self, mode: str) -> None:
-        import datetime
         self._mode = mode
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         self._path = f"cosmosh_perf_{ts}.jsonl"
@@ -1706,7 +1706,8 @@ class CosmoshWebRTCSessionManager:
                 if managed_session.closed:
                     break
 
-                _t_iter_start = time.perf_counter() * 1000.0
+                if latency_logger is not None:
+                    _t_iter_start = time.perf_counter() * 1000.0
 
                 # Backpressure: don't run ahead of playback by more than the cap.
                 while (
@@ -1735,8 +1736,8 @@ class CosmoshWebRTCSessionManager:
                     self._send_json(channel, {"type": "error", "message": str(exc)})
                     break
 
-                _t_iter_end = time.perf_counter() * 1000.0
                 if latency_logger is not None:
+                    _t_iter_end = time.perf_counter() * 1000.0
                     gap_ms = (_t_iter_start - _t_prev_block_end) if _t_prev_block_end is not None else None
                     record: dict[str, Any] = {"block": result.chunk_index, "gap_ms": gap_ms}
                     if result.timing:
@@ -1744,7 +1745,7 @@ class CosmoshWebRTCSessionManager:
                                        if k in ("encode_ms", "diffuse_ms", "decode_ms",
                                                 "finalize_ms", "input_age_ms")})
                     latency_logger.log_block(record)
-                _t_prev_block_end = _t_iter_end
+                    _t_prev_block_end = _t_iter_end
 
                 _fps_record_chunk(managed_session.fps_profile, result.num_frames)
 

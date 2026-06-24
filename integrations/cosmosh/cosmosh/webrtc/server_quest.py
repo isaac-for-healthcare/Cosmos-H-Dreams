@@ -482,7 +482,8 @@ class QuestSessionManager:
                     if self._closed:
                         break
 
-                    _t_iter_start = time.perf_counter() * 1000.0
+                    if latency_logger is not None:
+                        _t_iter_start = time.perf_counter() * 1000.0
 
                     async with self._render_lock:
                         if self._closed:
@@ -495,8 +496,8 @@ class QuestSessionManager:
                         )
                         await self._push_chunk_to_sink(result.video_chunk)
 
-                    _t_iter_end = time.perf_counter() * 1000.0
                     if latency_logger is not None:
+                        _t_iter_end = time.perf_counter() * 1000.0
                         gap_ms = (_t_iter_start - _t_prev_block_end) if _t_prev_block_end is not None else None
                         record: dict = {"block": result.chunk_index, "gap_ms": gap_ms}
                         if result.timing:
@@ -504,7 +505,7 @@ class QuestSessionManager:
                                            if k in ("encode_ms", "diffuse_ms", "decode_ms",
                                                     "finalize_ms", "input_age_ms")})
                         latency_logger.log_block(record)
-                    _t_prev_block_end = _t_iter_end
+                        _t_prev_block_end = _t_iter_end
 
                 except asyncio.CancelledError:
                     raise
