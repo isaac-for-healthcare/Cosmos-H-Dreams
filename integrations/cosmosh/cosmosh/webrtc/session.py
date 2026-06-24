@@ -122,11 +122,10 @@ class _LatencyLogger:
     def log_block(self, record: dict) -> None:
         record = {"mode": self._mode, **record}
         self._file.write(json.dumps(record) + "\n")
-        self._file.flush()
         self._block_records.append(record)
         # Build [PERF] log line with only non-None numeric values
         parts = [f"block={record.get('block', '?')}"]
-        for key in ("encode_ms", "diffuse_ms", "decode_ms", "finalize_ms",
+        for key in ("encode_ms", "diffuse_ms", "decode_ms", "finalize_ms", "d2h_ms",
                     "gap_ms", "cast_ms", "recv_wait_ms", "pacing_ms",
                     "jpeg_encode_ms", "mjpeg_drop_rate", "quest_pacing_ms", "input_age_ms"):
             val = record.get(key)
@@ -700,7 +699,7 @@ class CosmoshInferenceRuntime:
         """
         if self._closed:
             return False
-        return self.vr_state.apply_vr_input(payload)
+        return self.vr_state.apply_vr_input(payload, recv_t_ms=time.perf_counter() * 1000.0)
 
     async def generate_one_chunk_vr(self) -> CosmoshStepResult:
         """Render one outer block from the latest :class:`VRControllerState`.
@@ -1263,10 +1262,18 @@ class CosmoshInferenceRuntime:
         block_pixels = torch.cat(pixel_frames, dim=1)
         generated_b3thw = block_pixels.permute(0, 2, 1, 3, 4).contiguous()
 
+        if _block_timing and self._device is not None and self._device.type == "cuda":
+            torch.cuda.synchronize(self._device)
+            _t0_d2h = time.perf_counter()
+            video_chunk = generated_b3thw.detach().cpu()
+            _block_timing["d2h_ms"] = (time.perf_counter() - _t0_d2h) * 1000.0
+        else:
+            video_chunk = generated_b3thw.detach().cpu()
+
         result = CosmoshStepResult(
             chunk_index=self.autoregressive_index,
             num_frames=generated_b3thw.shape[2],
-            video_chunk=generated_b3thw.detach().cpu(),
+            video_chunk=video_chunk,
             timing=_block_timing if _block_timing else None,
         )
         self.autoregressive_index += 1
@@ -1751,7 +1758,7 @@ class CosmoshWebRTCSessionManager:
                     if result.timing:
                         record.update({k: v for k, v in result.timing.items()
                                        if k in ("encode_ms", "diffuse_ms", "decode_ms",
-                                                "finalize_ms", "input_age_ms")})
+                                                "finalize_ms", "d2h_ms", "input_age_ms")})
                     recv_stats = managed_session.video_track.drain_recv_stats()
                     record["cast_ms"] = cast_ms
                     record["recv_wait_ms"] = recv_stats["recv_wait_ms"]

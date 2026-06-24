@@ -120,10 +120,11 @@ class MJPEGSink:
     def __init__(self) -> None:
         self._latest: bytes | None = None
         self._frame_id: int = 0
+        self._last_consumed_id: int = 0  # highest frame_id returned to a consumer
         self._cond = asyncio.Condition()
         self._closed = False
         self._frames_pushed: int = 0
-        self._frames_overwritten: int = 0
+        self._frames_dropped: int = 0  # pushed while consumer hadn't seen previous
 
     @property
     def latest_id(self) -> int:
@@ -133,18 +134,20 @@ class MJPEGSink:
         async with self._cond:
             if self._closed:
                 return
-            if self._latest is not None:
-                self._frames_overwritten += 1
+            # A frame is truly dropped when the consumer hasn't yet consumed
+            # the frame currently in the buffer (last_consumed_id < frame_id).
+            if self._frame_id > self._last_consumed_id:
+                self._frames_dropped += 1
             self._latest = jpeg_bytes
             self._frame_id += 1
             self._frames_pushed += 1
             self._cond.notify_all()
 
     def drain_drop_stats(self) -> float:
-        """Return drop rate (overwritten/pushed) and reset counters."""
-        rate = self._frames_overwritten / self._frames_pushed if self._frames_pushed > 0 else 0.0
+        """Return drop rate (dropped/pushed) and reset counters."""
+        rate = self._frames_dropped / self._frames_pushed if self._frames_pushed > 0 else 0.0
         self._frames_pushed = 0
-        self._frames_overwritten = 0
+        self._frames_dropped = 0
         return rate
 
     async def wait_for_frame_after(
@@ -155,6 +158,7 @@ class MJPEGSink:
                 await self._cond.wait()
             if self._latest is None or self._frame_id <= last_id:
                 return None
+            self._last_consumed_id = self._frame_id
             return self._frame_id, self._latest
 
     async def close(self) -> None:
@@ -526,7 +530,7 @@ class QuestSessionManager:
                         if result.timing:
                             record.update({k: v for k, v in result.timing.items()
                                            if k in ("encode_ms", "diffuse_ms", "decode_ms",
-                                                    "finalize_ms", "input_age_ms")})
+                                                    "finalize_ms", "d2h_ms", "input_age_ms")})
                         record.update(delivery)
                         record["mjpeg_drop_rate"] = self._sink.drain_drop_stats()
                         latency_logger.log_block(record)
