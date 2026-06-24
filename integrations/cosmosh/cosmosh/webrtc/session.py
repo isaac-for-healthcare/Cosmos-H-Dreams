@@ -102,6 +102,65 @@ def _fps_reset_profile(profile: _ChunkFpsProfile) -> None:
     profile.frame_count = 0
     profile.chunk_count = 0
 
+
+# ---------------------------------------------------------------------------
+# Per-session latency logger
+# ---------------------------------------------------------------------------
+
+class _LatencyLogger:
+    """Per-session latency accumulator and JSONL file writer."""
+
+    def __init__(self, mode: str) -> None:
+        import datetime
+        self._mode = mode
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._path = f"cosmosh_perf_{ts}.jsonl"
+        self._file = open(self._path, "w", encoding="utf-8")
+        self._block_records: list[dict] = []
+        LOGGER.info("[latency] writing to %s", self._path)
+
+    def log_block(self, record: dict) -> None:
+        record = {"mode": self._mode, **record}
+        self._file.write(json.dumps(record) + "\n")
+        self._file.flush()
+        self._block_records.append(record)
+        # Build [PERF] log line with only non-None numeric values
+        parts = [f"block={record.get('block', '?')}"]
+        for key in ("encode_ms", "diffuse_ms", "decode_ms", "finalize_ms",
+                    "gap_ms", "cast_ms", "recv_wait_ms", "pacing_ms",
+                    "jpeg_encode_ms", "mjpeg_drop_rate", "quest_pacing_ms", "input_age_ms"):
+            val = record.get(key)
+            if val is not None:
+                parts.append(f"{key}={val:.2f}")
+        LOGGER.info("[PERF] %s", " ".join(parts))
+
+    def log_rollout_summary(self) -> None:
+        if not self._block_records:
+            return
+        # Average every float key across blocks
+        sums: dict[str, float] = {}
+        counts: dict[str, int] = {}
+        for rec in self._block_records:
+            for key, val in rec.items():
+                if isinstance(val, (int, float)) and key != "block":
+                    sums[key] = sums.get(key, 0.0) + val
+                    counts[key] = counts.get(key, 0) + 1
+        avgs = {k: sums[k] / counts[k] for k in sums}
+        summary = {"type": "rollout_summary", "mode": self._mode,
+                   "num_blocks": len(self._block_records), **avgs}
+        self._file.write(json.dumps(summary) + "\n")
+        self._file.flush()
+        avg_parts = [f"{k}={v:.2f}" for k, v in avgs.items() if k != "mode"]
+        LOGGER.info("[PERF] rollout_summary blocks=%d %s", len(self._block_records), " ".join(avg_parts))
+        self._block_records.clear()
+
+    def close(self) -> None:
+        try:
+            self._file.close()
+        except Exception:
+            pass
+
+
 # Default outer block size: 1 conditional + 12 generated pixel frames
 # (= 4 latent frames). The 12 is overridable via
 # ``CosmoshRuntimeConfig.actions_per_chunk`` — see that field's docstring
@@ -1623,6 +1682,8 @@ class CosmoshWebRTCSessionManager:
         next time the user submits an action.
         """
         channel = managed_session.control_channel
+        latency_logger = _LatencyLogger("keyboard") if _latency_profile_enabled() else None
+        _t_prev_block_end: float | None = None
         try:
             try:
                 async with managed_session.render_lock:
@@ -1644,6 +1705,8 @@ class CosmoshWebRTCSessionManager:
                 await managed_session.first_action_event.wait()
                 if managed_session.closed:
                     break
+
+                _t_iter_start = time.perf_counter() * 1000.0
 
                 # Backpressure: don't run ahead of playback by more than the cap.
                 while (
@@ -1671,6 +1734,17 @@ class CosmoshWebRTCSessionManager:
                     LOGGER.exception("Render loop chunk failed.")
                     self._send_json(channel, {"type": "error", "message": str(exc)})
                     break
+
+                _t_iter_end = time.perf_counter() * 1000.0
+                if latency_logger is not None:
+                    gap_ms = (_t_iter_start - _t_prev_block_end) if _t_prev_block_end is not None else None
+                    record: dict[str, Any] = {"block": result.chunk_index, "gap_ms": gap_ms}
+                    if result.timing:
+                        record.update({k: v for k, v in result.timing.items()
+                                       if k in ("encode_ms", "diffuse_ms", "decode_ms",
+                                                "finalize_ms", "input_age_ms")})
+                    latency_logger.log_block(record)
+                _t_prev_block_end = _t_iter_end
 
                 _fps_record_chunk(managed_session.fps_profile, result.num_frames)
 
@@ -1707,7 +1781,11 @@ class CosmoshWebRTCSessionManager:
                     },
                 )
         except asyncio.CancelledError:
-            return
+            pass
+        finally:
+            if latency_logger is not None:
+                latency_logger.log_rollout_summary()
+                latency_logger.close()
 
     async def _render_loop_debug(
         self, *, managed_session: _ManagedCosmoshSession

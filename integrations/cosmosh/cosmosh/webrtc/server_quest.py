@@ -25,7 +25,13 @@ from cosmosh.webrtc.config_loader import (
     load_yaml_config,
     parse_scenes,
 )
-from cosmosh.webrtc.session import CosmoshInferenceRuntime, CosmoshRuntimeConfig, Scene
+from cosmosh.webrtc.session import (
+    CosmoshInferenceRuntime,
+    CosmoshRuntimeConfig,
+    Scene,
+    _LatencyLogger,
+    _latency_profile_enabled,
+)
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 LOGGER = logging.getLogger(__name__)
@@ -467,12 +473,17 @@ class QuestSessionManager:
 
     async def _render_loop(self) -> None:
         LOGGER.info("Render loop started.")
+        latency_logger = _LatencyLogger("quest") if _latency_profile_enabled() else None
+        _t_prev_block_end: float | None = None
         try:
             while not self._closed:
                 try:
                     await self._first_action_event.wait()
                     if self._closed:
                         break
+
+                    _t_iter_start = time.perf_counter() * 1000.0
+
                     async with self._render_lock:
                         if self._closed:
                             break
@@ -483,6 +494,18 @@ class QuestSessionManager:
                             result.num_frames,
                         )
                         await self._push_chunk_to_sink(result.video_chunk)
+
+                    _t_iter_end = time.perf_counter() * 1000.0
+                    if latency_logger is not None:
+                        gap_ms = (_t_iter_start - _t_prev_block_end) if _t_prev_block_end is not None else None
+                        record: dict = {"block": result.chunk_index, "gap_ms": gap_ms}
+                        if result.timing:
+                            record.update({k: v for k, v in result.timing.items()
+                                           if k in ("encode_ms", "diffuse_ms", "decode_ms",
+                                                    "finalize_ms", "input_age_ms")})
+                        latency_logger.log_block(record)
+                    _t_prev_block_end = _t_iter_end
+
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -497,6 +520,9 @@ class QuestSessionManager:
             pass
         finally:
             LOGGER.info("Render loop ended.")
+            if latency_logger is not None:
+                latency_logger.log_rollout_summary()
+                latency_logger.close()
 
     async def _push_chunk_to_sink(self, chunk: torch.Tensor) -> None:
         """Encode each frame of a ``[1, 3, T, H, W]`` ``[-1, 1]`` tensor and push at ``fps``.
