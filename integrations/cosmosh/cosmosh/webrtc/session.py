@@ -204,6 +204,7 @@ class CosmoshStepResult:
     chunk_index: int
     num_frames: int
     video_chunk: torch.Tensor  # [1, 3, 12, H, W] in [-1, 1] on CPU
+    timing: dict[str, float] | None = None  # per-block profiler stats; None when profiling is off
 
 
 # Common single-image extensions ``mediapy.read_image`` understands. Any
@@ -1109,7 +1110,11 @@ class CosmoshInferenceRuntime:
             state.left.trigger,
         )
 
-        return self._render_chunk_from_actions(actions_np)
+        t_chunk_start_ms = time.perf_counter() * 1000.0
+        result = self._render_chunk_from_actions(actions_np)
+        if result.timing is not None and self.vr_state.t_ms > 0:
+            result.timing["input_age_ms"] = t_chunk_start_ms - self.vr_state.t_ms
+        return result
 
     def _render_chunk_from_actions(
         self, actions_np: np.ndarray
@@ -1172,6 +1177,7 @@ class CosmoshInferenceRuntime:
         # ``generate`` returns decoded pixels ``[1, T_pix, 3, H, W]``.
         pixel_frames: list[torch.Tensor] = []
         local_offset = 0
+        _block_timing: dict[str, float] = {}
         while True:
             ar_idx = self._global_ar_idx
             need = self._pipeline.get_num_actions(ar_idx)
@@ -1184,7 +1190,10 @@ class CosmoshInferenceRuntime:
             )
             pixels = self._pipeline.generate(ar_idx, self._cache, actions=chunk)
             pixels = pixels.clamp(min=-1.0, max=1.0)
-            self._pipeline.finalize(ar_idx, self._cache)
+            stats = self._pipeline.finalize(ar_idx, self._cache)
+            if stats:
+                for key, val in stats.items():
+                    _block_timing[key] = _block_timing.get(key, 0.0) + val
             local_offset += need
             self._global_ar_idx += 1
             # AR step 0's first decoded frame is the VAE reconstruction of the
@@ -1199,6 +1208,7 @@ class CosmoshInferenceRuntime:
             chunk_index=self.autoregressive_index,
             num_frames=generated_b3thw.shape[2],
             video_chunk=generated_b3thw.detach().cpu(),
+            timing=_block_timing if _block_timing else None,
         )
         self.autoregressive_index += 1
         return result
