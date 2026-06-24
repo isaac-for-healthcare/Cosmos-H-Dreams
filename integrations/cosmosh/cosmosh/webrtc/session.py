@@ -1171,7 +1171,7 @@ class CosmoshInferenceRuntime:
 
         t_chunk_start_ms = time.perf_counter() * 1000.0
         result = self._render_chunk_from_actions(actions_np)
-        if result.timing is not None and self.vr_state.t_ms > 0:
+        if result.timing is not None and self.vr_state.t_ms > 0:  # t_ms is 0.0 until the first vr_input arrives
             result.timing["input_age_ms"] = t_chunk_start_ms - self.vr_state.t_ms
         return result
 

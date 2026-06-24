@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from fractions import Fraction
 
@@ -25,6 +26,11 @@ _PACING_LAG_LOG_MS = 5.0
 """Below this lag we re-anchor pacing silently. Above it the lag is
 worth a one-line warning so bursts (which the browser jitter buffer
 turns into visible playback speed-ups) are correlatable in the log."""
+
+
+def _recv_profiling_enabled() -> bool:
+    """Return True when ``COSMOSH_PROFILE_LATENCY`` is set to a truthy value."""
+    return os.environ.get("COSMOSH_PROFILE_LATENCY", "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def tensor_chunk_to_rgb_frames(video_chunk: torch.Tensor) -> list[np.ndarray]:
@@ -72,6 +78,7 @@ class CosmoshVideoTrack(MediaStreamTrack):
         self._pts = 0
         self._frames: asyncio.Queue[np.ndarray | None] = asyncio.Queue()
         self._closed = False
+        self._profile_recv: bool = _recv_profiling_enabled()
         self._recv_wait_ms: list[float] = []
         self._pacing_ms: list[float] = []
 
@@ -110,7 +117,8 @@ class CosmoshVideoTrack(MediaStreamTrack):
         if frame_array is None:
             raise MediaStreamError
         get_wait_ms = (loop.time() - t_get_start) * 1000.0
-        self._recv_wait_ms.append(get_wait_ms)
+        if self._profile_recv:
+            self._recv_wait_ms.append(get_wait_ms)
         # ``_next_deadline_s is None`` is the single source of truth for
         # "we haven't emitted any frame yet". The pre-first-frame wait
         # is the time aiortc spends calling ``recv`` before the producer
@@ -136,14 +144,16 @@ class CosmoshVideoTrack(MediaStreamTrack):
             # look like another empty-queue stall, even when generation
             # outpaces playback — the sawtooth pattern visible in the logs.
             self._next_deadline_s = now_s
-            self._pacing_ms.append(0.0)
+            if self._profile_recv:
+                self._pacing_ms.append(0.0)
         else:
             proposed = self._next_deadline_s + self._frame_interval_s
             wait_s = proposed - now_s
             if wait_s > 0:
                 _t_sleep_start = loop.time()
                 await asyncio.sleep(wait_s)
-                self._pacing_ms.append((loop.time() - _t_sleep_start) * 1000.0)
+                if self._profile_recv:
+                    self._pacing_ms.append((loop.time() - _t_sleep_start) * 1000.0)
                 self._next_deadline_s = proposed
             else:
                 # Queue had a frame ready (no stall) but our deadline is
@@ -163,7 +173,8 @@ class CosmoshVideoTrack(MediaStreamTrack):
                         self._frames.qsize(),
                     )
                 self._next_deadline_s = now_s
-                self._pacing_ms.append(0.0)
+                if self._profile_recv:
+                    self._pacing_ms.append(0.0)
 
         frame = VideoFrame.from_ndarray(frame_array, format="rgb24")
         frame.pts = self._pts
