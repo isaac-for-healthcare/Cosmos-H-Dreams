@@ -1546,6 +1546,14 @@ class CosmoshWebRTCSessionManager:
                 managed_session=managed_session, payload=payload
             )
             return
+        if message_type == "latency_echo":
+            if _latency_profile_enabled():
+                LOGGER.info(
+                    "[PERF] browser chunk_id=%s recv_to_raf_ms=%.1f",
+                    payload.get("chunk_id"),
+                    float(payload.get("recv_to_raf_ms", 0)),
+                )
+            return
         if message_type != "action":
             self._send_json(
                 channel,
@@ -1750,6 +1758,12 @@ class CosmoshWebRTCSessionManager:
                     record["pacing_ms"] = recv_stats["pacing_ms"]
                     latency_logger.log_block(record)
                     _t_prev_block_end = _t_iter_end
+                    if channel is not None:
+                        self._send_json(channel, {
+                            "type": "frame_ts",
+                            "chunk_id": result.chunk_index,
+                            "server_ms": time.perf_counter() * 1000.0,
+                        })
 
                 _fps_record_chunk(managed_session.fps_profile, result.num_frames)
 

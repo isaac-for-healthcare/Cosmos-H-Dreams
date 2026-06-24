@@ -8,6 +8,8 @@ const eventLog = document.getElementById("eventLog")
 const remoteVideo = document.getElementById("remoteVideo")
 const sceneSelect = document.getElementById("sceneSelect")
 
+const LATENCY_ENABLED = new URLSearchParams(location.search).get('latency') === '1'
+
 // Mirror of what the server reports as the active scene. Used to revert the
 // dropdown if the user picks a scene the server rejects, or before the ws is
 // up.
@@ -298,6 +300,30 @@ function connectWs() {
     setTimeout(connectWs, 2000)
   }
   ws.onerror = () => logEvent("ws error")
+  ws.onmessage = (event) => {
+    let data
+    try {
+      data = JSON.parse(event.data)
+    } catch (e) {
+      return
+    }
+    if (data.type === 'frame_ts' && LATENCY_ENABLED) {
+      const T_recv = performance.now()
+      const img = remoteVideo
+      const handler = () => {
+        const T_load = performance.now()
+        requestAnimationFrame(() => {
+          send({
+            type: 'latency_echo',
+            chunk_id: data.chunk_id,
+            recv_to_load_ms: T_load - T_recv,
+            load_to_raf_ms: performance.now() - T_load,
+          })
+        })
+      }
+      img.addEventListener('load', handler, { once: true })
+    }
+  }
 }
 
 function send(obj) {

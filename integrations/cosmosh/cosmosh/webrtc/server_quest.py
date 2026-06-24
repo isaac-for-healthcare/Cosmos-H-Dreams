@@ -467,6 +467,15 @@ class QuestSessionManager:
             else:
                 self._viewer_events.publish("session", f"session: {action}")
             return
+        if msg_type == "latency_echo":
+            if _latency_profile_enabled():
+                LOGGER.info(
+                    "[PERF] browser chunk_id=%s recv_to_load_ms=%.1f load_to_raf_ms=%.1f",
+                    payload.get("chunk_id"),
+                    float(payload.get("recv_to_load_ms", 0)),
+                    float(payload.get("load_to_raf_ms", 0)),
+                )
+            return
         LOGGER.warning("ws msg type=%r ignored", msg_type)
 
     async def shutdown(self) -> None:
@@ -522,6 +531,16 @@ class QuestSessionManager:
                         record["mjpeg_drop_rate"] = self._sink.drain_drop_stats()
                         latency_logger.log_block(record)
                         _t_prev_block_end = _t_iter_end
+                        ws = self._ws
+                        if ws is not None and not ws.closed:
+                            try:
+                                await ws.send_json({
+                                    "type": "frame_ts",
+                                    "chunk_id": result.chunk_index,
+                                    "server_ms": time.perf_counter() * 1000.0,
+                                })
+                            except Exception:
+                                pass
 
                 except asyncio.CancelledError:
                     raise
