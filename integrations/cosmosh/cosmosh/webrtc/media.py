@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from fractions import Fraction
 
 import numpy as np
@@ -46,6 +47,17 @@ def tensor_chunk_to_rgb_frames(video_chunk: torch.Tensor) -> list[np.ndarray]:
     return [np.ascontiguousarray(frame) for frame in frames]
 
 
+def _timed_tensor_chunk_to_rgb_frames(video_chunk: torch.Tensor) -> tuple[list[np.ndarray], float]:
+    """Wrap ``tensor_chunk_to_rgb_frames`` with wall-clock timing.
+
+    Returns ``(frames, elapsed_ms)`` where ``elapsed_ms`` is the time spent
+    in the float→uint8 cast (the part that runs in a worker thread).
+    """
+    t0 = time.perf_counter()
+    frames = tensor_chunk_to_rgb_frames(video_chunk)
+    return frames, (time.perf_counter() - t0) * 1000.0
+
+
 class CosmoshVideoTrack(MediaStreamTrack):
     kind = "video"
 
@@ -60,16 +72,18 @@ class CosmoshVideoTrack(MediaStreamTrack):
         self._pts = 0
         self._frames: asyncio.Queue[np.ndarray | None] = asyncio.Queue()
         self._closed = False
+        self._recv_wait_ms: list[float] = []
+        self._pacing_ms: list[float] = []
 
-    async def enqueue_chunk(self, video_chunk: torch.Tensor) -> int:
+    async def enqueue_chunk(self, video_chunk: torch.Tensor) -> tuple[int, float]:
         # Offload the float->uint8 cast to a worker thread so it doesn't
         # stall the asyncio loop and starve ``recv``'s 1/fps pacing.
         # When this ran inline it was the single biggest source of the
         # empty-queue stalls that ``recv`` then has to re-anchor around.
-        frames = await asyncio.to_thread(tensor_chunk_to_rgb_frames, video_chunk)
+        frames, cast_ms = await asyncio.to_thread(_timed_tensor_chunk_to_rgb_frames, video_chunk)
         for frame in frames:
             await self._frames.put(frame)
-        return len(frames)
+        return len(frames), cast_ms
 
     def qsize(self) -> int:
         """Number of frames buffered but not yet sent over the wire."""
@@ -96,6 +110,7 @@ class CosmoshVideoTrack(MediaStreamTrack):
         if frame_array is None:
             raise MediaStreamError
         get_wait_ms = (loop.time() - t_get_start) * 1000.0
+        self._recv_wait_ms.append(get_wait_ms)
         # ``_next_deadline_s is None`` is the single source of truth for
         # "we haven't emitted any frame yet". The pre-first-frame wait
         # is the time aiortc spends calling ``recv`` before the producer
@@ -121,11 +136,14 @@ class CosmoshVideoTrack(MediaStreamTrack):
             # look like another empty-queue stall, even when generation
             # outpaces playback — the sawtooth pattern visible in the logs.
             self._next_deadline_s = now_s
+            self._pacing_ms.append(0.0)
         else:
             proposed = self._next_deadline_s + self._frame_interval_s
             wait_s = proposed - now_s
             if wait_s > 0:
+                _t_sleep_start = loop.time()
                 await asyncio.sleep(wait_s)
+                self._pacing_ms.append((loop.time() - _t_sleep_start) * 1000.0)
                 self._next_deadline_s = proposed
             else:
                 # Queue had a frame ready (no stall) but our deadline is
@@ -145,12 +163,22 @@ class CosmoshVideoTrack(MediaStreamTrack):
                         self._frames.qsize(),
                     )
                 self._next_deadline_s = now_s
+                self._pacing_ms.append(0.0)
 
         frame = VideoFrame.from_ndarray(frame_array, format="rgb24")
         frame.pts = self._pts
         frame.time_base = self._time_base
         self._pts += 1
         return frame
+
+    def drain_recv_stats(self) -> dict[str, float]:
+        """Return per-chunk average recv wait and pacing, then reset accumulators."""
+        def _avg(lst: list[float]) -> float:
+            return sum(lst) / len(lst) if lst else 0.0
+        stats = {"recv_wait_ms": _avg(self._recv_wait_ms), "pacing_ms": _avg(self._pacing_ms)}
+        self._recv_wait_ms.clear()
+        self._pacing_ms.clear()
+        return stats
 
     async def close(self) -> None:
         if self._closed:

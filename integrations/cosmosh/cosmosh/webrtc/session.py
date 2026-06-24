@@ -1595,7 +1595,7 @@ class CosmoshWebRTCSessionManager:
                 # generated frame from the pre-reset rollout.
                 managed_session.first_action_event.clear()
                 initial_chunk = managed_session.runtime.initial_frame_chunk()
-                await managed_session.video_track.enqueue_chunk(initial_chunk)
+                _ = await managed_session.video_track.enqueue_chunk(initial_chunk)
                 # Debug-override: ``runtime.reset()`` rewound the action cursor,
                 # so re-arm the loop to replay the recorded stream from the top.
                 if managed_session.runtime.debug_action_override:
@@ -1644,7 +1644,7 @@ class CosmoshWebRTCSessionManager:
                 dropped = managed_session.video_track.drain_pending()
                 managed_session.first_action_event.clear()
                 initial_chunk = managed_session.runtime.initial_frame_chunk()
-                await managed_session.video_track.enqueue_chunk(initial_chunk)
+                _ = await managed_session.video_track.enqueue_chunk(initial_chunk)
         except Exception as exc:
             LOGGER.exception("Scene switch to %r failed.", raw_name)
             self._send_json(channel, {"type": "error", "message": str(exc)})
@@ -1688,7 +1688,7 @@ class CosmoshWebRTCSessionManager:
             try:
                 async with managed_session.render_lock:
                     initial_chunk = managed_session.runtime.initial_frame_chunk()
-                    await managed_session.video_track.enqueue_chunk(initial_chunk)
+                    _ = await managed_session.video_track.enqueue_chunk(initial_chunk)
             except Exception:
                 LOGGER.exception("Failed to enqueue initial conditional frame.")
 
@@ -1728,7 +1728,7 @@ class CosmoshWebRTCSessionManager:
                         result = await managed_session.runtime.apply_actions_and_generate(
                             actions
                         )
-                        enqueued = await managed_session.video_track.enqueue_chunk(
+                        enqueued, cast_ms = await managed_session.video_track.enqueue_chunk(
                             result.video_chunk
                         )
                 except Exception as exc:
@@ -1744,6 +1744,10 @@ class CosmoshWebRTCSessionManager:
                         record.update({k: v for k, v in result.timing.items()
                                        if k in ("encode_ms", "diffuse_ms", "decode_ms",
                                                 "finalize_ms", "input_age_ms")})
+                    recv_stats = managed_session.video_track.drain_recv_stats()
+                    record["cast_ms"] = cast_ms
+                    record["recv_wait_ms"] = recv_stats["recv_wait_ms"]
+                    record["pacing_ms"] = recv_stats["pacing_ms"]
                     latency_logger.log_block(record)
                     _t_prev_block_end = _t_iter_end
 
@@ -1831,7 +1835,7 @@ class CosmoshWebRTCSessionManager:
                             if result is None:
                                 exhausted = True
                                 break
-                            enqueued = await managed_session.video_track.enqueue_chunk(
+                            enqueued, _ = await managed_session.video_track.enqueue_chunk(
                                 result.video_chunk
                             )
                     except Exception as exc:
