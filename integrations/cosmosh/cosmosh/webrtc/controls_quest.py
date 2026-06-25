@@ -113,21 +113,25 @@ class VRControllerState:
 
     right: VRArmInput = field(default_factory=VRArmInput)
     left: VRArmInput = field(default_factory=VRArmInput)
-    t_ms: float = 0.0
+    t_ms: float = 0.0  # time.perf_counter() * 1000.0 at server receive time
 
-    def apply_vr_input(self, payload: dict[str, Any]) -> bool:
+    def apply_vr_input(self, payload: dict[str, Any], recv_t_ms: float = 0.0) -> bool:
         """Replace both arms' state from a ``vr_input`` payload.
 
         Returns ``True`` if the payload had the right shape; ``False`` for
         non-``vr_input`` messages or non-dict payloads. Missing per-arm
         sections fall through to a zero arm input — one bad / dropped frame
         becomes "no motion this frame" rather than stale carry-over.
+
+        ``recv_t_ms`` must be ``time.perf_counter() * 1000.0`` stamped by the
+        caller immediately on receive — the same clock used in
+        ``_generate_one_chunk_vr_sync`` so the subtraction is meaningful.
         """
         if not isinstance(payload, dict) or payload.get("type") != "vr_input":
             return False
         self.right._apply(payload.get("right"))
         self.left._apply(payload.get("left"))
-        self.t_ms = _payload_to_float(payload.get("t_ms"))
+        self.t_ms = recv_t_ms
         return True
 
 

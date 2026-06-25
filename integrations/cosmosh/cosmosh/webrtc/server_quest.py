@@ -25,7 +25,13 @@ from cosmosh.webrtc.config_loader import (
     load_yaml_config,
     parse_scenes,
 )
-from cosmosh.webrtc.session import CosmoshInferenceRuntime, CosmoshRuntimeConfig, Scene
+from cosmosh.webrtc.session import (
+    CosmoshInferenceRuntime,
+    CosmoshRuntimeConfig,
+    Scene,
+    _LatencyLogger,
+    _latency_profile_enabled,
+)
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 LOGGER = logging.getLogger(__name__)
@@ -39,14 +45,15 @@ all but the last frame in the chunk) are correlatable in the log."""
 
 def _encode_frame_to_jpeg(
     frame_chw_neg1_pos1: torch.Tensor, jpeg_quality: int
-) -> bytes | None:
+) -> tuple[bytes | None, float]:
     """Convert one ``[3, H, W]`` CPU tensor in ``[-1, 1]`` to JPEG bytes.
 
     Runs off the asyncio loop via :func:`asyncio.to_thread` so the cast +
     cv2 encode don't starve the per-frame pacing in
-    :meth:`QuestSessionManager._push_chunk_to_sink`. Returns ``None`` if
+    :meth:`QuestSessionManager._push_chunk_to_sink`. Returns ``(None, elapsed_ms)`` if
     OpenCV fails to encode (rare; corrupt frame data).
     """
+    t0 = time.perf_counter()
     rgb = ((frame_chw_neg1_pos1 * 127.5) + 127.5).clamp(0.0, 255.0).to(torch.uint8)
     rgb_hwc = rgb.permute(1, 2, 0).contiguous().numpy()
     # cv2.imencode wants BGR. Model output is RGB (PIL/torchvision
@@ -55,7 +62,8 @@ def _encode_frame_to_jpeg(
     ok, jpeg = cv2.imencode(
         ".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)]
     )
-    return jpeg.tobytes() if ok else None
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    return (jpeg.tobytes() if ok else None), elapsed_ms
 
 
 # ---------------------------------------------------------------------------
@@ -112,8 +120,11 @@ class MJPEGSink:
     def __init__(self) -> None:
         self._latest: bytes | None = None
         self._frame_id: int = 0
+        self._last_consumed_id: int = 0  # highest frame_id returned to a consumer
         self._cond = asyncio.Condition()
         self._closed = False
+        self._frames_pushed: int = 0
+        self._frames_dropped: int = 0  # pushed while consumer hadn't seen previous
 
     @property
     def latest_id(self) -> int:
@@ -123,9 +134,21 @@ class MJPEGSink:
         async with self._cond:
             if self._closed:
                 return
+            # A frame is truly dropped when the consumer hasn't yet consumed
+            # the frame currently in the buffer (last_consumed_id < frame_id).
+            if self._frame_id > self._last_consumed_id:
+                self._frames_dropped += 1
             self._latest = jpeg_bytes
             self._frame_id += 1
+            self._frames_pushed += 1
             self._cond.notify_all()
+
+    def drain_drop_stats(self) -> float:
+        """Return drop rate (dropped/pushed) and reset counters."""
+        rate = self._frames_dropped / self._frames_pushed if self._frames_pushed > 0 else 0.0
+        self._frames_pushed = 0
+        self._frames_dropped = 0
+        return rate
 
     async def wait_for_frame_after(
         self, last_id: int
@@ -135,6 +158,7 @@ class MJPEGSink:
                 await self._cond.wait()
             if self._latest is None or self._frame_id <= last_id:
                 return None
+            self._last_consumed_id = self._frame_id
             return self._frame_id, self._latest
 
     async def close(self) -> None:
@@ -447,6 +471,15 @@ class QuestSessionManager:
             else:
                 self._viewer_events.publish("session", f"session: {action}")
             return
+        if msg_type == "latency_echo":
+            if _latency_profile_enabled():
+                LOGGER.info(
+                    "[PERF] browser chunk_id=%s recv_to_load_ms=%.1f load_to_raf_ms=%.1f",
+                    payload.get("chunk_id"),
+                    float(payload.get("recv_to_load_ms", 0)),
+                    float(payload.get("load_to_raf_ms", 0)),
+                )
+            return
         LOGGER.warning("ws msg type=%r ignored", msg_type)
 
     async def shutdown(self) -> None:
@@ -467,12 +500,18 @@ class QuestSessionManager:
 
     async def _render_loop(self) -> None:
         LOGGER.info("Render loop started.")
+        latency_logger = _LatencyLogger("quest") if _latency_profile_enabled() else None
+        _t_prev_block_end: float | None = None
         try:
             while not self._closed:
                 try:
                     await self._first_action_event.wait()
                     if self._closed:
                         break
+
+                    if latency_logger is not None:
+                        _t_iter_start = time.perf_counter() * 1000.0
+
                     async with self._render_lock:
                         if self._closed:
                             break
@@ -482,7 +521,31 @@ class QuestSessionManager:
                             result.chunk_index,
                             result.num_frames,
                         )
-                        await self._push_chunk_to_sink(result.video_chunk)
+                        delivery = await self._push_chunk_to_sink(result.video_chunk)
+
+                    if latency_logger is not None:
+                        _t_iter_end = time.perf_counter() * 1000.0
+                        gap_ms = (_t_iter_start - _t_prev_block_end) if _t_prev_block_end is not None else None
+                        record: dict = {"block": result.chunk_index, "gap_ms": gap_ms}
+                        if result.timing:
+                            record.update({k: v for k, v in result.timing.items()
+                                           if k in ("encode_ms", "diffuse_ms", "decode_ms",
+                                                    "finalize_ms", "d2h_ms", "input_age_ms")})
+                        record.update(delivery)
+                        record["mjpeg_drop_rate"] = self._sink.drain_drop_stats()
+                        latency_logger.log_block(record)
+                        _t_prev_block_end = _t_iter_end
+                        ws = self._ws
+                        if ws is not None and not ws.closed:
+                            try:
+                                await ws.send_json({
+                                    "type": "frame_ts",
+                                    "chunk_id": result.chunk_index,
+                                    "server_ms": time.perf_counter() * 1000.0,
+                                })
+                            except Exception:
+                                pass
+
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -497,8 +560,11 @@ class QuestSessionManager:
             pass
         finally:
             LOGGER.info("Render loop ended.")
+            if latency_logger is not None:
+                latency_logger.log_rollout_summary()
+                latency_logger.close()
 
-    async def _push_chunk_to_sink(self, chunk: torch.Tensor) -> None:
+    async def _push_chunk_to_sink(self, chunk: torch.Tensor) -> dict[str, float]:
         """Encode each frame of a ``[1, 3, T, H, W]`` ``[-1, 1]`` tensor and push at ``fps``.
 
         Pacing matters because the MJPEG sink is latest-frame-wins: pushing
@@ -506,28 +572,37 @@ class QuestSessionManager:
         until each frame's wall-clock target so encode latency doesn't
         accumulate. For ``T == 1`` (the conditional anchor) this just pushes
         one frame and returns.
+
+        Returns a dict with average per-frame timing:
+        ``{"jpeg_encode_ms": float, "quest_pacing_ms": float}``.
         """
         if chunk.ndim != 5 or chunk.shape[0] != 1 or chunk.shape[1] != 3:
             LOGGER.warning("Unexpected chunk shape %s; skipping push.", tuple(chunk.shape))
-            return
+            return {"jpeg_encode_ms": 0.0, "quest_pacing_ms": 0.0}
         period = 1.0 / float(self.fps)
         t_frames = chunk.shape[2]
         start = time.monotonic()
+        encode_times: list[float] = []
+        pacing_times: list[float] = []
         for f in range(t_frames):
             # Offload float->uint8 + cv2 JPEG encode to a worker thread.
             # On the asyncio loop this can dominate the 1/fps per-frame
             # budget and force the re-anchor branch below to keep firing.
-            jpeg_bytes = await asyncio.to_thread(
+            jpeg_bytes, enc_ms = await asyncio.to_thread(
                 _encode_frame_to_jpeg, chunk[0, :, f], self.jpeg_quality
             )
+            encode_times.append(enc_ms)
             if jpeg_bytes is not None:
                 await self._sink.push_jpeg(jpeg_bytes)
             target = start + (f + 1) * period
             now = time.monotonic()
             wait_s = target - now
             if wait_s > 0:
+                t_sleep_start = time.monotonic()
                 await asyncio.sleep(wait_s)
+                pacing_times.append((time.monotonic() - t_sleep_start) * 1000.0)
             else:
+                pacing_times.append(0.0)
                 # Deadline is already in the past — encode + push took
                 # longer than ``period``. Without re-anchoring, every
                 # remaining frame's ``target`` is also in the past and
@@ -544,6 +619,9 @@ class QuestSessionManager:
                         lag_ms,
                     )
                 start = now - (f + 1) * period
+        avg_encode = sum(encode_times) / len(encode_times) if encode_times else 0.0
+        avg_pacing = sum(pacing_times) / len(pacing_times) if pacing_times else 0.0
+        return {"jpeg_encode_ms": avg_encode, "quest_pacing_ms": avg_pacing}
 
 
 # ---------------------------------------------------------------------------

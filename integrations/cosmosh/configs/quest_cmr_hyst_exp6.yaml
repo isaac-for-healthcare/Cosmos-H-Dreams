@@ -35,12 +35,41 @@ scenes:
     cr1_embeddings_path: sf_inference_data/cr1_empty_string_text_embeddings.pt
 
 
-keyboard:
-  translate_v_per_frame: 0.05   # σ/frame; 0.1 ≈ 2.3 mm/s on PSM1 at fps=10
-  gripper_v_per_chunk: 1.0     # σ/chunk while open/close key held
-  rotate_deg_per_frame: 1.0    # degrees/frame while a rotation key held
-  light_mode: false            # true = render only while input is held
+vr:
+  # translate_scale: per-axis play-space scaling applied before the
+  # camera-frame remap. Three accepted shapes:
+  #   - scalar                          → all axes, both arms
+  #   - [x, y, z]                       → per axis, shared across arms
+  #   - {right: <s|3-vec>, left: <s|3-vec>}   → asymmetric per arm
+  # translate_scale: [250.0, 800.0, 250.0]
+  translate_scale:
+    right: [250.0, 800.0, 250.0]
+    left:  [250.0, 800.0, 250.0]
+  # rotate_scale: scalar (shared) or {right, left} dict (asymmetric).
+  rotate_scale: 9.0
+  # rotate_scale: {right: 9.0, left: 9.0}
+  # Input semantics (default false = absolute play-space; see QUEST_PLAN.md).
+  # body_relative_translate: rotate dpos by -headset_yaw before sending,
+  #   so "push forward" follows the user's heading rather than the
+  #   play-space initial direction.
+  # body_relative_rotation: send conj(prev)·curr instead of curr·conj(prev),
+  #   so wrist rotation deltas are expressed in the controller's own
+  #   previous frame.
+  body_relative_translate: true
+  body_relative_rotation: true
+  # In-headset display panel — the floating "monitor" you see in VR.
+  # Aspect should ideally match runtime.resolution (here 288x512 ≈ 9:16
+  # so a 16:9-ish panel reads correctly). Defaults: 0.4 × 0.3 m @ 1.2 m.
+  display:
+    width_m: 1
+    height_m: 0.75
+    distance_m: 1.2
+
+video:
+  jpeg_quality: 85
 
 server:
   host: 0.0.0.0
-  port: 8080
+  port: 8443
+  cert: cert.pem  # WebXR requires TLS on non-localhost origins
+  key: key.pem

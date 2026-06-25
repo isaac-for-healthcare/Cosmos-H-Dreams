@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime
 import json
 import logging
 import os
@@ -101,6 +102,63 @@ def _fps_reset_profile(profile: _ChunkFpsProfile) -> None:
     profile.window_start = None
     profile.frame_count = 0
     profile.chunk_count = 0
+
+
+# ---------------------------------------------------------------------------
+# Per-session latency logger
+# ---------------------------------------------------------------------------
+
+class _LatencyLogger:
+    """Per-session latency accumulator and JSONL file writer."""
+
+    def __init__(self, mode: str) -> None:
+        self._mode = mode
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._path = f"cosmosh_perf_{ts}.jsonl"
+        self._file = open(self._path, "w", encoding="utf-8")
+        self._block_records: list[dict] = []
+        LOGGER.info("[latency] writing to %s", self._path)
+
+    def log_block(self, record: dict) -> None:
+        record = {"mode": self._mode, **record}
+        self._file.write(json.dumps(record) + "\n")
+        self._block_records.append(record)
+        # Build [PERF] log line with only non-None numeric values
+        parts = [f"block={record.get('block', '?')}"]
+        for key in ("encode_ms", "diffuse_ms", "decode_ms", "finalize_ms", "d2h_ms",
+                    "gap_ms", "cast_ms", "recv_wait_ms", "pacing_ms",
+                    "jpeg_encode_ms", "mjpeg_drop_rate", "quest_pacing_ms", "input_age_ms"):
+            val = record.get(key)
+            if val is not None:
+                parts.append(f"{key}={val:.2f}")
+        LOGGER.info("[PERF] %s", " ".join(parts))
+
+    def log_rollout_summary(self) -> None:
+        if not self._block_records:
+            return
+        # Average every float key across blocks
+        sums: dict[str, float] = {}
+        counts: dict[str, int] = {}
+        for rec in self._block_records:
+            for key, val in rec.items():
+                if isinstance(val, (int, float)) and key != "block":
+                    sums[key] = sums.get(key, 0.0) + val
+                    counts[key] = counts.get(key, 0) + 1
+        avgs = {k: sums[k] / counts[k] for k in sums}
+        summary = {"type": "rollout_summary", "mode": self._mode,
+                   "num_blocks": len(self._block_records), **avgs}
+        self._file.write(json.dumps(summary) + "\n")
+        self._file.flush()
+        avg_parts = [f"{k}={v:.2f}" for k, v in avgs.items() if k != "mode"]
+        LOGGER.info("[PERF] rollout_summary blocks=%d %s", len(self._block_records), " ".join(avg_parts))
+        self._block_records.clear()
+
+    def close(self) -> None:
+        try:
+            self._file.close()
+        except Exception:
+            pass
+
 
 # Default outer block size: 1 conditional + 12 generated pixel frames
 # (= 4 latent frames). The 12 is overridable via
@@ -204,6 +262,7 @@ class CosmoshStepResult:
     chunk_index: int
     num_frames: int
     video_chunk: torch.Tensor  # [1, 3, 12, H, W] in [-1, 1] on CPU
+    timing: dict[str, float] | None = None  # per-block profiler stats; None when profiling is off
 
 
 # Common single-image extensions ``mediapy.read_image`` understands. Any
@@ -640,7 +699,7 @@ class CosmoshInferenceRuntime:
         """
         if self._closed:
             return False
-        return self.vr_state.apply_vr_input(payload)
+        return self.vr_state.apply_vr_input(payload, recv_t_ms=time.perf_counter() * 1000.0)
 
     async def generate_one_chunk_vr(self) -> CosmoshStepResult:
         """Render one outer block from the latest :class:`VRControllerState`.
@@ -1109,7 +1168,11 @@ class CosmoshInferenceRuntime:
             state.left.trigger,
         )
 
-        return self._render_chunk_from_actions(actions_np)
+        t_chunk_start_ms = time.perf_counter() * 1000.0
+        result = self._render_chunk_from_actions(actions_np)
+        if result.timing is not None and self.vr_state.t_ms > 0:  # t_ms is 0.0 until the first vr_input arrives
+            result.timing["input_age_ms"] = t_chunk_start_ms - self.vr_state.t_ms
+        return result
 
     def _render_chunk_from_actions(
         self, actions_np: np.ndarray
@@ -1172,6 +1235,7 @@ class CosmoshInferenceRuntime:
         # ``generate`` returns decoded pixels ``[1, T_pix, 3, H, W]``.
         pixel_frames: list[torch.Tensor] = []
         local_offset = 0
+        _block_timing: dict[str, float] = {}
         while True:
             ar_idx = self._global_ar_idx
             need = self._pipeline.get_num_actions(ar_idx)
@@ -1184,7 +1248,10 @@ class CosmoshInferenceRuntime:
             )
             pixels = self._pipeline.generate(ar_idx, self._cache, actions=chunk)
             pixels = pixels.clamp(min=-1.0, max=1.0)
-            self._pipeline.finalize(ar_idx, self._cache)
+            stats = self._pipeline.finalize(ar_idx, self._cache)
+            if stats:
+                for key, val in stats.items():
+                    _block_timing[key] = _block_timing.get(key, 0.0) + val
             local_offset += need
             self._global_ar_idx += 1
             # AR step 0's first decoded frame is the VAE reconstruction of the
@@ -1195,10 +1262,19 @@ class CosmoshInferenceRuntime:
         block_pixels = torch.cat(pixel_frames, dim=1)
         generated_b3thw = block_pixels.permute(0, 2, 1, 3, 4).contiguous()
 
+        if _block_timing and self._device is not None and self._device.type == "cuda":
+            torch.cuda.synchronize(self._device)
+            _t0_d2h = time.perf_counter()
+            video_chunk = generated_b3thw.detach().cpu()
+            _block_timing["d2h_ms"] = (time.perf_counter() - _t0_d2h) * 1000.0
+        else:
+            video_chunk = generated_b3thw.detach().cpu()
+
         result = CosmoshStepResult(
             chunk_index=self.autoregressive_index,
             num_frames=generated_b3thw.shape[2],
-            video_chunk=generated_b3thw.detach().cpu(),
+            video_chunk=video_chunk,
+            timing=_block_timing if _block_timing else None,
         )
         self.autoregressive_index += 1
         return result
@@ -1477,6 +1553,14 @@ class CosmoshWebRTCSessionManager:
                 managed_session=managed_session, payload=payload
             )
             return
+        if message_type == "latency_echo":
+            if _latency_profile_enabled():
+                LOGGER.info(
+                    "[PERF] browser chunk_id=%s recv_to_raf_ms=%.1f",
+                    payload.get("chunk_id"),
+                    float(payload.get("recv_to_raf_ms", 0)),
+                )
+            return
         if message_type != "action":
             self._send_json(
                 channel,
@@ -1526,7 +1610,7 @@ class CosmoshWebRTCSessionManager:
                 # generated frame from the pre-reset rollout.
                 managed_session.first_action_event.clear()
                 initial_chunk = managed_session.runtime.initial_frame_chunk()
-                await managed_session.video_track.enqueue_chunk(initial_chunk)
+                _ = await managed_session.video_track.enqueue_chunk(initial_chunk)
                 # Debug-override: ``runtime.reset()`` rewound the action cursor,
                 # so re-arm the loop to replay the recorded stream from the top.
                 if managed_session.runtime.debug_action_override:
@@ -1575,7 +1659,7 @@ class CosmoshWebRTCSessionManager:
                 dropped = managed_session.video_track.drain_pending()
                 managed_session.first_action_event.clear()
                 initial_chunk = managed_session.runtime.initial_frame_chunk()
-                await managed_session.video_track.enqueue_chunk(initial_chunk)
+                _ = await managed_session.video_track.enqueue_chunk(initial_chunk)
         except Exception as exc:
             LOGGER.exception("Scene switch to %r failed.", raw_name)
             self._send_json(channel, {"type": "error", "message": str(exc)})
@@ -1613,11 +1697,13 @@ class CosmoshWebRTCSessionManager:
         next time the user submits an action.
         """
         channel = managed_session.control_channel
+        latency_logger = _LatencyLogger("keyboard") if _latency_profile_enabled() else None
+        _t_prev_block_end: float | None = None
         try:
             try:
                 async with managed_session.render_lock:
                     initial_chunk = managed_session.runtime.initial_frame_chunk()
-                    await managed_session.video_track.enqueue_chunk(initial_chunk)
+                    _ = await managed_session.video_track.enqueue_chunk(initial_chunk)
             except Exception:
                 LOGGER.exception("Failed to enqueue initial conditional frame.")
 
@@ -1634,6 +1720,9 @@ class CosmoshWebRTCSessionManager:
                 await managed_session.first_action_event.wait()
                 if managed_session.closed:
                     break
+
+                if latency_logger is not None:
+                    _t_iter_start = time.perf_counter() * 1000.0
 
                 # Backpressure: don't run ahead of playback by more than the cap.
                 while (
@@ -1654,13 +1743,34 @@ class CosmoshWebRTCSessionManager:
                         result = await managed_session.runtime.apply_actions_and_generate(
                             actions
                         )
-                        enqueued = await managed_session.video_track.enqueue_chunk(
+                        enqueued, cast_ms = await managed_session.video_track.enqueue_chunk(
                             result.video_chunk
                         )
                 except Exception as exc:
                     LOGGER.exception("Render loop chunk failed.")
                     self._send_json(channel, {"type": "error", "message": str(exc)})
                     break
+
+                if latency_logger is not None:
+                    _t_iter_end = time.perf_counter() * 1000.0
+                    gap_ms = (_t_iter_start - _t_prev_block_end) if _t_prev_block_end is not None else None
+                    record: dict[str, Any] = {"block": result.chunk_index, "gap_ms": gap_ms}
+                    if result.timing:
+                        record.update({k: v for k, v in result.timing.items()
+                                       if k in ("encode_ms", "diffuse_ms", "decode_ms",
+                                                "finalize_ms", "d2h_ms", "input_age_ms")})
+                    recv_stats = managed_session.video_track.drain_recv_stats()
+                    record["cast_ms"] = cast_ms
+                    record["recv_wait_ms"] = recv_stats["recv_wait_ms"]
+                    record["pacing_ms"] = recv_stats["pacing_ms"]
+                    latency_logger.log_block(record)
+                    _t_prev_block_end = _t_iter_end
+                    if channel is not None:
+                        self._send_json(channel, {
+                            "type": "frame_ts",
+                            "chunk_id": result.chunk_index,
+                            "server_ms": time.perf_counter() * 1000.0,
+                        })
 
                 _fps_record_chunk(managed_session.fps_profile, result.num_frames)
 
@@ -1697,7 +1807,11 @@ class CosmoshWebRTCSessionManager:
                     },
                 )
         except asyncio.CancelledError:
-            return
+            pass
+        finally:
+            if latency_logger is not None:
+                latency_logger.log_rollout_summary()
+                latency_logger.close()
 
     async def _render_loop_debug(
         self, *, managed_session: _ManagedCosmoshSession
@@ -1742,7 +1856,7 @@ class CosmoshWebRTCSessionManager:
                             if result is None:
                                 exhausted = True
                                 break
-                            enqueued = await managed_session.video_track.enqueue_chunk(
+                            enqueued, _ = await managed_session.video_track.enqueue_chunk(
                                 result.video_chunk
                             )
                     except Exception as exc:

@@ -6,6 +6,8 @@ const eventLog = document.getElementById("eventLog")
 const remoteVideo = document.getElementById("remoteVideo")
 const sceneSelect = document.getElementById("sceneSelect")
 
+const LATENCY_ENABLED = new URLSearchParams(location.search).get('latency') === '1'
+
 // Set after /api/scenes resolves; mirrors what the server reports as the
 // initial scene. We keep it client-side so a failed switch can roll the
 // dropdown back to whatever the server is actually on.
@@ -111,6 +113,21 @@ function handleControlMessage(rawMessage) {
 
   if (payload.type === "error") {
     logEvent(`server error: ${payload.message}`)
+    return
+  }
+
+  if (payload.type === 'frame_ts' && LATENCY_ENABLED) {
+    const T_recv = performance.now()
+    requestAnimationFrame(() => {
+      const recv_to_raf_ms = performance.now() - T_recv
+      if (controlChannel && controlChannel.readyState === 'open') {
+        controlChannel.send(JSON.stringify({
+          type: 'latency_echo',
+          chunk_id: payload.chunk_id,
+          recv_to_raf_ms,
+        }))
+      }
+    })
     return
   }
 

@@ -4,6 +4,9 @@ compile_commands.json
 # Visual Studio Code configs.
 .vscode/
 
+# Superpowers agent working directory (plans, reports, diffs — not for VCS).
+.superpowers/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -139,3 +142,5 @@ sf_inference_data/
 *PLAN.md
 *.zip
 outputs_interactive/
+plans/
+*.jsonl
