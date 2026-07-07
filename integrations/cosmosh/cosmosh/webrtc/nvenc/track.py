@@ -105,6 +105,16 @@ class CosmoshNvencVideoTrack(MediaStreamTrack):
         """Number of markers buffered but not yet consumed by ``recv``."""
         return self._markers.qsize()
 
+    def drain_recv_stats(self) -> dict[str, float]:
+        """Return per-chunk recv-wait / pacing stats and reset accumulators.
+
+        Interface-compat stub matching :meth:`CosmoshVideoTrack.drain_recv_stats`
+        so the shared latency logger can consume either backend uniformly.
+        Zero-valued today; wire in real accumulators if per-frame NVENC-path
+        pacing telemetry becomes useful.
+        """
+        return {"recv_wait_ms": 0.0, "pacing_ms": 0.0}
+
     def drain_pending(self) -> int:
         """Discard any pending markers.
 

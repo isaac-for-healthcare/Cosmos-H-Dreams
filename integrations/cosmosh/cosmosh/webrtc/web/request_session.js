@@ -89,7 +89,7 @@ function handleControlMessage(rawMessage) {
   }
 
   if (payload.type === "reset_done") {
-    logEvent(`reset_done dropped_frames=${payload.dropped_frames}`)
+    logEvent("reset_done")
     setFlow("reset; render loop running")
     return
   }
@@ -99,9 +99,7 @@ function handleControlMessage(rawMessage) {
     if (sceneSelect.value !== payload.name) {
       sceneSelect.value = payload.name
     }
-    logEvent(
-      `scene_set name=${payload.name}, dropped_frames=${payload.dropped_frames}`
-    )
+    logEvent(`scene_set name=${payload.name}`)
     setFlow(`scene=${payload.name}; render loop idle`)
     return
   }

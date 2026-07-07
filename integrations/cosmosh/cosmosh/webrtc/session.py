@@ -30,6 +30,17 @@ from cosmosh.webrtc.controls_quest import (
     compute_action_chunk,
 )
 from cosmosh.webrtc.media import CosmoshVideoTrack
+from cosmosh.webrtc.nvenc import (
+    ENCODER_CPU_LIBAV,
+    ENCODER_NVENC,
+    CosmoshNvencVideoTrack,
+    DefaultRTCVideoEncoder,
+    NalFrame,
+    NvencConfig,
+    PyNvHardwareEncoder,
+    VideoEncoder,
+    denormalize_and_pack_argb,
+)
 from cosmosh.webrtc.utils import ACTION_DIM_NORMALISED
 from cosmosh.config import COSMOSH_RUNNERS
 from flashdreams.infra.config import derive_config
@@ -38,6 +49,20 @@ LOGGER = logging.getLogger(__name__)
 
 # Wan2.1 VAE spatial compression ratio (pixel resolution -> latent grid).
 WAN_SCR = 8
+
+
+def _nal_frame_has_sps(nf: NalFrame) -> bool:
+    """True iff ``nf`` carries an H.264 SPS NAL (unit type 7).
+
+    Used to discriminate the anchor IDR from stale P-frames buffered
+    inside NVENC at reset / scene-switch time: only the submit with
+    ``force_idr=True`` (which sets OUTPUT_SPSPPS) emits SPS, so SPS
+    presence uniquely tags our anchor in the encoder's output stream.
+    """
+    for unit in nf.nal_units:
+        if unit and (unit[0] & 0x1F) == 7:
+            return True
+    return False
 
 # ---------------------------------------------------------------------------
 # E2E frame-rate profiling
@@ -256,12 +281,42 @@ class CosmoshRuntimeConfig:
         default_factory=lambda: {"right": 1.0, "left": 1.0}
     )
 
+    # Video encoder selection. One of ``ENCODER_CPU_LIBAV`` (the current
+    # default — aiortc + libavcodec on CPU) or ``ENCODER_NVENC`` (NVIDIA
+    # NVENC via PyNvVideoCodec; pixel data stays GPU-resident through
+    # encode). Resolved against the auto/auto-fallback probe by the
+    # server's main() before the runtime is constructed; by the time we
+    # see this field it is already concrete (no ``auto``).
+    video_encoder: str = ENCODER_CPU_LIBAV
+    # NVENC tuning knobs — only used when ``video_encoder == ENCODER_NVENC``.
+    # Defaults match the unified_tabletop recommendation in the
+    # optimization design doc.
+    nvenc_preset: str = "P3"
+    nvenc_tuning: str = "ultra_low_latency"
+    nvenc_bitrate: int = 3_000_000
+    nvenc_idr_period_s: float = 4.0
+
 
 @dataclass(slots=True)
 class CosmoshStepResult:
+    """Result of one outer-block render or one initial-frame publish.
+
+    - CPU path (``video_encoder=cpu_libav``): ``video_chunk`` holds the
+      ``[1, 3, T, H, W]`` bf16/float32 tensor on CPU; the session
+      manager hands it to :meth:`CosmoshVideoTrack.enqueue_chunk` for
+      libavcodec H.264 encode.
+    - NVENC path (``video_encoder=nvenc``): the chunk has already been
+      packed to ARGB, encoded to H.264 NALs, and pushed to the encoder
+      adapter's queue *inside the runtime*. ``video_chunk`` is
+      :data:`None`; ``is_nvenc_published`` is :data:`True`. The session
+      manager dispatches to :meth:`CosmoshNvencVideoTrack.enqueue_markers`
+      based on this flag.
+    """
+
     chunk_index: int
     num_frames: int
-    video_chunk: torch.Tensor  # [1, 3, 12, H, W] in [-1, 1] on CPU
+    video_chunk: torch.Tensor | None = None
+    is_nvenc_published: bool = False
     timing: dict[str, float] | None = None  # per-block profiler stats; None when profiling is off
 
 
@@ -533,6 +588,20 @@ class CosmoshInferenceRuntime:
         self._closed = False
         self._step_lock = asyncio.Lock()
 
+        # Video encoder backend, populated in ``_initialize_sync``. One of
+        # :class:`PyNvHardwareEncoder` (NVENC path — installs the aiortc
+        # shim + owns the NAL queue itself) or
+        # :class:`DefaultRTCVideoEncoder` (aiortc SW path). Callers
+        # branch on ``isinstance`` when they need to know which backend
+        # is running; everything else goes through the Protocol.
+        self._video_encoder: VideoEncoder | None = None
+        # Tracks whether the previous chunk went through the NVENC encode
+        # path. On a False→True transition ``_publish_chunk`` resets the
+        # NVENC session and forces an IDR so a newly-attached WebRTC
+        # consumer starts from a clean keyframe rather than a P-frame that
+        # references stale (pre-skip) pipeline state.
+        self._last_nvenc_was_active: bool = False
+
         # Name of the currently-loaded scene (set by callers via
         # :meth:`set_active_scene_name` or :meth:`set_scene`). Independent of
         # ``config`` because the runtime is initialised with one scene's
@@ -621,22 +690,89 @@ class CosmoshInferenceRuntime:
         """Record the initial scene's name (called once at startup by the server)."""
         self._active_scene_name = name
 
-    def initial_frame_chunk(self) -> torch.Tensor:
-        """Return the conditional anchor frame as ``[1, 3, 1, H, W]`` on CPU.
+    def initial_frame_chunk(self) -> CosmoshStepResult:
+        """Publish the conditional anchor frame.
 
-        The video track's ``enqueue_chunk`` accepts ``[B, C, T, H, W]``; with
-        ``T=1`` it produces a single RGB frame the browser can display while
-        the render loop is paused.
+        CPU path: returns a :class:`CosmoshStepResult` whose
+        ``video_chunk`` is ``[1, 3, 1, H, W]`` on CPU, ready for
+        :meth:`CosmoshVideoTrack.enqueue_chunk`. With ``T=1`` it
+        produces a single RGB frame the browser can display while the
+        render loop is paused.
+
+        NVENC path: packs the anchor frame to ARGB on GPU, encodes
+        through NVENC with ``force_idr=True`` (so the client decoder
+        always has a valid keyframe to start from after session start /
+        reset / scene-switch), pushes the resulting NalFrame to the
+        adapter queue, and returns a result with ``video_chunk=None``
+        and ``num_frames=1``.
+
+        ``chunk_index`` is reported as ``-1`` because the initial
+        frame sits outside the regular outer-block autoregressive
+        index sequence.
         """
         if self._initial_cond_pixels is None:
             raise CosmoshRuntimeError("Runtime is not initialized.")
+
         # ``_initial_cond_pixels`` is ``[1, 1, 3, H, W]``; permute to
         # ``[1, 3, 1, H, W]`` to match the per-block video-chunk layout.
-        return (
-            self._initial_cond_pixels.permute(0, 2, 1, 3, 4)
-            .contiguous()
-            .detach()
-            .cpu()
+        initial_b3thw = (
+            self._initial_cond_pixels.permute(0, 2, 1, 3, 4).contiguous()
+        )
+        # Always produce the CPU tensor — the unified server's Quest
+        # manager consumes it directly for its MJPEG sink even when
+        # the keyboard manager is using the NVENC path.
+        cpu_chunk = initial_b3thw.detach().cpu()
+
+        if not isinstance(self._video_encoder, PyNvHardwareEncoder):
+            return CosmoshStepResult(
+                chunk_index=-1,
+                num_frames=1,
+                video_chunk=cpu_chunk,
+                is_nvenc_published=False,
+            )
+
+        # NVENC path — encode the anchor frame with a forced IDR so client
+        # decoders always start from a keyframe. On reset / scene-switch
+        # ``_reset_rollout_sync`` has already torn down NVENC's session
+        # so the pipeline is empty here. We deliberately do NOT touch
+        # the encoder's NAL queue: aiortc's sender may have an in-flight
+        # marker pulled, blocked inside ``encode()`` waiting for its
+        # paired NAL, and removing that NAL would break the
+        # marker↔NAL lockstep contract.
+        argb_chunk = denormalize_and_pack_argb(initial_b3thw)
+        # NVENC's internal pipeline depth varies by SDK / driver; observed
+        # ≥2 on PyNvVideoCodec 2.x. Keep submitting the anchor frame and
+        # consume buffered output until we see the anchor IDR (identified
+        # by an SPS NAL — only force_idr=True submits carry OUTPUT_SPSPPS,
+        # so SPS presence uniquely tags our anchor). Outputs emitted
+        # before the IDR are stale P-frames from a prior rollout
+        # (on reset / scene-switch) — discarded. Any anchor copies
+        # remaining inside NVENC after we break out surface as the first
+        # outputs of the next render chunk; identical to the displayed
+        # anchor so visually invisible.
+        raw_encoder = self._video_encoder.raw_encoder()
+        anchor_nal: NalFrame | None = None
+        max_submits = 64
+        for i in range(max_submits):
+            out = raw_encoder.encode_chunk(argb_chunk, force_idr=(i == 0))
+            for nf in out:
+                if _nal_frame_has_sps(nf):
+                    anchor_nal = nf
+                    break
+            if anchor_nal is not None:
+                break
+        if anchor_nal is None:
+            raise CosmoshRuntimeError(
+                "NVENC failed to emit the anchor IDR after "
+                f"{max_submits} submits — encoder pipeline depth exceeds "
+                "expected bounds."
+            )
+        self._video_encoder.nal_queue.put(anchor_nal)
+        return CosmoshStepResult(
+            chunk_index=-1,
+            num_frames=1,
+            video_chunk=cpu_chunk,
+            is_nvenc_published=True,
         )
 
     async def close(self) -> None:
@@ -701,11 +837,30 @@ class CosmoshInferenceRuntime:
             return False
         return self.vr_state.apply_vr_input(payload, recv_t_ms=time.perf_counter() * 1000.0)
 
-    async def generate_one_chunk_vr(self) -> CosmoshStepResult:
+    async def generate_one_chunk_vr(
+        self,
+        *,
+        caller_needs_cpu_chunk: bool = True,
+        caller_needs_nvenc_output: bool = True,
+    ) -> CosmoshStepResult:
         """Render one outer block from the latest :class:`VRControllerState`.
 
         Serialised against keyboard / VR / reset paths via the step lock so
         only one GPU pipeline call is in flight at a time.
+
+        When the Quest manager is on the WebRTC video transport AND no
+        ``/viewer`` spectator is attached, it can pass
+        ``caller_needs_cpu_chunk=False`` to let the runtime skip the
+        ``.cpu()`` copy (replaced by an explicit CUDA stream sync). The
+        default ``True`` preserves the legacy MJPEG-friendly behaviour.
+
+        ``caller_needs_nvenc_output=False`` additionally skips the NVENC
+        pack + encode + NAL-queue push — for Quest on MJPEG transport (or
+        WebRTC transport with no browser connected), where the H.264 bytes
+        would go straight into an unbounded queue with no consumer. Skips
+        are transparent: on the next call with ``True`` the runtime resets
+        the encoder session and forces an IDR so the newly-attached
+        consumer starts from a clean keyframe.
         """
         if self._closed:
             raise CosmoshRuntimeError("Session is closed.")
@@ -714,7 +869,11 @@ class CosmoshInferenceRuntime:
         async with self._step_lock:
             if self._closed:
                 raise CosmoshRuntimeError("Session is closed.")
-            return await asyncio.to_thread(self._generate_one_chunk_vr_sync)
+            return await asyncio.to_thread(
+                self._generate_one_chunk_vr_sync,
+                caller_needs_cpu_chunk,
+                caller_needs_nvenc_output,
+            )
 
     async def generate_one_chunk_debug(self) -> CosmoshStepResult | None:
         """Render one chunk from the recorded debug action stream.
@@ -910,14 +1069,61 @@ class CosmoshInferenceRuntime:
 
         self._reset_rollout_sync()
 
+        # Video encoder construction. The session manager runs the
+        # auto/probe resolution before constructing the runtime, so by
+        # the time we get here ``config.video_encoder`` is concrete
+        # (``nvenc`` or ``cpu_libav``, never ``auto``).
+        #
+        # For NVENC: PyNvVideoCodec is imported inside
+        # :class:`CosmoshNvencH264.__init__` (which
+        # :class:`PyNvHardwareEncoder` wraps); the aiortc shim install
+        # + codec restriction also happen in
+        # :meth:`PyNvHardwareEncoder.__init__`, so the session manager
+        # doesn't need to know about either.
+        if self.config.video_encoder == ENCODER_NVENC:
+            nvenc_cfg = NvencConfig(
+                width=wt,
+                height=ht,
+                fps=self.config.fps,
+                bitrate=self.config.nvenc_bitrate,
+                preset=self.config.nvenc_preset,
+                tuning=self.config.nvenc_tuning,
+                idr_period_s=self.config.nvenc_idr_period_s,
+                gpu_id=(self._device.index or 0),
+            )
+            # ``apply_encoder_settings`` already ran the deep probe via
+            # ``GetEncoderCaps`` — reaching this branch means caps say
+            # NVENC + H.264 is usable at this resolution. If
+            # ``CreateEncoder`` still fails from here, that's a *real*
+            # environmental problem (driver bug, session-pool
+            # exhaustion, hardware fault) rather than an environmental
+            # mismatch. Log with traceback and re-raise so it surfaces
+            # at startup instead of getting silently masked by a
+            # fallback to the CPU path.
+            try:
+                self._video_encoder = PyNvHardwareEncoder(nvenc_cfg)
+            except Exception:
+                LOGGER.exception(
+                    "NVENC capability probe reported support but "
+                    "``PyNvHardwareEncoder`` construction failed. "
+                    "Not masking the failure with a silent cpu_libav "
+                    "fallback — investigate driver / session-pool / "
+                    "hardware state on GPU %d.",
+                    nvenc_cfg.gpu_id,
+                )
+                raise
+        else:
+            self._video_encoder = DefaultRTCVideoEncoder(fps=self.config.fps)
+
         LOGGER.info(
             "Cosmosh runtime initialized: config_name=%s resolution=%dx%d "
-            "action_dim=%d actions_per_chunk=%d",
+            "action_dim=%d actions_per_chunk=%d video_encoder=%s",
             self.config.config_name,
             ht,
             wt,
             self._action_target_dim,
             self.actions_per_chunk,
+            self.config.video_encoder,
         )
         LOGGER.info(
             "Gripper endpoints from %s: psm1=[closed=%.3f, open=%.3f] "
@@ -947,6 +1153,17 @@ class CosmoshInferenceRuntime:
         self._vr_psm2_pos = np.zeros(3, dtype=np.float64)
         # Rewind the debug action stream so a reset replays from the start.
         self._debug_cursor = 0
+        # Drop NVENC's buffered frames. We do NOT drain the runtime's
+        # NAL queue here — aiortc's RTP sender may have already pulled a
+        # marker and be blocked inside encode() waiting for its paired
+        # NAL; removing that NAL out from under it breaks the lockstep
+        # marker↔NAL contract and the next anchor submission would
+        # double-consume on one side. Letting the queue flush naturally
+        # costs at most one prior chunk's worth of pre-reset motion
+        # (~0.4 s at 30 fps), and the anchor IDR re-anchors the browser
+        # decoder cleanly on arrival.
+        if self._video_encoder is not None:
+            self._video_encoder.reset_session()
 
     def _set_scene_sync(self, scene: Scene) -> None:
         if self._pipeline is None:
@@ -1023,11 +1240,23 @@ class CosmoshInferenceRuntime:
     def _close_sync(self) -> None:
         pipeline = self._pipeline
         cache = self._cache
+        video_encoder = self._video_encoder
         self._pipeline = None
         self._cache = None
+        self._video_encoder = None
         self._text_embeddings = None
         self._initial_cond_pixels = None
         self._cond_pixels = None
+
+        # Close the encoder before releasing PyTorch resources so any
+        # NVENC-owned CUDA state finishes its flush against a still-valid
+        # CUDA context. ``PyNvHardwareEncoder.close`` also uninstalls the
+        # aiortc shim; ``DefaultRTCVideoEncoder.close`` is a no-op.
+        if video_encoder is not None:
+            try:
+                video_encoder.close()
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("Video encoder close raised; continuing.")
 
         for obj in (pipeline, cache):
             if obj is not None:
@@ -1115,7 +1344,11 @@ class CosmoshInferenceRuntime:
         return self._render_chunk_from_actions(actions_np)
 
     @torch.inference_mode()
-    def _generate_one_chunk_vr_sync(self) -> CosmoshStepResult:
+    def _generate_one_chunk_vr_sync(
+        self,
+        caller_needs_cpu_chunk: bool = True,
+        caller_needs_nvenc_output: bool = True,
+    ) -> CosmoshStepResult:
         """VR variant of :meth:`_generate_one_chunk_sync`.
 
         Snapshots the current :class:`VRControllerState` (latest-sample-wins
@@ -1128,6 +1361,13 @@ class CosmoshInferenceRuntime:
         PSM1 rot6d stats live on the keyboard integrator (loaded from
         ``stats_cosmos.json`` at init); we reuse them rather than threading
         a second copy through the runtime.
+
+        ``caller_needs_cpu_chunk`` is forwarded to
+        :meth:`_render_chunk_from_actions`; the Quest manager passes
+        ``False`` on the WebRTC transport when no MJPEG spectator is
+        attached, letting the runtime skip the ``.cpu()`` host copy
+        (an explicit ``torch.cuda.synchronize`` runs in its place
+        before the NVENC submit — see ``_publish_chunk``).
         """
         state = self.vr_state
         consumed = self._count_consumed_actions()
@@ -1169,13 +1409,21 @@ class CosmoshInferenceRuntime:
         )
 
         t_chunk_start_ms = time.perf_counter() * 1000.0
-        result = self._render_chunk_from_actions(actions_np)
+        result = self._render_chunk_from_actions(
+            actions_np,
+            caller_needs_cpu_chunk=caller_needs_cpu_chunk,
+            caller_needs_nvenc_output=caller_needs_nvenc_output,
+        )
         if result.timing is not None and self.vr_state.t_ms > 0:  # t_ms is 0.0 until the first vr_input arrives
             result.timing["input_age_ms"] = t_chunk_start_ms - self.vr_state.t_ms
         return result
 
     def _render_chunk_from_actions(
-        self, actions_np: np.ndarray
+        self,
+        actions_np: np.ndarray,
+        *,
+        caller_needs_cpu_chunk: bool = True,
+        caller_needs_nvenc_output: bool = True,
     ) -> CosmoshStepResult:
         """Shared flat-AR body for the keyboard and VR paths.
 
@@ -1262,22 +1510,117 @@ class CosmoshInferenceRuntime:
         block_pixels = torch.cat(pixel_frames, dim=1)
         generated_b3thw = block_pixels.permute(0, 2, 1, 3, 4).contiguous()
 
-        if _block_timing and self._device is not None and self._device.type == "cuda":
-            torch.cuda.synchronize(self._device)
-            _t0_d2h = time.perf_counter()
-            video_chunk = generated_b3thw.detach().cpu()
-            _block_timing["d2h_ms"] = (time.perf_counter() - _t0_d2h) * 1000.0
-        else:
-            video_chunk = generated_b3thw.detach().cpu()
-
-        result = CosmoshStepResult(
-            chunk_index=self.autoregressive_index,
-            num_frames=generated_b3thw.shape[2],
-            video_chunk=video_chunk,
-            timing=_block_timing if _block_timing else None,
+        result = self._publish_chunk(
+            generated_b3thw,
+            caller_needs_cpu_chunk=caller_needs_cpu_chunk,
+            caller_needs_nvenc_output=caller_needs_nvenc_output,
+            block_timing=_block_timing if _block_timing else None,
         )
         self.autoregressive_index += 1
         return result
+
+    def _publish_chunk(
+        self,
+        generated_b3thw: torch.Tensor,
+        *,
+        force_idr: bool = False,
+        caller_needs_cpu_chunk: bool = True,
+        caller_needs_nvenc_output: bool = True,
+        block_timing: dict[str, float] | None = None,
+    ) -> CosmoshStepResult:
+        """Publish one chunk through the active video-encoder path.
+
+        CPU path: copy the GPU tensor to host and return a
+        :class:`CosmoshStepResult` carrying it.
+
+        NVENC path: pack the chunk to ARGB on the GPU, encode through
+        NVENC, push one :class:`NalFrame` per generated frame into the
+        adapter's queue. Also produces the CPU tensor when
+        ``caller_needs_cpu_chunk`` is True (MJPEG sink / libav
+        fallback); otherwise the ``.cpu()`` copy is skipped and an
+        explicit ``torch.cuda.synchronize`` runs before NVENC submit
+        so the encoder sees fully-written GPU memory.
+
+        ``force_idr`` is consulted on the NVENC path only; the CPU
+        encoder forces keyframes on its own internal cadence (and on
+        aiortc's RTCP PLI handling).
+
+        ``block_timing``: when non-None, ``d2h_ms`` is recorded around
+        the ``.cpu()`` copy (skipped on NVENC-only rollouts). Attached
+        to the returned result's ``timing`` field.
+        """
+        # Whether NVENC actually runs this chunk. False when the encoder
+        # isn't configured at all (CPU libav path), or when the caller
+        # has no WebRTC consumer attached (e.g., Quest on MJPEG
+        # transport, or Quest on WebRTC transport before the browser
+        # opens the peer connection). Skipping saves the ARGB pack +
+        # NVENC encode + NAL queue push per chunk.
+        nvenc_active = (
+            isinstance(self._video_encoder, PyNvHardwareEncoder)
+            and caller_needs_nvenc_output
+        )
+
+        # CPU tensor is produced when any caller needs it (MJPEG sink or
+        # libav fallback). On the NVENC + WebRTC path with no spectator
+        # attached we skip the .cpu() host copy and substitute an
+        # explicit CUDA sync before NVENC submit so the encoder sees
+        # fully-written GPU memory.
+        need_cpu = caller_needs_cpu_chunk or not nvenc_active
+        if need_cpu:
+            if (
+                block_timing is not None
+                and self._device is not None
+                and self._device.type == "cuda"
+            ):
+                torch.cuda.synchronize(self._device)
+                _t0_d2h = time.perf_counter()
+                cpu_chunk = generated_b3thw.detach().cpu()
+                block_timing["d2h_ms"] = (time.perf_counter() - _t0_d2h) * 1000.0
+            else:
+                cpu_chunk = generated_b3thw.detach().cpu()
+        else:
+            cpu_chunk = None
+
+        if not nvenc_active:
+            self._last_nvenc_was_active = False
+            return CosmoshStepResult(
+                chunk_index=self.autoregressive_index,
+                num_frames=generated_b3thw.shape[2],
+                video_chunk=cpu_chunk,
+                is_nvenc_published=False,
+                timing=block_timing,
+            )
+
+        # Transition from "no consumer" to "consumer attached": reset
+        # NVENC's internal pipeline so we don't emit stale pre-skip
+        # frames, and force the next output to be an IDR so the newly-
+        # attached browser can start decoding immediately (rather than
+        # waiting up to idr_period_s for the next natural IDR).
+        assert isinstance(self._video_encoder, PyNvHardwareEncoder)  # narrow for type checker
+        if not self._last_nvenc_was_active:
+            self._video_encoder.reset_session()
+            force_idr = True
+        self._last_nvenc_was_active = True
+
+        # NVENC path — encode the GPU tensor.
+        if not need_cpu and generated_b3thw.is_cuda:
+            # The .cpu() copy above acted as an implicit CUDA stream
+            # sync; without it, NVENC could read torn / in-flight pixel
+            # data. Sync explicitly.
+            torch.cuda.synchronize(generated_b3thw.device)
+        argb_chunk = denormalize_and_pack_argb(generated_b3thw)
+        raw_encoder = self._video_encoder.raw_encoder()
+        nal_frames = raw_encoder.encode_chunk(argb_chunk, force_idr=force_idr)
+        nal_queue = self._video_encoder.nal_queue
+        for nf in nal_frames:
+            nal_queue.put(nf)
+        return CosmoshStepResult(
+            chunk_index=self.autoregressive_index,
+            num_frames=len(nal_frames),
+            video_chunk=cpu_chunk,
+            is_nvenc_published=True,
+            timing=block_timing,
+        )
 
 
 # Cap the video track's outstanding frame buffer at two outer blocks so a
@@ -1394,6 +1737,9 @@ class CosmoshWebRTCSessionManager:
             return
         await self._runtime.initialize()
         self._runtime_ready = True
+        # NVENC adapter wiring — the aiortc shim install + codec
+        # restriction happen inside :meth:`PyNvHardwareEncoder.__init__`
+        # during ``_initialize_sync``, so nothing to do here.
 
     async def create_answer(self, *, offer_sdp: str, offer_type: str) -> dict[str, str]:
         try:
@@ -1421,7 +1767,12 @@ class CosmoshWebRTCSessionManager:
             await self._runtime.reset_for_new_session()
 
             peer_connection = RTCPeerConnection()
-            video_track = CosmoshVideoTrack(fps=self.fps)
+            if self._runtime._video_encoder is None:
+                raise CosmoshRuntimeError(
+                    "Runtime video encoder not initialized; "
+                    "``initialize()`` must complete before create_answer."
+                )
+            video_track = self._runtime._video_encoder.create_track()
             peer_connection.addTrack(video_track)
             managed_session = _ManagedCosmoshSession(
                 runtime=self._runtime,
@@ -1497,6 +1848,37 @@ class CosmoshWebRTCSessionManager:
         if had_active:
             self._publish_driver("idle")
 
+    @staticmethod
+    async def _publish_step_to_track(
+        video_track: Any, result: CosmoshStepResult
+    ) -> tuple[int, float]:
+        """Hand a step result to whichever video track is in use.
+
+        Dispatch keys on the **track type**, not the result flag,
+        because in NVENC mode the runtime emits *both* the CPU tensor
+        (consumed by Quest's MJPEG path) and the NVENC NAL queue
+        (consumed by the keyboard's WebRTC path). Each session manager
+        picks the right field for its track.
+
+        Returns ``(enqueued, cast_ms)`` — the number of frames or
+        markers enqueued and the float->uint8 cast time (0.0 on the
+        NVENC path, which has no cast). Shape matches
+        :meth:`CosmoshVideoTrack.enqueue_chunk` so the latency logger
+        can consume either backend's return value uniformly.
+        """
+        if isinstance(video_track, CosmoshNvencVideoTrack):
+            assert result.is_nvenc_published, (
+                "NvencVideoTrack expects an NVENC-published result "
+                "(runtime did not push NalFrames for this chunk)."
+            )
+            enqueued = await video_track.enqueue_markers(num_frames=result.num_frames)
+            return enqueued, 0.0
+        assert isinstance(video_track, CosmoshVideoTrack)
+        assert result.video_chunk is not None, (
+            "CPU video track expects a non-None video_chunk."
+        )
+        return await video_track.enqueue_chunk(result.video_chunk)
+
     def _publish_driver(self, name: str) -> None:
         """Broadcast a 'driver' event for the unified server's admin panel.
 
@@ -1511,6 +1893,9 @@ class CosmoshWebRTCSessionManager:
 
     async def shutdown(self) -> None:
         await self.close_active_session()
+        # ``runtime.close()`` invokes ``video_encoder.close()``, which for
+        # :class:`PyNvHardwareEncoder` uninstalls the aiortc shim.
+        # No further teardown needed here.
         await self._runtime.close()
         self._runtime_ready = False
 
@@ -1596,21 +1981,29 @@ class CosmoshWebRTCSessionManager:
             return
 
         # The render lock guarantees no chunk is in flight while we mutate
-        # runtime state and drain the video track. The lock acquisition will
-        # block at most one chunk's worth of inference time.
+        # runtime state. The lock acquisition will block at most one
+        # chunk's worth of inference time.
         try:
             async with managed_session.render_lock:
                 managed_session.pending_actions.clear()
                 await managed_session.runtime.reset()
                 _fps_reset_profile(managed_session.fps_profile)
-                dropped = managed_session.video_track.drain_pending()
-                # Re-arm the input gate so the render loop pauses on its
-                # next iteration, then push the conditional anchor frame so
-                # the browser shows the starting pose instead of the last
-                # generated frame from the pre-reset rollout.
+                # Deliberately do NOT drain the video track's marker queue
+                # (or the runtime-owned NAL queue) here. Those two queues
+                # hold paired entries that aiortc's sender consumes in
+                # lockstep — draining one without the other breaks the
+                # pairing and the sender ends up emitting stale NALs for
+                # the newly-enqueued anchor marker, so the browser sits
+                # on old frames until the user presses a key. Letting
+                # both queues flush naturally costs at most one chunk's
+                # worth of pre-reset motion (~0.4 s at 30 fps under the
+                # existing backpressure cap), then the anchor IDR
+                # re-anchors the decoder cleanly.
                 managed_session.first_action_event.clear()
-                initial_chunk = managed_session.runtime.initial_frame_chunk()
-                _ = await managed_session.video_track.enqueue_chunk(initial_chunk)
+                initial_result = managed_session.runtime.initial_frame_chunk()
+                await self._publish_step_to_track(
+                    managed_session.video_track, initial_result
+                )
                 # Debug-override: ``runtime.reset()`` rewound the action cursor,
                 # so re-arm the loop to replay the recorded stream from the top.
                 if managed_session.runtime.debug_action_override:
@@ -1620,11 +2013,8 @@ class CosmoshWebRTCSessionManager:
             self._send_json(channel, {"type": "error", "message": str(exc)})
             return
 
-        LOGGER.info("Reset: cleared rollout state and %d pending frames.", dropped)
-        self._send_json(
-            channel,
-            {"type": "reset_done", "dropped_frames": dropped},
-        )
+        LOGGER.info("Reset: cleared rollout state and pushed a fresh anchor frame.")
+        self._send_json(channel, {"type": "reset_done"})
 
     async def _handle_set_scene(
         self,
@@ -1650,31 +2040,30 @@ class CosmoshWebRTCSessionManager:
             )
             return
 
-        # Same render-lock contract as reset: drain pending actions and the
-        # video track, swap the runtime's scene, push the new anchor frame.
+        # Same render-lock contract as reset: swap the runtime's scene,
+        # then push the new anchor frame. As in ``_handle_reset``, we do
+        # NOT drain the video track's marker queue or the NAL queue —
+        # those pairs must be consumed in lockstep by aiortc's sender.
         try:
             async with managed_session.render_lock:
                 managed_session.pending_actions.clear()
                 await managed_session.runtime.set_scene(scene)
-                dropped = managed_session.video_track.drain_pending()
                 managed_session.first_action_event.clear()
-                initial_chunk = managed_session.runtime.initial_frame_chunk()
-                _ = await managed_session.video_track.enqueue_chunk(initial_chunk)
+                initial_result = managed_session.runtime.initial_frame_chunk()
+                await self._publish_step_to_track(
+                    managed_session.video_track, initial_result
+                )
         except Exception as exc:
             LOGGER.exception("Scene switch to %r failed.", raw_name)
             self._send_json(channel, {"type": "error", "message": str(exc)})
             return
 
         LOGGER.info(
-            "Scene switched to %r; cleared %d pending frames.", scene.name, dropped
+            "Scene switched to %r; anchor frame pushed.", scene.name
         )
         self._send_json(
             channel,
-            {
-                "type": "scene_set",
-                "name": scene.name,
-                "dropped_frames": dropped,
-            },
+            {"type": "scene_set", "name": scene.name},
         )
 
     async def _render_loop(
@@ -1702,8 +2091,10 @@ class CosmoshWebRTCSessionManager:
         try:
             try:
                 async with managed_session.render_lock:
-                    initial_chunk = managed_session.runtime.initial_frame_chunk()
-                    _ = await managed_session.video_track.enqueue_chunk(initial_chunk)
+                    initial_result = managed_session.runtime.initial_frame_chunk()
+                    await self._publish_step_to_track(
+                        managed_session.video_track, initial_result
+                    )
             except Exception:
                 LOGGER.exception("Failed to enqueue initial conditional frame.")
 
@@ -1743,8 +2134,8 @@ class CosmoshWebRTCSessionManager:
                         result = await managed_session.runtime.apply_actions_and_generate(
                             actions
                         )
-                        enqueued, cast_ms = await managed_session.video_track.enqueue_chunk(
-                            result.video_chunk
+                        enqueued, cast_ms = await self._publish_step_to_track(
+                            managed_session.video_track, result
                         )
                 except Exception as exc:
                     LOGGER.exception("Render loop chunk failed.")

@@ -13,14 +13,14 @@
 #   /viewer            spectator MJPEG view
 
 runtime:
-  config_name: vae_vae
+  config_name: cosmosh-chunk3-vae-vae
   compile_network: true
   device: cuda:0
   seed: 1
   ckpt_path: checkpoints/jhu/tabletop/model_ema_bf16_jhutabletop_288x512.pt
   resolution: [288, 512]
   fps: 30
-  actions_per_chunk: 8  # 4 / 8 / 12 / 16…; smaller = lower latency, lower fidelity
+  actions_per_chunk: 12  # 4 / 8 / 12 / 16…; smaller = lower latency, lower fidelity
 
 scenes:
   - name: suturebot_001867
@@ -60,9 +60,26 @@ vr:
     width_m: 1
     height_m: 0.75
     distance_m: 1.2
+  # Quest headset video transport: ``webrtc`` (default for this profile)
+  # uses an RTCPeerConnection carrying the H.264 stream NVENC is already
+  # producing for the keyboard path; ``mjpeg`` falls back to the legacy
+  # multipart-JPEG-over-HTTP path on /video. The /viewer spectator page
+  # always uses MJPEG regardless of this knob.
+  video_transport: webrtc
 
 video:
+  # Quest MJPEG sink quality (unchanged).
   jpeg_quality: 85
+
+  # Keyboard / WebRTC path: encode via NVIDIA NVENC. Falls back to
+  # cpu_libav automatically on hosts without PyNvVideoCodec + CUDA.
+  # Override per-launch with --encoder cpu_libav.
+  encoder: auto
+  nvenc:
+    preset: P3
+    tuning: ultra_low_latency
+    bitrate: 3000000        # bits per second
+    idr_period_s: 4.0       # seconds between forced IDR frames
 
 # HTTPS required because WebXR (Quest) refuses to start on non-localhost
 # origins without TLS. The keyboard demo works fine over HTTPS too —

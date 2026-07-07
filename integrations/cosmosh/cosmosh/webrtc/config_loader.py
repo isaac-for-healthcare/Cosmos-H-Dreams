@@ -69,6 +69,17 @@ Schema (full)::
     video:
       jpeg_quality: 85
 
+      # Keyboard server (WebRTC H.264) — opt-in NVENC acceleration.
+      # Values: auto | nvenc | cpu_libav. Default: cpu_libav.
+      # See cosmosh.webrtc.nvenc.resolver for precedence and the auto probe.
+      encoder: cpu_libav
+      # NVENC-only sub-block. Ignored when encoder != nvenc.
+      nvenc:
+        preset: P3
+        tuning: ultra_low_latency
+        bitrate: 3000000        # bits per second
+        idr_period_s: 4.0       # seconds between forced IDR frames
+
     # Both servers (cert/key only used by Quest)
     server:
       cert: cert.pem
@@ -87,6 +98,14 @@ from typing import Any
 
 import yaml
 
+from cosmosh.webrtc.nvenc.resolver import (
+    ENCODER_CPU_LIBAV,
+    VALID_ENCODERS,
+    normalize_encoder_value,
+    read_encoder_env,
+    resolve_encoder,
+    select_requested_encoder,
+)
 from cosmosh.webrtc.session import CosmoshRuntimeConfig, Scene
 
 LOGGER = logging.getLogger(__name__)
@@ -471,6 +490,177 @@ def _parse_display_section(value: Any) -> dict[str, float]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Encoder (video.encoder + video.nvenc.*) — used by the keyboard/WebRTC path.
+# ---------------------------------------------------------------------------
+
+# Defaults for the NVENC sub-block. Match what the design doc proposes
+# for the unified_tabletop profile.
+_NVENC_DEFAULTS: dict[str, Any] = {
+    "preset": "P3",
+    "tuning": "ultra_low_latency",
+    "bitrate": 3_000_000,
+    "idr_period_s": 4.0,
+}
+_NVENC_KNOWN: frozenset[str] = frozenset(_NVENC_DEFAULTS.keys())
+
+
+def _validate_nvenc_block(raw: dict[str, Any]) -> dict[str, Any]:
+    """Validate ``video.nvenc.*`` and merge with defaults.
+
+    Unknown keys log a warning (typo guard). Missing keys take the
+    defaults in :data:`_NVENC_DEFAULTS`. Bitrate and IDR period are
+    validated to be positive — non-positive is almost always a typo.
+    """
+    if not isinstance(raw, dict):
+        raise ConfigError("video.nvenc must be a mapping")
+    for key in raw.keys():
+        if key not in _NVENC_KNOWN:
+            LOGGER.warning(
+                "Unknown video.nvenc key %r — typo? Known keys: %s",
+                key,
+                sorted(_NVENC_KNOWN),
+            )
+    out: dict[str, Any] = dict(_NVENC_DEFAULTS)
+    if "preset" in raw:
+        out["preset"] = str(raw["preset"])
+    if "tuning" in raw:
+        out["tuning"] = str(raw["tuning"])
+    if "bitrate" in raw:
+        try:
+            bitrate = int(raw["bitrate"])
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(
+                f"video.nvenc.bitrate must be an integer; got {raw['bitrate']!r}"
+            ) from exc
+        if bitrate <= 0:
+            raise ConfigError(
+                f"video.nvenc.bitrate must be > 0; got {bitrate}"
+            )
+        out["bitrate"] = bitrate
+    if "idr_period_s" in raw:
+        try:
+            idr = float(raw["idr_period_s"])
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(
+                "video.nvenc.idr_period_s must be a number; got "
+                f"{raw['idr_period_s']!r}"
+            ) from exc
+        if idr <= 0:
+            raise ConfigError(
+                f"video.nvenc.idr_period_s must be > 0; got {idr}"
+            )
+        out["idr_period_s"] = idr
+    return out
+
+
+def apply_encoder_settings(
+    runtime_config: CosmoshRuntimeConfig,
+    cfg: dict[str, Any],
+    *,
+    cli_value: str | None = None,
+) -> str:
+    """Resolve the encoder choice and write it onto ``runtime_config``.
+
+    Precedence (highest first):
+
+      1. CLI flag (``--encoder``)
+      2. ``COSMOSH_VIDEO_ENCODER`` environment variable
+      3. ``video.encoder`` field in the YAML config
+      4. Code default (``cpu_libav`` — the safe fallback when no layer specifies)
+
+    ``auto`` is resolved against the NVENC probe at startup; the
+    function logs the resolution at INFO so operators always know
+    which encoder path is active. Returns the active encoder string
+    (one of :data:`ENCODER_NVENC` or :data:`ENCODER_CPU_LIBAV`; never
+    ``auto`` — that has already been resolved).
+
+    Raises :class:`cosmosh.webrtc.nvenc.NvencUnavailableError` if the
+    user explicitly asked for ``nvenc`` but the probe says NVENC is
+    not usable in this process — the call site is expected to let
+    that bubble up to ``main()`` so the server fails fast on
+    misconfigured rigs.
+    """
+    encoder_settings = get_encoder_settings(cfg)
+    requested = select_requested_encoder(
+        cli_value=cli_value,
+        env_value=read_encoder_env(),
+        yaml_value=encoder_settings["encoder"],
+        code_default=ENCODER_CPU_LIBAV,
+    )
+    # Thread target resolution into the resolver so the probe can call
+    # ``GetEncoderCaps`` and reject configurations the GPU cannot encode
+    # (e.g., a resolution outside the driver-reported bounds) before
+    # ``CreateEncoder`` fails at initialize-time. ``resolution`` is stored
+    # as ``[height, width]``; pass a zero-fallback if it's unset so the
+    # probe falls back to its shallow (import + CUDA) check.
+    res = getattr(runtime_config, "resolution", None) or (0, 0)
+    height = int(res[0]) if len(res) >= 1 else 0
+    width = int(res[1]) if len(res) >= 2 else 0
+    active, reason = resolve_encoder(
+        requested,
+        gpu_id=0,
+        width=width,
+        height=height,
+    )
+    LOGGER.info("Video encoder: %r (%s).", active, reason)
+
+    runtime_config.video_encoder = active
+    nvenc_block = encoder_settings["nvenc"]
+    runtime_config.nvenc_preset = str(nvenc_block["preset"])
+    runtime_config.nvenc_tuning = str(nvenc_block["tuning"])
+    runtime_config.nvenc_bitrate = int(nvenc_block["bitrate"])
+    runtime_config.nvenc_idr_period_s = float(nvenc_block["idr_period_s"])
+    return active
+
+
+def get_encoder_settings(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Extract the video-encoder choice + NVENC tuning from the YAML.
+
+    Returns::
+
+        {
+          "encoder": str,   # YAML-level request, one of VALID_ENCODERS.
+                            # Defaults to ENCODER_CPU_LIBAV when absent.
+                            # The final encoder used at runtime is resolved
+                            # by the server's main() against the precedence
+                            # chain (CLI > env > this YAML value > code
+                            # default), and the auto-probe runs there.
+          "nvenc": dict,    # Validated video.nvenc.* sub-block (see
+                            # _validate_nvenc_block). Always populated with
+                            # defaults so the NVENC encoder wrapper can
+                            # consume it unconditionally.
+        }
+
+    This function intentionally does NOT call the resolver — it only
+    reports what the YAML asks for. The server is responsible for
+    applying CLI / env overrides and resolving ``auto`` at startup.
+    """
+    video = cfg.get("video") or {}
+    if not isinstance(video, dict):
+        raise ConfigError("video section must be a mapping")
+
+    requested_raw = video.get("encoder")
+    requested = normalize_encoder_value(requested_raw)
+    if requested is None:
+        requested = ENCODER_CPU_LIBAV
+    elif requested not in VALID_ENCODERS:
+        valid = ", ".join(sorted(VALID_ENCODERS))
+        raise ConfigError(
+            f"video.encoder must be one of [{valid}]; got {requested_raw!r}"
+        )
+
+    nvenc_raw = video.get("nvenc") or {}
+    nvenc = _validate_nvenc_block(nvenc_raw)
+
+    return {"encoder": requested, "nvenc": nvenc}
+
+
+# ---------------------------------------------------------------------------
+# VR (browser) settings
+# ---------------------------------------------------------------------------
+
+
 def get_vr_browser_settings(cfg: dict[str, Any]) -> dict[str, Any]:
     """Return the subset of ``vr:`` that the browser needs to know about.
 
@@ -486,4 +676,32 @@ def get_vr_browser_settings(cfg: dict[str, Any]) -> dict[str, Any]:
         "body_relative_translate": bool(vr.get("body_relative_translate", False)),
         "body_relative_rotation": bool(vr.get("body_relative_rotation", False)),
         "display": _parse_display_section(vr.get("display")),
+        "video_transport": _parse_vr_video_transport(vr.get("video_transport")),
     }
+
+
+_VALID_VR_VIDEO_TRANSPORTS: frozenset[str] = frozenset({"mjpeg", "webrtc"})
+
+
+def _parse_vr_video_transport(raw: Any) -> str:
+    """Validate ``vr.video_transport`` (``mjpeg`` default, or ``webrtc``).
+
+    ``mjpeg`` is the legacy path — Quest browser fetches multipart-JPEG over
+    HTTP. ``webrtc`` switches the headset to a standard WebRTC video
+    stream that carries the H.264 bytes NVENC is already producing for the
+    keyboard path. Spectator ``/viewer`` always stays on MJPEG; this knob
+    only affects the Quest headset's own video path.
+    """
+    if raw is None:
+        return "mjpeg"
+    if not isinstance(raw, str):
+        raise ConfigError(
+            f"vr.video_transport must be a string; got {type(raw).__name__}"
+        )
+    value = raw.strip().lower()
+    if value not in _VALID_VR_VIDEO_TRANSPORTS:
+        raise ConfigError(
+            "vr.video_transport must be one of "
+            f"{sorted(_VALID_VR_VIDEO_TRANSPORTS)}; got {raw!r}"
+        )
+    return value
