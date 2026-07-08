@@ -6,17 +6,17 @@
 #     --config integrations/cosmosh/configs/quest_tabletop.yaml
 
 runtime:
-  config_name: 2steps_vae_lighttae
+  config_name: cosmosh-chunk3-vae-lighttae
   compile_network: true
   device: cuda:0
   seed: 1
-  ckpt_path: sf_inference_data/checkpoints/jhu/tabletop/model_ema_bf16_jhutabletop_288x512.pt  # null → AVAILABLE_COSMOSH_CHECKPOINT_PATHS["default"]
+  ckpt_path: checkpoints/jhu/tabletop/model_ema_bf16_jhutabletop_288x512_h73.pt  # null → AVAILABLE_COSMOSH_CHECKPOINT_PATHS["default"]
   resolution: [288, 512]
   fps: 30
   # Generated frames per outer block. Must be a positive multiple of the
   # pipeline's num_action_per_latent_frame (usually 4, so 4 / 8 / 12 / 16…).
   # 12 matches training; smaller = shorter latency, lower fidelity.
-  actions_per_chunk: 8
+  actions_per_chunk: 12
 
 # Light-switch contract: model (config_name / ckpt_path / resolution /
 # actions_per_chunk) is shared across scenes — only the conditional input,
@@ -68,9 +68,21 @@ vr:
     width_m: 1
     height_m: 0.75
     distance_m: 1.2
+  video_transport: webrtc
 
 video:
+  # Quest MJPEG sink quality (unchanged).
   jpeg_quality: 85
+
+  # Keyboard / WebRTC path: encode via NVIDIA NVENC. Falls back to
+  # cpu_libav automatically on hosts without PyNvVideoCodec + CUDA.
+  # Override per-launch with --encoder cpu_libav.
+  encoder: auto
+  nvenc:
+    preset: P3
+    tuning: ultra_low_latency
+    bitrate: 3000000        # bits per second
+    idr_period_s: 4.0       # seconds between forced IDR frames
 
 server:
   host: 0.0.0.0

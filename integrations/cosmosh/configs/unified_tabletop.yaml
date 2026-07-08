@@ -13,11 +13,11 @@
 #   /viewer            spectator MJPEG view
 
 runtime:
-  config_name: cosmosh-chunk3-vae-vae
+  config_name: cosmosh-chunk3-vae-lighttae
   compile_network: true
   device: cuda:0
   seed: 1
-  ckpt_path: checkpoints/jhu/tabletop/model_ema_bf16_jhutabletop_288x512.pt
+  ckpt_path: checkpoints/jhu/tabletop/model_ema_bf16_jhutabletop_288x512_h73.pt
   resolution: [288, 512]
   fps: 30
   actions_per_chunk: 12  # 4 / 8 / 12 / 16…; smaller = lower latency, lower fidelity

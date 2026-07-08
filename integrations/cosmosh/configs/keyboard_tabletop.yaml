@@ -6,11 +6,11 @@
 #     --config integrations/cosmosh/configs/keyboard_tabletop.yaml
 
 runtime:
-  config_name: 2steps_vae_lighttae
+  config_name: cosmosh-2steps-vae-lighttae
   compile_network: true
   device: cuda:0
   seed: 1
-  ckpt_path: checkpoints/jhu/tabletop/model_ema_bf16_jhutabletop_288x512.pt
+  ckpt_path: checkpoints/jhu/tabletop/model_ema_bf16_jhutabletop_288x512_h73.pt
   resolution: [288, 512]
   fps: 30
   actions_per_chunk: 12  # 4 / 8 / 12 / 16…; smaller = lower latency, lower fidelity
@@ -45,3 +45,6 @@ keyboard:
 server:
   host: 0.0.0.0
   port: 8080
+
+video:
+  encoder: auto
