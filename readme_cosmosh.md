@@ -68,6 +68,7 @@ root; the CLI paths below assume these.)
 docker run --rm -it \
   --network host \
   --gpus all \
+  -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,video \
   -v .:/workspace/flashdreams \
   -w /workspace/flashdreams \
   flashdreams:public /bin/bash

@@ -45,33 +45,20 @@ from aiortc.mediastreams import (  # type: ignore[import-untyped]
     VIDEO_TIME_BASE,
     convert_timebase,
 )
-from aiortc.rtcrtpparameters import (  # type: ignore[import-untyped]
-    RTCRtcpFeedback,
-    RTCRtpCodecParameters,
-)
-
 from cosmosh.webrtc.nvenc.encoder import NalFrame
 
-
-# H.264 profile-level-id advertised in SDP for the NVENC path.
-#
-# NVENC (PyNvVideoCodec 2.1) emits H.264 *High* profile with no kwarg
-# to override it. aiortc's default ``init_codecs()`` registers only
-# Baseline (``42001f``) and Constrained Baseline (``42e01f``) — the
-# browser refuses to decode High-profile NALs against a Baseline-only
-# SDP, leaving a black canvas. We therefore add a High @ Level 3.1
-# capability to the codec list before SDP negotiation.
-#
-# Profile-level-id encoding (RFC 6184 §8.1):
-#   ``64`` = profile_idc 100 (High)
-#   ``00`` = profile_iop (no constraint flags set)
-#   ``1f`` = level_idc 31 → H.264 Level 3.1 (max ~14 Mb/s)
-#
-# Level 3.1 is comfortably above NVENC's actual output level for the
-# unified_tabletop profile (288×512 @ 30 fps @ 3 Mb/s → Level 2.1), so
-# the SDP is correct even if NVENC bumps the level for higher
-# resolutions or bitrates later.
-_H264_HIGH_PROFILE_LEVEL_ID: str = "64001f"
+# NVENC (PyNvVideoCodec 2.1) emits H.264 *High* profile (profile_idc
+# 0x64) with no kwarg to override it. Browsers, however, never offer a
+# High H.264 line in their SDP — Chrome offers only Baseline (42001f),
+# Constrained Baseline (42e01f), Main (4d001f) and High-4:4:4
+# (f4001f). aiortc negotiates H.264 by profile *category* +
+# packetization-mode (see rtcpeerconnection.is_codec_compatible), so
+# advertising a High-only capability matches nothing and
+# setRemoteDescription fails outright. We therefore keep aiortc's
+# default Constrained-Baseline / Baseline H.264 lines (which the
+# browser offers) and rely on the fact that Chromium builds its
+# decoder from the in-band SPS, not the negotiated profile-level-id —
+# so it decodes the High bitstream we send under those payload types.
 
 LOGGER = logging.getLogger(__name__)
 
@@ -269,65 +256,6 @@ def install_nvenc_encoder(nal_queue: "queue.Queue[NalFrame]") -> None:
     )
 
 
-def _has_h264_high_capability() -> bool:
-    """True iff CODECS['video'] already advertises H.264 High profile."""
-    for cap in _aiortc_codecs.CODECS.get("video", []):
-        if getattr(cap, "mimeType", "").lower() != "video/h264":
-            continue
-        params = getattr(cap, "parameters", None) or {}
-        if params.get("profile-level-id", "").lower() == _H264_HIGH_PROFILE_LEVEL_ID:
-            return True
-    return False
-
-
-def _ensure_h264_high_codec_capability() -> None:
-    """Append a High @ Level 3.1 H.264 capability to ``CODECS['video']``.
-
-    Idempotent. Picks an unused dynamic payload type (97–127 per RFC
-    3551 §6, though aiortc uses 97+ for dynamic codecs). The new entry
-    matches the format aiortc's own ``init_codecs`` produces (same
-    ``rtcpFeedback`` set, same ``packetization-mode``, etc.) so the
-    rest of aiortc's SDP machinery treats it identically.
-    """
-    if _has_h264_high_capability():
-        return
-    used_pts = {
-        getattr(c, "payloadType", None)
-        for c in _aiortc_codecs.CODECS.get("video", [])
-    }
-    used_pts.discard(None)
-    # aiortc's init_codecs seeds 97–102; start above the typical range.
-    dynamic_pt = 105
-    while dynamic_pt in used_pts and dynamic_pt < 128:
-        dynamic_pt += 1
-    if dynamic_pt >= 128:
-        raise AiortcCompatError(
-            "could not find an unused dynamic payload type for H.264 High"
-        )
-    _aiortc_codecs.CODECS["video"].append(
-        RTCRtpCodecParameters(
-            mimeType="video/H264",
-            clockRate=90000,
-            payloadType=dynamic_pt,
-            rtcpFeedback=[
-                RTCRtcpFeedback(type="nack"),
-                RTCRtcpFeedback(type="nack", parameter="pli"),
-                RTCRtcpFeedback(type="goog-remb"),
-            ],
-            parameters={
-                "level-asymmetry-allowed": "1",
-                "packetization-mode": "1",
-                "profile-level-id": _H264_HIGH_PROFILE_LEVEL_ID,
-            },
-        )
-    )
-    LOGGER.info(
-        "Added H.264 High @ Level 3.1 codec capability (pt=%d, "
-        "profile-level-id=%s) — matches what PyNvVideoCodec NVENC emits.",
-        dynamic_pt, _H264_HIGH_PROFILE_LEVEL_ID,
-    )
-
-
 def restrict_codecs_to_h264() -> None:
     """Drop non-H.264 video codecs from ``CODECS["video"]``.
 
@@ -363,35 +291,29 @@ def restrict_codecs_to_h264() -> None:
                 _aiortc_codecs.CODECS.get("video", [])
             )
 
-        # Add a High @ Level 3.1 entry matching what NVENC actually
-        # emits. Idempotent — if a High entry is already present from
-        # a prior call we leave the list untouched.
-        _ensure_h264_high_codec_capability()
-
         video_list = _aiortc_codecs.CODECS.get("video", [])
-        # Restrict to H.264 entries whose profile-level-id matches
-        # what NVENC actually emits (High @ Level 3.1). aiortc's
-        # default codec capabilities include Baseline (42001f) and
-        # Constrained Baseline (42e01f); leaving those in the answer
-        # would cause the SDP negotiation to pick a Baseline payload
-        # type ("listed first wins") while the bitstream we emit is
-        # High profile — the exact mismatch that produces black
-        # frames in the browser. Drop them.
+        # Keep every H.264 entry and drop the rest (VP8 + its RTX).
+        #
+        # NVENC emits High profile (profile_idc=0x64), but browsers do
+        # NOT offer a High H.264 line — Chrome offers only Baseline
+        # (42001f), Constrained Baseline (42e01f), Main (4d001f) and
+        # High-4:4:4 (f4001f). aiortc matches H.264 by profile
+        # *category* + packetization-mode (see is_codec_compatible),
+        # so advertising a High-only line negotiates with nothing and
+        # setRemoteDescription fails outright.
+        #
+        # aiortc's own default video codecs already include H.264
+        # 42001f / 42e01f (packetization-mode=1), which Chrome offers,
+        # so keeping them lets negotiation succeed. The negotiated
+        # profile-level-id does not gate decoding: Chromium builds its
+        # H.264 decoder from the in-band SPS, so it decodes the High
+        # bitstream we send under a Constrained-Baseline payload type.
+        # We only need to drop VP8 so aiortc doesn't route frames to
+        # its libav VP8 encoder (we have no NVENC VP8 path).
         filtered = [
             c for c in video_list
-            if (
-                getattr(c, "mimeType", "").lower() == "video/h264"
-                and (getattr(c, "parameters", None) or {})
-                .get("profile-level-id", "")
-                .lower()
-                == _H264_HIGH_PROFILE_LEVEL_ID
-            )
+            if getattr(c, "mimeType", "").lower() == "video/h264"
         ]
-        # Keep RTX entries that pair with H.264 — aiortc maps them via
-        # the H.264 dynamic payload type. RTX entries have mimeType
-        # "video/rtx", which we drop alongside VP8. The aiortc sender
-        # handles missing RTX gracefully (no retransmission, which is
-        # acceptable for our LAN deployment).
         if not filtered:
             LOGGER.warning(
                 "restrict_codecs_to_h264: no H.264 codec found in CODECS['video']."

@@ -329,7 +329,7 @@ class DefaultRTCVideoEncoder:
                 f"got {type(track).__name__}. Create the track via "
                 "encoder.create_track()."
             )
-        enqueued = await track.enqueue_chunk(chunk)
+        enqueued, _cast_ms = await track.enqueue_chunk(chunk)
         return ChunkDeliveryResult(
             backend=self.backend,
             num_frames=enqueued,

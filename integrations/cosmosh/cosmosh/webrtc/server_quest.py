@@ -775,13 +775,18 @@ class QuestSessionManager:
             if isinstance(self._video_track, CosmoshNvencVideoTrack):
                 # NVENC: NAL bytes are already on the queue; just enqueue
                 # the same number of pacing markers.
-                assert result.is_nvenc_published, (
-                    "WebRTC NVENC track expects an NVENC-published "
-                    "CosmoshStepResult (runtime did not push NalFrames)."
-                )
-                await self._video_track.enqueue_markers(
-                    num_frames=result.num_frames
-                )
+                #
+                # ``is_nvenc_published`` is False whenever the runtime
+                # skipped the NVENC encode for this chunk — which is the
+                # expected state while no video peer connection is
+                # attached (``need_nvenc_output`` gates on
+                # ``self._video_pc is not None``; see the render loop).
+                # In that state there are no NAL frames on the queue, so
+                # there is nothing to pace — skip rather than assert.
+                if result.is_nvenc_published:
+                    await self._video_track.enqueue_markers(
+                        num_frames=result.num_frames
+                    )
             else:
                 # CPU libav fallback for the WebRTC transport — aiortc's
                 # stock encoder will consume each RGB frame from the queue.
