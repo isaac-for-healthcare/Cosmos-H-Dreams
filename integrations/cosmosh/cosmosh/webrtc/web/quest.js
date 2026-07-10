@@ -5,10 +5,19 @@ const wsText = document.getElementById("wsText")
 const xrText = document.getElementById("xrText")
 const rateText = document.getElementById("rateText")
 const eventLog = document.getElementById("eventLog")
-const remoteVideo = document.getElementById("remoteVideo")
 const sceneSelect = document.getElementById("sceneSelect")
 
 const LATENCY_ENABLED = new URLSearchParams(location.search).get('latency') === '1'
+// Two video sources live in the DOM; whichever transport the server reports
+// in /vr_config is the one we activate. The WebGL scene samples ``remoteVideo``
+// without caring about its tag — gl.texImage2D accepts <img> and <video>
+// interchangeably as TexImageSource.
+const remoteVideoMjpegEl = document.getElementById("remoteVideoMjpeg")
+const remoteVideoWebrtcEl = document.getElementById("remoteVideoWebrtc")
+let remoteVideo = remoteVideoMjpegEl  // default to MJPEG; activateVideoTransport
+                                       // re-points this when vr_config arrives.
+let videoTransport = "mjpeg"           // updated by activateVideoTransport.
+let videoPeerConnection = null         // RTCPeerConnection when transport=webrtc.
 
 // Mirror of what the server reports as the active scene. Used to revert the
 // dropdown if the user picks a scene the server rejects, or before the ws is
@@ -106,19 +115,123 @@ async function fetchVrConfig() {
       if (typeof cfg.display.height_m === "number") displayConfig.heightM = cfg.display.height_m
       if (typeof cfg.display.distance_m === "number") displayConfig.distanceM = cfg.display.distance_m
     }
+    const transport = typeof cfg.video_transport === "string"
+      ? cfg.video_transport
+      : "mjpeg"
     logEvent(
       `vr_config: body_relative_translate=${bodyRelativeTranslate} ` +
       `body_relative_rotation=${bodyRelativeRotation} ` +
-      `display=${displayConfig.widthM}x${displayConfig.heightM}m@${displayConfig.distanceM}m`,
+      `display=${displayConfig.widthM}x${displayConfig.heightM}m@${displayConfig.distanceM}m ` +
+      `video_transport=${transport}`,
     )
+    await activateVideoTransport(transport)
   } catch (e) {
     logEvent(`vr_config fetch failed (${e.message}) — using absolute defaults`)
+    // Keep the MJPEG <img> active as a safe fallback.
+    await activateVideoTransport("mjpeg")
   }
 }
 
-// Phase 1 uses WebSocket transport because Quest's network can't reach the
-// server's WebRTC ICE candidates (NAT/proxy). See QUEST_PLAN.md for the
-// path forward. WebRTC negotiation is deferred to Phase 3 along with video.
+// ---- Video transport activation ---------------------------------------
+// Reads the server's reported transport and either keeps the MJPEG <img>
+// (default) or sets up an RTCPeerConnection that feeds the <video> element.
+// The WebGL scene reads ``remoteVideo`` regardless, so the rest of the file
+// stays transport-agnostic.
+
+async function activateVideoTransport(transport) {
+  videoTransport = transport === "webrtc" ? "webrtc" : "mjpeg"
+  if (videoTransport === "mjpeg") {
+    remoteVideo = remoteVideoMjpegEl
+    // Make sure the <video> element isn't holding a stale srcObject if the
+    // server flipped transports between page loads.
+    if (remoteVideoWebrtcEl.srcObject) {
+      remoteVideoWebrtcEl.srcObject = null
+    }
+    return
+  }
+  // WebRTC: turn off the MJPEG <img> so the browser doesn't open an
+  // unused /video stream, then negotiate the peer connection.
+  remoteVideoMjpegEl.removeAttribute("src")
+  remoteVideo = remoteVideoWebrtcEl
+  try {
+    await connectVideoPeerConnection()
+  } catch (e) {
+    logEvent(`webrtc video connect failed (${e.message}) — staying on placeholder`)
+  }
+}
+
+async function connectVideoPeerConnection() {
+  // Close any prior connection so a page refresh starts cleanly.
+  if (videoPeerConnection) {
+    try { videoPeerConnection.close() } catch (_) {}
+    videoPeerConnection = null
+  }
+  const pc = new RTCPeerConnection()
+  pc.addTransceiver("video", { direction: "recvonly" })
+
+  pc.ontrack = (event) => {
+    const [stream] = event.streams
+    if (stream) {
+      remoteVideoWebrtcEl.srcObject = stream
+      // Edge/Chromium does not always honour the `autoplay` attribute
+      // for `<video>` elements driven by a live MediaStream — the
+      // element stays at paused=true with a single decoded frame.
+      // Call play() explicitly; surface autoplay-block errors so the
+      // user can react (e.g., click to retry).
+      remoteVideoWebrtcEl.play().catch((err) => {
+        logEvent(`webrtc video play() failed: ${err.name} ${err.message}`)
+      })
+      logEvent("webrtc video track attached")
+    }
+  }
+  pc.onconnectionstatechange = () => {
+    logEvent(`webrtc video state=${pc.connectionState}`)
+    if (["failed", "closed", "disconnected"].includes(pc.connectionState)) {
+      // Don't auto-reconnect: the page-load handshake is the only place
+      // we open the connection. A real disconnect means the server side
+      // is gone too; the user gets the placeholder texture until reload.
+    }
+  }
+
+  const offer = await pc.createOffer()
+  await pc.setLocalDescription(offer)
+  await waitForVideoIceGathering(pc)
+
+  const resp = await fetch("/quest/offer", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(pc.localDescription),
+  })
+  if (!resp.ok) {
+    const text = await resp.text()
+    throw new Error(`/quest/offer ${resp.status}: ${text}`)
+  }
+  const answer = await resp.json()
+  await pc.setRemoteDescription(answer)
+  videoPeerConnection = pc
+  logEvent("webrtc video handshake complete")
+}
+
+function waitForVideoIceGathering(pc) {
+  // Same trivial wait-for-complete-or-timeout shape the keyboard client uses.
+  if (pc.iceGatheringState === "complete") return Promise.resolve()
+  return new Promise((resolve) => {
+    let done = false
+    const finish = () => {
+      if (done) return
+      done = true
+      pc.removeEventListener("icegatheringstatechange", onChange)
+      resolve()
+    }
+    function onChange() {
+      if (pc.iceGatheringState === "complete") finish()
+    }
+    pc.addEventListener("icegatheringstatechange", onChange)
+    // Backstop: even on glitchy networks, give up after 2 s so the SDP
+    // exchange doesn't hang the page indefinitely.
+    setTimeout(finish, 2000)
+  })
+}
 
 function logEvent(message) {
   const stamp = new Date().toLocaleTimeString()
@@ -225,8 +338,18 @@ function setupVideoQuad(gl) {
   }
 }
 
+function isRemoteVideoReady() {
+  // <img>: complete && naturalWidth > 0 means at least one frame decoded.
+  // <video>: readyState >= HAVE_CURRENT_DATA (2) means the current frame
+  // is decoded and renderable.
+  if (remoteVideo instanceof HTMLVideoElement) {
+    return remoteVideo.readyState >= 2 && remoteVideo.videoWidth > 0
+  }
+  return remoteVideo.complete && remoteVideo.naturalWidth > 0
+}
+
 function uploadVideoTex(gl, quad) {
-  if (!remoteVideo.complete || remoteVideo.naturalWidth === 0) return
+  if (!isRemoteVideoReady()) return
   gl.bindTexture(gl.TEXTURE_2D, quad.tex)
   try {
     gl.texImage2D(

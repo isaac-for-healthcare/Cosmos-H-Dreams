@@ -25,6 +25,11 @@ from cosmosh.webrtc.config_loader import (
     load_yaml_config,
     parse_scenes,
 )
+from cosmosh.webrtc.media import CosmoshVideoTrack
+from cosmosh.webrtc.nvenc import (
+    ENCODER_NVENC,
+    CosmoshNvencVideoTrack,
+)
 from cosmosh.webrtc.session import (
     CosmoshInferenceRuntime,
     CosmoshRuntimeConfig,
@@ -125,10 +130,30 @@ class MJPEGSink:
         self._closed = False
         self._frames_pushed: int = 0
         self._frames_dropped: int = 0  # pushed while consumer hadn't seen previous
+        # Number of HTTP clients currently consuming /video. Used by the
+        # Quest render loop to decide whether the upstream ``.cpu()``
+        # copy can be skipped: when the count is zero AND the headset is
+        # on the WebRTC transport, nothing on the host actually needs
+        # the CPU tensor, so the runtime synchronises without copying.
+        self._subscriber_count: int = 0
 
     @property
     def latest_id(self) -> int:
         return self._frame_id
+
+    @property
+    def subscriber_count(self) -> int:
+        return self._subscriber_count
+
+    def has_subscribers(self) -> bool:
+        return self._subscriber_count > 0
+
+    def attach_subscriber(self) -> None:
+        self._subscriber_count += 1
+
+    def detach_subscriber(self) -> None:
+        if self._subscriber_count > 0:
+            self._subscriber_count -= 1
 
     async def push_jpeg(self, jpeg_bytes: bytes) -> None:
         async with self._cond:
@@ -247,10 +272,16 @@ class QuestSessionManager:
         jpeg_quality: int,
         scenes: list[Scene] | None = None,
         runtime: CosmoshInferenceRuntime | None = None,
+        video_transport: str = "mjpeg",
     ) -> None:
         self.runtime_config = runtime_config
         self.fps = fps
         self.jpeg_quality = jpeg_quality
+        if video_transport not in ("mjpeg", "webrtc"):
+            raise ValueError(
+                f"video_transport must be 'mjpeg' or 'webrtc'; got {video_transport!r}"
+            )
+        self.video_transport = video_transport
         self.scenes: list[Scene] = list(scenes) if scenes else []
         self._scenes_by_name: dict[str, Scene] = {s.name: s for s in self.scenes}
         # ``runtime`` lets the unified server share one runtime across the
@@ -281,6 +312,22 @@ class QuestSessionManager:
         self._reset_cooldown_s: float = 1.0
         self._closed = False
         self._viewer_events = _ViewerEventBroadcaster()
+        # WebRTC video transport (opt-in via ``vr.video_transport``).
+        # When ``video_transport == 'webrtc'`` the manager exposes a
+        # marker-only video track that the Quest browser pulls H.264
+        # RTP from via :meth:`create_video_answer`. When the runtime
+        # is configured with NVENC, the track drains the existing NAL
+        # queue (no extra encoder); otherwise it consumes the CPU
+        # tensor like the keyboard's CPU path. ``mjpeg`` mode leaves
+        # both fields ``None`` and the legacy MJPEG sink remains the
+        # only video pathway.
+        self._video_track: Any = None
+        self._video_pc: Any = None
+        if self.video_transport == "webrtc":
+            if self.runtime_config.video_encoder == ENCODER_NVENC:
+                self._video_track = CosmoshNvencVideoTrack(fps=self.fps)
+            else:
+                self._video_track = CosmoshVideoTrack(fps=self.fps)
 
     @property
     def sink(self) -> MJPEGSink:
@@ -307,9 +354,17 @@ class QuestSessionManager:
         self._runtime_ready = True
         LOGGER.info("Cosmosh runtime ready.")
         self._viewer_events.publish("info", "Runtime ready.")
-        # /video clients connecting before any ws get the anchor frame.
+        # The anchor frame goes to whichever pathways are active. On
+        # WebRTC the initial_frame_chunk also pushes the IDR to the NAL
+        # queue (the double-submit fix from the keyboard work guarantees
+        # the browser sees the anchor immediately on first connect /
+        # reset / scene-switch). The runtime always produces the CPU
+        # tensor on this code path (initial_frame_chunk is unconditional)
+        # so the MJPEG sink seeds correctly even before any spectator
+        # attaches.
         async with self._render_lock:
-            await self._push_chunk_to_sink(self._runtime.initial_frame_chunk())
+            initial = self._runtime.initial_frame_chunk()
+            await self._publish_chunk_result(initial)
         self._render_task = asyncio.create_task(self._render_loop())
 
     async def attach_ws(self, ws: web.WebSocketResponse) -> None:
@@ -354,9 +409,13 @@ class QuestSessionManager:
             self._first_action_event.clear()
             if self._runtime_ready:
                 await self._runtime.reset()
-                await self._push_chunk_to_sink(
-                    self._runtime.initial_frame_chunk()
-                )
+                # Don't drain the marker queue here — its paired NALs
+                # are still in the runtime's NAL queue, and the sender
+                # consumes both in lockstep. They flush naturally to
+                # the browser as a brief tail of pre-reset motion,
+                # then the anchor IDR re-anchors the decoder.
+                initial = self._runtime.initial_frame_chunk()
+                await self._publish_chunk_result(initial)
         self._reset_cooldown_until = (
             time.monotonic() + self._reset_cooldown_s
         )
@@ -387,6 +446,10 @@ class QuestSessionManager:
             previous_ws = self._ws
             self._ws = None
             self._first_action_event.clear()
+        # On the WebRTC video transport, also close the video peer
+        # connection so it doesn't keep the NAL queue subscribed once the
+        # ws (the headset session's control channel) is gone.
+        await self._close_video_pc()
         if previous_ws is not None and not previous_ws.closed:
             LOGGER.info("Quest ws kicked by cross-driver takeover.")
             # The keyboard side will publish "driver: keyboard" once its
@@ -408,6 +471,10 @@ class QuestSessionManager:
             self._ws = None
             self._first_action_event.clear()
             self._viewer_events.publish("driver", "idle")
+            # On the WebRTC transport: drop the video peer connection
+            # too so a reconnecting headset always starts a fresh one
+            # instead of inheriting a stale, half-torn connection.
+            await self._close_video_pc()
 
     async def handle_message(self, payload: dict[str, Any]) -> None:
         msg_type = payload.get("type")
@@ -442,9 +509,11 @@ class QuestSessionManager:
                     self._first_action_event.clear()
                     if self._runtime_ready:
                         await self._runtime.set_scene(scene)
-                        await self._push_chunk_to_sink(
-                            self._runtime.initial_frame_chunk()
-                        )
+                        # Don't drain the marker queue (lockstep with
+                        # the NAL queue) — see ``reset`` for the
+                        # rationale.
+                        initial = self._runtime.initial_frame_chunk()
+                        await self._publish_chunk_result(initial)
             except Exception as exc:
                 LOGGER.exception("Scene switch to %r failed.", raw_name)
                 self._viewer_events.publish(
@@ -482,6 +551,89 @@ class QuestSessionManager:
             return
         LOGGER.warning("ws msg type=%r ignored", msg_type)
 
+    async def create_video_answer(
+        self, *, offer_sdp: str, offer_type: str
+    ) -> dict[str, str]:
+        """Complete the WebRTC handshake for the Quest headset's video stream.
+
+        Only valid when this manager was constructed with
+        ``video_transport='webrtc'``; raises :class:`RuntimeError`
+        otherwise (callers should gate the route accordingly).
+
+        Idempotent across page reloads: closes any prior peer connection
+        before negotiating a new one so a refresh on the Quest browser
+        doesn't leave a stranded RTC track draining the NAL queue.
+        """
+        if self._video_track is None:
+            raise RuntimeError(
+                "Quest video_transport is not 'webrtc'; cannot create "
+                "WebRTC video answer. Set vr.video_transport: webrtc in "
+                "the YAML config."
+            )
+        try:
+            from aiortc import RTCPeerConnection, RTCSessionDescription
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "aiortc is required for WebRTC signaling. Install aiortc "
+                "as part of the cosmosh extras."
+            ) from exc
+
+        # Cross-driver takeover: opening a video peer connection means
+        # Quest is becoming the active driver. Kick any active keyboard
+        # session so only one side is talking to the shared runtime.
+        if self.on_take_over is not None:
+            with contextlib.suppress(Exception):
+                await self.on_take_over()
+
+        # Close any prior peer connection before negotiating a new one.
+        await self._close_video_pc()
+
+        pc = RTCPeerConnection()
+        pc.addTrack(self._video_track)
+        self._video_pc = pc
+
+        @pc.on("connectionstatechange")
+        async def _on_state_change() -> None:
+            state = pc.connectionState
+            if state in {"failed", "disconnected", "closed"}:
+                if self._video_pc is pc:
+                    await self._close_video_pc()
+
+        try:
+            offer = RTCSessionDescription(sdp=offer_sdp, type=offer_type)
+            await pc.setRemoteDescription(offer)
+            answer = await pc.createAnswer()
+            await pc.setLocalDescription(answer)
+            local = pc.localDescription
+            if local is None:
+                raise RuntimeError(
+                    "Peer connection did not produce a local description."
+                )
+            self._viewer_events.publish("driver", "quest")
+            LOGGER.info(
+                "Quest WebRTC video peer connection negotiated "
+                "(transport=webrtc, track=%s).",
+                type(self._video_track).__name__,
+            )
+            return {"sdp": local.sdp, "type": local.type}
+        except Exception:
+            LOGGER.exception("Quest WebRTC video negotiation failed.")
+            await self._close_video_pc()
+            raise
+
+    async def _close_video_pc(self) -> None:
+        """Close any active video peer connection. Idempotent."""
+        pc = self._video_pc
+        if pc is None:
+            return
+        self._video_pc = None
+        with contextlib.suppress(Exception):
+            await pc.close()
+        if isinstance(self._video_track, CosmoshNvencVideoTrack):
+            # Drain markers so a fresh peer connection doesn't immediately
+            # pull stale ones.
+            self._video_track.drain_pending()
+
     async def shutdown(self) -> None:
         if self._closed:
             return
@@ -493,6 +645,10 @@ class QuestSessionManager:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._render_task
             self._render_task = None
+        await self._close_video_pc()
+        if self._video_track is not None:
+            with contextlib.suppress(Exception):
+                await self._video_track.close()
         await self._runtime.close()
         await self._sink.close()
 
@@ -502,6 +658,14 @@ class QuestSessionManager:
         LOGGER.info("Render loop started.")
         latency_logger = _LatencyLogger("quest") if _latency_profile_enabled() else None
         _t_prev_block_end: float | None = None
+        # Backpressure cap on the WebRTC marker queue: stop rendering when
+        # we're more than ~2 chunks ahead of the RTP sender. Without this,
+        # the GPU produces ~120 fps worth of work while aiortc paces output
+        # at 30 fps, so the queue grows unbounded over a long rollout and a
+        # later reset / scene-switch becomes invisible to the user until
+        # the backlog drains.
+        max_buffered = 2 * self._runtime.actions_per_chunk
+        backpressure_poll_s = 0.05
         try:
             while not self._closed:
                 try:
@@ -512,16 +676,46 @@ class QuestSessionManager:
                     if latency_logger is not None:
                         _t_iter_start = time.perf_counter() * 1000.0
 
+                    if isinstance(self._video_track, CosmoshNvencVideoTrack):
+                        while (
+                            not self._closed
+                            and self._video_track.qsize() >= max_buffered
+                        ):
+                            await asyncio.sleep(backpressure_poll_s)
+                        if self._closed:
+                            break
                     async with self._render_lock:
                         if self._closed:
                             break
-                        result = await self._runtime.generate_one_chunk_vr()
-                        LOGGER.info(
-                            "Rendered VR chunk=%d num_frames=%d",
-                            result.chunk_index,
-                            result.num_frames,
+                        # On the WebRTC transport the runtime can skip
+                        # the GPU→CPU sync when no spectator is watching
+                        # /video — the headset will receive NAL bytes
+                        # directly from the NVENC NAL queue (or the
+                        # CosmoshVideoTrack equivalent when running
+                        # cpu_libav). On MJPEG transport the sink ALWAYS
+                        # needs the tensor, so the gate stays True.
+                        need_cpu_chunk = (
+                            self.video_transport == "mjpeg"
+                            or self._sink.has_subscribers()
                         )
-                        delivery = await self._push_chunk_to_sink(result.video_chunk)
+                        # NVENC output is only useful when the Quest WebRTC
+                        # video peer connection is open — otherwise NAL
+                        # frames go into a queue nothing drains. On MJPEG
+                        # transport this is always False; on WebRTC it
+                        # flips to True when the browser POSTs
+                        # /quest/offer and back to False on disconnect. If
+                        # a keyboard client is driving instead, keyboard's
+                        # own render loop supplies the default (True) so
+                        # its NVENC output still flows.
+                        need_nvenc_output = (
+                            self.video_transport == "webrtc"
+                            and self._video_pc is not None
+                        )
+                        result = await self._runtime.generate_one_chunk_vr(
+                            caller_needs_cpu_chunk=need_cpu_chunk,
+                            caller_needs_nvenc_output=need_nvenc_output,
+                        )
+                        delivery = await self._publish_chunk_result(result)
 
                     if latency_logger is not None:
                         _t_iter_end = time.perf_counter() * 1000.0
@@ -531,7 +725,8 @@ class QuestSessionManager:
                             record.update({k: v for k, v in result.timing.items()
                                            if k in ("encode_ms", "diffuse_ms", "decode_ms",
                                                     "finalize_ms", "d2h_ms", "input_age_ms")})
-                        record.update(delivery)
+                        if delivery is not None:
+                            record.update(delivery)
                         record["mjpeg_drop_rate"] = self._sink.drain_drop_stats()
                         latency_logger.log_block(record)
                         _t_prev_block_end = _t_iter_end
@@ -545,7 +740,6 @@ class QuestSessionManager:
                                 })
                             except Exception:
                                 pass
-
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -563,6 +757,49 @@ class QuestSessionManager:
             if latency_logger is not None:
                 latency_logger.log_rollout_summary()
                 latency_logger.close()
+
+    async def _publish_chunk_result(self, result: Any) -> dict[str, float] | None:
+        """Push a chunk to the active video pathways.
+
+        Sends markers to the WebRTC video track (if configured) and
+        pushes the CPU tensor to the MJPEG sink (whenever the tensor
+        is present — i.e., whenever at least one consumer asked for it
+        via ``caller_needs_cpu_chunk``).
+
+        Returns the MJPEG sink's delivery stats
+        (``{"jpeg_encode_ms": float, "quest_pacing_ms": float}``) when
+        the CPU tensor was pushed, or ``None`` when only the WebRTC
+        track was fed. Forwarded to the latency logger by the caller.
+        """
+        if self._video_track is not None:
+            if isinstance(self._video_track, CosmoshNvencVideoTrack):
+                # NVENC: NAL bytes are already on the queue; just enqueue
+                # the same number of pacing markers.
+                #
+                # ``is_nvenc_published`` is False whenever the runtime
+                # skipped the NVENC encode for this chunk — which is the
+                # expected state while no video peer connection is
+                # attached (``need_nvenc_output`` gates on
+                # ``self._video_pc is not None``; see the render loop).
+                # In that state there are no NAL frames on the queue, so
+                # there is nothing to pace — skip rather than assert.
+                if result.is_nvenc_published:
+                    await self._video_track.enqueue_markers(
+                        num_frames=result.num_frames
+                    )
+            else:
+                # CPU libav fallback for the WebRTC transport — aiortc's
+                # stock encoder will consume each RGB frame from the queue.
+                assert result.video_chunk is not None, (
+                    "WebRTC CPU track expects a non-None video_chunk."
+                )
+                await self._video_track.enqueue_chunk(result.video_chunk)
+        if result.video_chunk is not None:
+            # MJPEG legacy path. Stays cold automatically when nobody is
+            # connected to /video, because need_cpu_chunk is False then
+            # and video_chunk is None.
+            return await self._push_chunk_to_sink(result.video_chunk)
+        return None
 
     async def _push_chunk_to_sink(self, chunk: torch.Tensor) -> dict[str, float]:
         """Encode each frame of a ``[1, 3, T, H, W]`` ``[-1, 1]`` tensor and push at ``fps``.
@@ -717,7 +954,11 @@ async def _video_stream_handler(request: web.Request) -> web.StreamResponse:
         },
     )
     await response.prepare(request)
-    LOGGER.info("MJPEG client connected: %s", request.remote)
+    sink.attach_subscriber()
+    LOGGER.info(
+        "MJPEG client connected: %s (subscribers=%d)",
+        request.remote, sink.subscriber_count,
+    )
     last_id = 0
     try:
         while True:
@@ -736,7 +977,11 @@ async def _video_stream_handler(request: web.Request) -> web.StreamResponse:
     except (asyncio.CancelledError, ConnectionResetError, ConnectionAbortedError):
         pass
     finally:
-        LOGGER.info("MJPEG client disconnected: %s", request.remote)
+        sink.detach_subscriber()
+        LOGGER.info(
+            "MJPEG client disconnected: %s (subscribers=%d)",
+            request.remote, sink.subscriber_count,
+        )
     return response
 
 
@@ -781,6 +1026,40 @@ def create_app(
         await mgr.reset(source="admin")
         return web.json_response({"ok": True, "driver": "quest"})
 
+    async def quest_offer(request: web.Request) -> web.StreamResponse:
+        """WebRTC handshake endpoint for the Quest headset's video stream.
+
+        Available only when ``video_transport='webrtc'``; returns 404
+        otherwise so the client can fall back to MJPEG cleanly.
+        """
+        mgr: QuestSessionManager = request.app["manager"]
+        if mgr.video_transport != "webrtc":
+            raise web.HTTPNotFound(reason="Quest video transport is not 'webrtc'.")
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            raise web.HTTPBadRequest(reason="Expected JSON offer payload.") from exc
+        if not isinstance(payload, dict):
+            raise web.HTTPBadRequest(reason="Offer payload must be a JSON object.")
+        sdp = payload.get("sdp")
+        offer_type = payload.get("type")
+        if not isinstance(sdp, str) or not sdp:
+            raise web.HTTPBadRequest(
+                reason="Offer payload must include non-empty 'sdp'."
+            )
+        if not isinstance(offer_type, str) or not offer_type:
+            raise web.HTTPBadRequest(
+                reason="Offer payload must include non-empty 'type'."
+            )
+        try:
+            answer = await mgr.create_video_answer(
+                offer_sdp=sdp, offer_type=offer_type
+            )
+        except Exception as exc:
+            LOGGER.exception("Quest WebRTC offer handling failed.")
+            raise web.HTTPInternalServerError(reason=str(exc)) from exc
+        return web.json_response(answer)
+
     async def scenes_list(request: web.Request) -> web.StreamResponse:
         mgr: QuestSessionManager = request.app["manager"]
         return web.json_response(
@@ -808,6 +1087,7 @@ def create_app(
     app.router.add_get("/vr_config", vr_config)
     app.router.add_get("/scenes", scenes_list)
     app.router.add_post("/admin/reset", admin_reset)
+    app.router.add_post("/quest/offer", quest_offer)
     app.router.add_static("/static/", WEB_DIR, show_index=False)
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
@@ -857,6 +1137,7 @@ def main() -> None:
         fps=runtime_config.fps,
         jpeg_quality=jpeg_quality,
         scenes=scenes,
+        video_transport=vr_browser_settings["video_transport"],
     )
     LOGGER.info(
         "Scenes: %s (initial=%r)",

@@ -59,7 +59,16 @@
     </section>
 
     <section class="videoPane">
-      <img id="remoteVideo" src="/video" alt="Cosmosh stream" />
+      <!-- MJPEG fallback path. quest.js leaves this attached when the
+           server reports video_transport=mjpeg; otherwise it removes
+           the src so the browser doesn't open a stray /video stream. -->
+      <img id="remoteVideoMjpeg" src="/video" alt="Cosmosh stream" />
+      <!-- WebRTC path. quest.js wires this element's srcObject from an
+           RTCPeerConnection when video_transport=webrtc. Hidden by
+           default; the WebGL scene samples whichever element is the
+           active source, so visual layout is unchanged. -->
+      <video id="remoteVideoWebrtc" autoplay muted playsinline
+             style="display: none"></video>
     </section>
 
     <section class="logPane">

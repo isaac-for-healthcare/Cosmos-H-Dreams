@@ -29,6 +29,7 @@ from pathlib import Path
 from aiohttp import web
 
 from cosmosh.webrtc.config_loader import (
+    apply_encoder_settings,
     build_runtime_config_unified,
     get_keyboard_settings,
     get_server_settings,
@@ -36,6 +37,11 @@ from cosmosh.webrtc.config_loader import (
     get_vr_browser_settings,
     load_yaml_config,
     parse_scenes,
+)
+from cosmosh.webrtc.nvenc.resolver import (
+    ENCODER_AUTO,
+    ENCODER_CPU_LIBAV,
+    ENCODER_NVENC,
 )
 from cosmosh.webrtc.server_quest import (
     QuestSessionManager,
@@ -89,6 +95,19 @@ def parse_args() -> argparse.Namespace:
         "--debug", action="store_true",
         help="DEBUG-level logging (per-event traces).",
     )
+    parser.add_argument(
+        "--encoder",
+        choices=[ENCODER_AUTO, ENCODER_NVENC, ENCODER_CPU_LIBAV],
+        default=None,
+        help=(
+            "Override the keyboard-path video encoder (Quest path is "
+            "always cpu_libav). Precedence: this flag > "
+            "COSMOSH_VIDEO_ENCODER env > video.encoder in YAML > "
+            "code default (cpu_libav). 'auto' picks NVENC when "
+            "PyNvVideoCodec + CUDA are present, else falls back to "
+            "cpu_libav. 'nvenc' hard-fails if NVENC is unavailable."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -96,6 +115,7 @@ def create_app(
     *,
     kbd_manager: CosmoshWebRTCSessionManager,
     quest_manager: QuestSessionManager,
+    shared_runtime: CosmoshInferenceRuntime,
     vr_browser_settings: dict,
 ) -> web.Application:
     """Mount all keyboard + Quest routes on one aiohttp app.
@@ -224,6 +244,40 @@ def create_app(
     async def vr_config(request: web.Request) -> web.StreamResponse:
         return web.json_response(request.app["vr_browser_settings"])
 
+    async def quest_offer(request: web.Request) -> web.StreamResponse:
+        """WebRTC handshake endpoint for the Quest headset's video stream.
+
+        Available only when ``vr.video_transport='webrtc'``; returns 404
+        otherwise so the client can fall back to MJPEG cleanly. Same
+        shape as the keyboard's ``/api/webrtc/offer``.
+        """
+        if quest_manager.video_transport != "webrtc":
+            raise web.HTTPNotFound(reason="Quest video transport is not 'webrtc'.")
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            raise web.HTTPBadRequest(reason="Expected JSON offer payload.") from exc
+        if not isinstance(payload, dict):
+            raise web.HTTPBadRequest(reason="Offer payload must be a JSON object.")
+        sdp = payload.get("sdp")
+        offer_type = payload.get("type")
+        if not isinstance(sdp, str) or not sdp:
+            raise web.HTTPBadRequest(
+                reason="Offer payload must include non-empty 'sdp'."
+            )
+        if not isinstance(offer_type, str) or not offer_type:
+            raise web.HTTPBadRequest(
+                reason="Offer payload must include non-empty 'type'."
+            )
+        try:
+            answer = await quest_manager.create_video_answer(
+                offer_sdp=sdp, offer_type=offer_type
+            )
+        except Exception as exc:
+            LOGGER.exception("Quest WebRTC offer handling failed.")
+            raise web.HTTPInternalServerError(reason=str(exc)) from exc
+        return web.json_response(answer)
+
     async def scenes_list(_: web.Request) -> web.StreamResponse:
         # Both managers carry the same scenes list; pick one as the source.
         scenes = quest_manager.scenes or kbd_manager.scenes
@@ -269,6 +323,7 @@ def create_app(
     app.router.add_get("/viewer_events", _viewer_events_handler)
     app.router.add_get("/vr_config", vr_config)
     app.router.add_get("/scenes", scenes_list)
+    app.router.add_post("/quest/offer", quest_offer)
     # Shared
     app.router.add_get("/healthz", healthz)
     app.router.add_get("/admin/status", admin_status)
@@ -306,6 +361,10 @@ def main() -> None:
     cfg = load_yaml_config(args.config)
     scenes = parse_scenes(cfg)
     runtime_config = build_runtime_config_unified(cfg, scenes=scenes)
+    # Resolve encoder choice — applies to the keyboard / WebRTC path
+    # only (Quest path is always cpu_libav). See apply_encoder_settings
+    # for the four-layer precedence.
+    apply_encoder_settings(runtime_config, cfg, cli_value=args.encoder)
     server_settings = get_server_settings(cfg)
     video_settings = get_video_settings(cfg)
     vr_browser_settings = get_vr_browser_settings(cfg)
@@ -329,6 +388,7 @@ def main() -> None:
         jpeg_quality=jpeg_quality,
         scenes=scenes,
         runtime=shared_runtime,
+        video_transport=vr_browser_settings["video_transport"],
     )
     # Keyboard manager publishes to the Quest manager's broadcaster so the
     # admin / viewer page sees a unified event stream and can show which
@@ -364,6 +424,7 @@ def main() -> None:
     app = create_app(
         kbd_manager=kbd_manager,
         quest_manager=quest_manager,
+        shared_runtime=shared_runtime,
         vr_browser_settings=vr_browser_settings,
     )
     print(f"Starting on external IP: {get_external_ip()}")

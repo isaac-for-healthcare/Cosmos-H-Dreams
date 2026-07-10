@@ -8,11 +8,17 @@ from pathlib import Path
 from aiohttp import web
 
 from cosmosh.webrtc.config_loader import (
+    apply_encoder_settings,
     build_runtime_config,
     get_keyboard_settings,
     get_server_settings,
     load_yaml_config,
     parse_scenes,
+)
+from cosmosh.webrtc.nvenc.resolver import (
+    ENCODER_AUTO,
+    ENCODER_CPU_LIBAV,
+    ENCODER_NVENC,
 )
 from cosmosh.webrtc.session import (
     CosmoshWebRTCSessionManager,
@@ -73,6 +79,19 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Enable DEBUG-level logging — adds per-event traces (each "
             "keydown/keyup, every chunk render). Default level is INFO."
+        ),
+    )
+    parser.add_argument(
+        "--encoder",
+        choices=[ENCODER_AUTO, ENCODER_NVENC, ENCODER_CPU_LIBAV],
+        default=None,
+        help=(
+            "Override the video encoder. Precedence: this flag > "
+            "COSMOSH_VIDEO_ENCODER env > video.encoder in YAML > "
+            "code default (cpu_libav). 'auto' picks NVENC when "
+            "PyNvVideoCodec + CUDA are present, else falls back to "
+            "cpu_libav. 'nvenc' hard-fails if NVENC is unavailable. "
+            "'cpu_libav' forces the libavcodec path."
         ),
     )
     return parser.parse_args()
@@ -176,6 +195,11 @@ def main() -> None:
     cfg = load_yaml_config(args.config)
     scenes = parse_scenes(cfg)
     runtime_config = build_runtime_config(cfg, role="keyboard", scenes=scenes)
+    # Resolve encoder choice (CLI > env > YAML > code default) and apply
+    # to runtime_config. Logs the resolution at INFO. Raises
+    # NvencUnavailableError if the user explicitly asked for nvenc on
+    # a host without NVENC; let it bubble up so the failure is loud.
+    apply_encoder_settings(runtime_config, cfg, cli_value=args.encoder)
     server_settings = get_server_settings(cfg)
     keyboard_settings = get_keyboard_settings(cfg)
 

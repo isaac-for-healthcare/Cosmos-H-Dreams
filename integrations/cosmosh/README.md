@@ -94,7 +94,7 @@ Browser -> server:
 
 - Supported message types:
   - `{type: "action", action: {event: "keydown" | "keyup", key: ...}}` — held-key bookkeeping (`key` ∈ `w,a,s,d,r,f`) and `space` keydown to toggle the gripper.
-  - `{type: "reset"}` — clear keyboard state, integrator, AR index, and re-anchor on the initial conditional frame. Server drains pending video frames and replies `{type: "reset_done", dropped_frames: N}`. The render loop continues on the reset state.
+  - `{type: "reset"}` — clear keyboard state, integrator, AR index, and re-anchor on the initial conditional frame. Server pushes a fresh anchor frame to the video track and replies `{type: "reset_done"}`. Any pre-reset frames already buffered on the video track flush to the browser in lockstep with the sender's pacing (≤ 1 chunk under backpressure). The render loop continues on the reset state.
   - `{type: "action", action: {event: "step"}}` — accepted as a no-op for backwards compatibility; the server renders continuously, so explicit step requests are unnecessary.
 - Key mapping (each arm uses the keyboard region under the matching hand):
   - **PSM1 (right arm, right-hand keys):**
