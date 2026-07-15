@@ -1,0 +1,50 @@
+# Keyboard server — suturebot episode 001867 + chole scenes.
+# Switch live from the UI's "Scene:" dropdown.
+#
+# Run with:
+#   uv run --package flash-cosmosHDreams python -m cosmosHDreams.webrtc.server \
+#     --config cosmosHDreams/configs/keyboard_tabletop.yaml
+
+runtime:
+  config_name: cosmosHDreams-chunk3-2steps-vae-lighttae
+  compile_network: true
+  device: cuda:0
+  seed: 1
+  ckpt_path: checkpoints/jhu/tabletop/model_ema_bf16_jhutabletop_288x512_h73.pt
+  resolution: [288, 512]
+  fps: 30
+  actions_per_chunk: 12  # 4 / 8 / 12 / 16…; smaller = lower latency, lower fidelity
+
+# Light-switch contract: the model (config_name / ckpt_path / resolution /
+# actions_per_chunk) is shared across scenes — only the conditional input,
+# action stats, and CR1 embeddings change at switch time. First scene below
+# is the one the runtime boots into.
+scenes:
+  - name: suturebot_001867
+    input_path: sf_inference_data/260206/suturebot_inference_data/episode_001867.mp4
+    stats_path: sf_inference_data/260206/stats_cosmos.json
+    cr1_embeddings_path: sf_inference_data/cr1_empty_string_text_embeddings.pt
+    start_frame_idx: 0
+  - name: suturebot_001866
+    input_path: sf_inference_data/260206/suturebot_inference_data/episode_001866.mp4
+    stats_path: sf_inference_data/260206/stats_cosmos.json
+    cr1_embeddings_path: sf_inference_data/cr1_empty_string_text_embeddings.pt
+    start_frame_idx: 0
+  - name: suturebot_001868
+    input_path: sf_inference_data/260206/suturebot_inference_data/episode_001868.mp4
+    stats_path: sf_inference_data/260206/stats_cosmos.json
+    cr1_embeddings_path: sf_inference_data/cr1_empty_string_text_embeddings.pt
+    start_frame_idx: 0
+
+keyboard:
+  translate_v_per_frame: 0.1   # σ/frame; 0.1 ≈ 2.3 mm/s on PSM1 at fps=10
+  gripper_v_per_chunk: 1.0     # σ/chunk while open/close key held
+  rotate_deg_per_frame: 1.0    # degrees/frame while a rotation key held
+  light_mode: false            # true = render only while input is held
+
+server:
+  host: 0.0.0.0
+  port: 8080
+
+video:
+  encoder: auto

@@ -1,0 +1,75 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flash-cosmosHDreams"
+version = "0.1.0"
+description = "Cosmosh WebRTC integration for flashdreams"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "flashdreams",
+    "aiohttp>=3.9",
+    "aiortc>=1.9",
+    "opencv-python-headless",
+    "mediapy",
+    "PyNvVideoCodec>=2.1",
+    "pyyaml>=6.0",
+]
+
+[tool.uv.sources]
+flashdreams = { workspace = true }
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+# Each entry registers one ``runner_name`` slug with ``flashdreams-run``.
+# The discovery layer (``flashdreams.plugins.registry.discover_runners``)
+# scans this group at CLI startup; the entry-point name itself is purely
+# informational, the registry key always comes from ``cfg.runner_name``.
+[project.entry-points."flashdreams.runner_configs"]
+# chunk2 variants
+"cosmosHDreams-chunk2-vae-vae" = "cosmosHDreams.config:RUNNER_COSMOSH_CHUNK2_VAE_VAE"
+"cosmosHDreams-chunk2-vae-lighttae" = "cosmosHDreams.config:RUNNER_COSMOSH_CHUNK2_VAE_LIGHTTAE"
+"cosmosHDreams-chunk2-2steps-vae-vae" = "cosmosHDreams.config:RUNNER_COSMOSH_CHUNK2_2STEPS_VAE_VAE"
+"cosmosHDreams-chunk2-2steps-vae-lighttae" = "cosmosHDreams.config:RUNNER_COSMOSH_CHUNK2_2STEPS_VAE_LIGHTTAE"
+# chunk3 variants (recommended)
+"cosmosHDreams-chunk3-vae-vae" = "cosmosHDreams.config:RUNNER_COSMOSH_CHUNK3_VAE_VAE"
+"cosmosHDreams-chunk3-vae-lighttae" = "cosmosHDreams.config:RUNNER_COSMOSH_CHUNK3_VAE_LIGHTTAE"
+"cosmosHDreams-chunk3-2steps-vae-vae" = "cosmosHDreams.config:RUNNER_COSMOSH_CHUNK3_2STEPS_VAE_VAE"
+"cosmosHDreams-chunk3-2steps-vae-lighttae" = "cosmosHDreams.config:RUNNER_COSMOSH_CHUNK3_2STEPS_VAE_LIGHTTAE"
+# Explicit 4-step aliases (same pipelines as the non-2steps chunk slugs above).
+"cosmosHDreams-chunk2-4steps-vae-vae" = "cosmosHDreams.config:RUNNER_COSMOSH_CHUNK2_4STEPS_VAE_VAE"
+"cosmosHDreams-chunk2-4steps-vae-lighttae" = "cosmosHDreams.config:RUNNER_COSMOSH_CHUNK2_4STEPS_VAE_LIGHTTAE"
+"cosmosHDreams-chunk3-4steps-vae-vae" = "cosmosHDreams.config:RUNNER_COSMOSH_CHUNK3_4STEPS_VAE_VAE"
+"cosmosHDreams-chunk3-4steps-vae-lighttae" = "cosmosHDreams.config:RUNNER_COSMOSH_CHUNK3_4STEPS_VAE_LIGHTTAE"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cosmosHDreams*"]
+exclude = ["tests*"]
+
+[tool.setuptools.package-data]
+"cosmosHDreams.webrtc" = ["web/*.html", "web/*.css", "web/*.js"]
+
+[tool.uv]
+managed = true

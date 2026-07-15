@@ -1,167 +1,184 @@
-<!--
-SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-SPDX-License-Identifier: Apache-2.0
--->
+# Cosmos-H-Dreams
 
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/logo/horizontal-dark.svg">
-    <img alt="FlashDreams" src="assets/logo/horizontal-light.svg" width="600">
-  </picture>
-</p>
+[![License](https://img.shields.io/badge/Code-Apache_2.0-blue.svg)](LICENSE)
+[![Weights](https://img.shields.io/badge/Weights-NVIDIA_Open_Model-green.svg)](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license)
+[![HuggingFace](https://img.shields.io/badge/%F0%9F%A4%97-Hugging%20Face-yellow)](TODO)
+[![Paper](https://img.shields.io/badge/arXiv-TODO-red.svg)](TODO)
+[![Python](https://img.shields.io/badge/Python-3.12+-blue.svg)](https://python.org)
 
-<p align="center">
-  <a href="LICENSE"><img alt="License: Apache 2.0" src="https://img.shields.io/badge/License-Apache_2.0-blue.svg"></a>
-  <a href="https://nvidia.github.io/flashdreams/main/index.html"><img alt="Documentation" src="https://img.shields.io/badge/docs-latest-blue.svg"></a>
-</p>
+Real-time action-conditioned surgical video simulation via WebRTC, built on [FlashDreams](https://github.com/NVIDIA/flashdreams).
 
-**FlashDreams** is a high-performance inference and serving library for
-interactive autoregressive video and world models. It began as the optimized
-runtime behind the [NVIDIA OmniDreams closed-loop demo for GTC 2026][omnidreams-blog]
-and has grown into a general platform for real-time world-model applications
-across gaming, autonomous vehicles, robotics, simulated or virtual
-environments, and more.
+## Overview
 
-[omnidreams-blog]: https://research.nvidia.com/labs/sil/projects/omnidreams-blog/
+Cosmos-H-Dreams is a fine-tuned variant of Cosmos-H-Surgical-Simulator, with its own checkpoint and a serving layer in a streaming server, enabling live surgical simulation driven by keyboard or Meta Quest controller input. Given a conditional first frame from a surgical procedure and a live stream of instrument action vectors, the model rolls forward in blocks of generated frames and streams the output to a browser or VR headset in real time via WebRTC.
 
-https://github.com/user-attachments/assets/2b000ce9-effe-4cc9-a227-5b4619413e4d
+The system is built on top of [FlashDreams](https://github.com/NVIDIA/flashdreams), NVIDIA's high-performance inference and serving library for autoregressive video models. It uses a fine-tuned checkpoint from [Cosmos-H-Surgical-Simulator](https://github.com/NVIDIA-Medtech/Cosmos-H-Surgical-Simulator) and supports two modes:
+
+- **Offline batch inference** — feed a JSON manifest of `{input_video, input_action, output_video}` entries and produce MP4 + raw tensor outputs.
+- **Interactive WebRTC** — drive the rollout live from a browser (keyboard) or a Meta Quest headset (WebXR), with no action `.npy` needed.
+
+## News
+
+- **[July, 2026]** — Initial release of Cosmos-H-Dreams
+
+## Runner Configurations
+
+Slugs follow the pattern `cosmosHDreams-[chunk{N}-][2steps-]{encoder}-{decoder}` across four independent axes:
+
+
+| Axis                        | Choices            | Notes                                                                                                                             |
+| --------------------------- | ------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
+| **Chunk size** (`chunk{N}`) | `chunk2`, `chunk3` | Latent frames per DiT forward pass. Higher = fewer DiT calls for the same output. `chunk3` is recommended for throughput.         |
+| **Schedule**                | `4steps`, `2steps` | 4-step is closer to the training distribution; 2-step gives ~2× DiT speedup at some fidelity cost. Omitting defaults to `4steps`. |
+| **Encoder**                 | `vae`              | Full Wan2.1 VAE.                                                                                                                  |
+| **Decoder**                 | `vae`, `lighttae`  | Full Wan2.1 VAE vs. TAEHV `lighttae` (~10× faster decode, modest quality drop).                                                   |
+
+
+The recommended chunk3 variants:
+
+
+| Slug                                       | Schedule | Encoder | Decoder  |
+| ------------------------------------------ | -------- | ------- | -------- |
+| `cosmosHDreams-chunk3-4steps-vae-vae` ⭐    | 4-step   | vae     | vae      |
+| `cosmosHDreams-chunk3-4steps-vae-lighttae` | 4-step   | vae     | lighttae |
+| `cosmosHDreams-chunk3-2steps-vae-vae`      | 2-step   | vae     | vae      |
+| `cosmosHDreams-chunk3-2steps-vae-lighttae` | 2-step   | vae     | lighttae |
+
+
+All 12 configs share the same checkpoint and DiT geometry. Run `uv run flashdreams-run --help` to list every available slug.
+
+## Quick Start
+
+### 1. Build the container
+
+```bash
+docker build -t cosmos-h-dreams:latest docker/
+```
+
+### 2. Start the container
+
+Place the following assets under the repo root before launching:
+
+- `checkpoints/` — CosmosH `.pt` checkpoint(s)
+- `sf_inference_data/` — input manifests, action `.npy` files, and the precomputed CR1 text embeddings `.pt`
+
+```bash
+docker run --rm -it \
+  --network host \
+  --gpus all \
+  -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,video \
+  -v .:/workspace/cosmos-h-dreams \
+  -w /workspace/cosmos-h-dreams \
+  cosmos-h-dreams:latest /bin/bash
+```
+
+### 3. Install dependencies
+
+```bash
+uv sync --extra dev --extra runners --group lint
+```
+
+### 4. Mode A — Offline batch inference
+
+```bash
+uv run flashdreams-run cosmosHDreams-chunk3-vae-vae \
+  --input-json assets/example_data/offline/suturebot_inference_manifest.json \
+  --cr1-embeddings-path sf_inference_data/cr1_empty_string_text_embeddings.pt \
+  --root-dir . \
+  --total-blocks 20 \
+  --save-comparison True \
+  --resolution 288,512 \
+  --pipeline.diffusion-model.transformer.checkpoint-path checkpoints/model_ema_bf16_jhutabletop_288x512_h73.pt
+```
+
+Each entry produces `<name>.mp4`, `<name>_annotated.mp4`, `<name>.npy` (raw `[3, T, H, W]` tensor in `[-1, 1]`), and `<name>_latents.npy`.
+
+> **Note — first-run latency.** The first block absorbs `torch.compile` JIT and the initial CUDA-graph capture (reported as `[WARMUP]`). Compiled artifacts are cached and reused on subsequent runs of the same configuration and resolution.
+
+### 5. Mode B — Interactive WebRTC
+
+**Keyboard (any browser):**
+
+```bash
+uv run --package flash-cosmosHDreams python -m cosmosHDreams.webrtc.server \
+  --config cosmosHDreams/configs/keyboard_tabletop.yaml
+```
+
+Open **[http://0.0.0.0:8080/keyboard](http://0.0.0.0:8080/keyboard)** in any browser to start controlling the surgical robot.
+
+**Meta Quest (WebXR):**
+
+WebXR requires HTTPS. Generate a self-signed certificate once, replacing `<host-ip>` with the LAN IP of the server:
+
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes \
+  -keyout key.pem -out cert.pem -days 365 \
+  -subj "/CN=quest" \
+  -addext "subjectAltName=IP:<host-ip>"
+```
+
+```bash
+uv run --package flash-cosmosHDreams python -m cosmosHDreams.webrtc.server_quest \
+  --config cosmosHDreams/configs/quest_tabletop.yaml
+```
+
+Open `https://<host-ip>:8443/quest` in the Quest browser and click **Enter VR**. Hold `B` to reset the simulation; hold `Y` for 1 s to exit immersive mode.
+
+**Unified (keyboard + Quest on one port):**
+
+```bash
+uv run --package flash-cosmosHDreams python -m cosmosHDreams.webrtc.server_unified \
+  --config cosmosHDreams/configs/unified_tabletop.yaml
+```
+
+Serves `/keyboard`, `/quest`, `/viewer`, and `/` on a single HTTPS port (default `8443`). Whichever client connects most recently drives; the other is paused until it reconnects (takeover semantics).
+
+> **Note — first-input latency.** In interactive mode the DiT is compiled with `torch.compile` on the first forward pass triggered by user input. Expect the first generation to take significantly longer than steady-state; subsequent generations run at normal speed.
+
+## Documentation
+
+
+| Guide | Description |
+|-------|-------------|
+| [`cosmosHDreams/GUIDE.md`](cosmosHDreams/GUIDE.md) | Container setup, dependency sync, config selection, full flag reference for offline inference and all three WebRTC servers |
+| [`cosmosHDreams/README.md`](cosmosHDreams/README.md) | Package reference: run commands, DataChannel protocol, key bindings |
+| [`cosmosHDreams/configs/`](cosmosHDreams/configs/) | Annotated YAML schemas (runtime, scenes, server, video settings) |
+
 
 ## System Requirements
 
-- NVIDIA GPU with **80 GB VRAM or more** (e.g. H100 80GB), see notes below.
-- NVIDIA driver from the **R580 series or newer** (compatible with CUDA 13.x)
-- **CUDA 13.x** (PyTorch `2.11.0+cu130` and the `nvidia-*-cu13` libraries are
-  resolved by `uv sync`. A system CUDA toolkit is needed only for the
-  developer extras and is included in `nvidia/cuda:13.2.1-cudnn-devel-ubuntu24.04`)
-- **Python >= 3.10**
-- **PyTorch >= 2.11.0+cu130** (`>= 2.9` for bare PyPI library install)
-- Linux x86-64 or arm64
-- **100 GB+ free storage space** recommended for environment and model checkpoints.
-- Docker with the
-  [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
-  (optional, only for the container workflow)
-
-> Development and testing were performed on GPUs with **80 GB of VRAM or more**.
-> Inference can fail (out-of-memory) on consumer and even enthusiast GPUs.
-> Per-model GPU and VRAM requirements are listed on each model page in
-> [the model gallery](https://nvidia.github.io/flashdreams/main/models/index.html).
-
-## Quickstart
-
-The complete setup is in
-[the installation guide](https://nvidia.github.io/flashdreams/main/quickstart/installation.html).
-Assuming `uv` is [installed](https://docs.astral.sh/uv/getting-started/installation), the shortest viable path is:
-
-```bash
-git clone https://github.com/NVIDIA/flashdreams.git
-cd flashdreams
-uv sync --extra runners
-export HF_TOKEN=<your-hf-token>
-uv run flashdreams-run --help
-```
-
-Note for developers/maintainers you would want to run `uv sync --extra dev --extra runners` instead.
-
-Then launch your first model by following
-[the quickstart guide](https://nvidia.github.io/flashdreams/main/quickstart/first_world_model.html).
-For example, the offline Self-Forcing T2V quickstart command is:
-
-```bash
-uv run --project integrations/self_forcing \
-    flashdreams-run self-forcing-wan2.1-t2v-1.3b \
-    --total-blocks 7
-```
-
-You can also install FlashDreams as a library from PyPI:
-
-```bash
-pip install flashdreams
-```
-
-### Try the interactive driving demo
-
-Drive a world model in real time with the OmniDreams `interactive-drive` demo. See the
-**[interactive demo guide](https://nvidia.github.io/flashdreams/main/models/omnidreams.html#launch-the-interactive-demo)**.
-
-## Supported models
-
-FlashDreams ships first-party integrations under
-[`integrations/`](integrations/). Each model has a dedicated docs page with
-runner slugs, multi-GPU commands, and (where available) profiling benchmarks.
-
-| Model | Family |
-| --- | --- |
-| [Self-Forcing](https://nvidia.github.io/flashdreams/main/models/self_forcing.html) | Streaming Wan2.1 T2V |
-| [OmniDreams](https://nvidia.github.io/flashdreams/main/models/omnidreams.html) | HDMap-conditioned driving world model |
-| [LingBot-World](https://nvidia.github.io/flashdreams/main/models/lingbot_world.html) | Camera-controllable I2V world model |
-| [Wan2.1](https://nvidia.github.io/flashdreams/main/models/wan21.html) | Bidirectional T2V / I2V |
-| [Causal-Forcing](https://nvidia.github.io/flashdreams/main/models/causal_forcing.html) | Streaming Wan2.1 T2V / I2V |
-| [Causal Wan2.2](https://nvidia.github.io/flashdreams/main/models/causal_wan22.html) | FastVideo Causal Wan 2.2 14B MoE T2V |
-| [FlashVSR](https://nvidia.github.io/flashdreams/main/models/flashvsr.html) | Streaming video super-resolution |
-| [Cosmos-Predict2.5](https://nvidia.github.io/flashdreams/main/models/cosmos_predict2.html) | Bidirectional T2V / I2V |
-
-See [the model gallery](https://nvidia.github.io/flashdreams/main/models/index.html) and
-[the new method guide](https://nvidia.github.io/flashdreams/main/developer_guides/new_integration.html)
-to add your own.
-
-## Developer guides
-
-- [Inference pipeline overview](https://nvidia.github.io/flashdreams/main/developer_guides/inference_pipeline_overview.html)
-- [Config system](https://nvidia.github.io/flashdreams/main/developer_guides/config_system.html)
-- [Add a new method](https://nvidia.github.io/flashdreams/main/developer_guides/new_integration.html)
-
-For day-to-day development:
-
-```bash
-uv sync --extra dev --extra runners
-uv run pre-commit run -a
-uv run pytest -m "not manual"
-```
-
-See [`DEV.md`](DEV.md) for repository-specific workflow notes.
-
-## Contributing
-
-For how to contribute, see [`CONTRIBUTING.md`](CONTRIBUTING.md).
-New integrations, bug reports, feature requests, performance tuning, and
-documentation edits are all welcome.
-
-Use [GitHub Issues](https://github.com/NVIDIA/flashdreams/issues) to report defects or request improvements.
-
-Join us on the [NVIDIA Omniverse Discord](https://discord.com/invite/nvidiaomniverse)
-to share your results and take part in technical discussion! Channel: [`#flashdreams`](https://discord.gg/yTdHDqFP)
-
-## Security
-
-To report a potential security vulnerability, follow the coordinated
-disclosure process in [`SECURITY.md`](SECURITY.md).
+- NVIDIA GPU with at least 12GB of VRAM.
+- NVIDIA driver **R580 series or newer** (CUDA 13.x)
+- **Python >= 3.12**
+- Docker with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
 
 ## License
 
-FlashDreams is released under the [Apache License 2.0](LICENSE). Third-party
-components and their licenses are listed in
-[`THIRD-PARTY-NOTICES`](THIRD-PARTY-NOTICES) and [`NOTICE`](NOTICE). The
-repository is REUSE-compliant; see [`REUSE.toml`](REUSE.toml) and
-[`LICENSES/`](LICENSES/).
 
-## Citation
+| Component                     | License                                                                                                     |
+| ----------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| Source code                   | [Apache 2.0](LICENSE)                                                                                       |
+| Cosmos-H-Dreams model weights | [NVIDIA Open Model](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/) |
 
-If FlashDreams is useful in your research or product, please cite the project:
 
-```bibtex
-@misc{flashdreams2026,
-  title        = {FlashDreams: High-performance inference and serving for
-                  interactive autoregressive video and world models},
-  author       = {{FlashDreams Contributors}},
-  year         = {2026},
-  howpublished = {\url{https://github.com/NVIDIA/flashdreams}},
-}
+## Resources
 
-@misc{nvidia2026omnidreams,
-  title={OmniDreams: Real-Time Generative Closed-Loop Autonomous Vehicle Simulation Built on NVIDIA Cosmos},
-  author={Basant, Aarti and Kar, Amlan and Paschalidou, Despoina and Garcia Cobo, Guillermo and Turki, Haithem and Ling, Huan and Seo, Jaewoo and Wang, Jialiang and Lucas, James and Wu, Jay and Lorraine, Jonathan and Gao, Jun and He, Kai and Tothova, Katarina and Xie, Kevin and Tyszkiewicz, Michal and Wu, Qi and de Lutio, Riccardo and Li, Ruilong and Fidler, Sanja and Kim, Seung Wook and Shen, Tianchang and Cao, Tianshi and Pfaff, Tobias and Lew, William and Ren, Xuanchi and Lu, Yifan and Gojcic, Zan and Wang, Zian},
-  year={2026},
-  note={Technical report},
-  howpublished={\url{https://research.nvidia.com/labs/sil/projects/omnidreams-blog/paper.pdf}}
-}
+- [Paper](TODO) — Cosmos-H-Dreams technical report
+- [HuggingFace](TODO) — Model weights and checkpoints
+- [Cosmos-H-Surgical-Simulator](https://github.com/NVIDIA-Medtech/Cosmos-H-Surgical-Simulator) — Base model that Cosmos-H-Dreams is fine-tuned from (offline inference and fine-tuning)
+- [FlashDreams](https://github.com/NVIDIA/flashdreams) — Underlying high-performance inference runtime
+- [Open-H Dataset](https://huggingface.co/datasets/nvidia/Open-H) — Multi-embodiment surgical benchmark used for training
+- [NVIDIA Cosmos Platform](https://www.nvidia.com/en-us/ai/cosmos) — Product website
+
+## Known Issues
+
+**WebRTC stream flickers with wrong colors** — the video stream in the browser or Quest headset shows color artifacts or flickers between frames. This happens when the GPU is saturated by the diffusion process and cannot simultaneously run the NVENC hardware encoder reliably. Fix: force the CPU encoder in the server YAML:
+
+```yaml
+video:
+  encoder: cpu_libav
 ```
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on reporting bugs and submitting changes.
