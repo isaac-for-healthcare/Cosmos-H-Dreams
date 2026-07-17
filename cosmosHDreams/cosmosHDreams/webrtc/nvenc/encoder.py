@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Thin wrapper around PyNvVideoCodec NVENC for the CosmosH WebRTC server.
 
 Owns one NVENC session for the lifetime of a streaming session. Construction

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Keyboard input state + action-chunk computation for the keyboard server.
 
 Quest-side state lives in :mod:`cosmosHDreams.webrtc.controls_quest`; truly shared

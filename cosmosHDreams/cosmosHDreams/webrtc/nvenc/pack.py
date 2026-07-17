@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """GPU-side denormalize + ARGB pack for NVENC consumption.
 
 The CosmosH runtime hands the post-decoder pixel chunk to the encode

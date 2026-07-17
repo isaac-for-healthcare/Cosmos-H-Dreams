@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Video track for the NVENC encode path.
 
 Drop-in replacement for :class:`cosmosHDreams.webrtc.media.CosmoshVideoTrack`

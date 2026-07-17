@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unified Cosmosh server — keyboard + Quest on one port, one rollout.
 
 The keyboard demo lives at ``/keyboard`` (WebRTC), the Quest demo at

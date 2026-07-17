@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Unit tests for ``cosmosHDreams.webrtc.nvenc.resolver``.
 
 Pure-Python — no CUDA, no PyNvVideoCodec, no aiortc internals. Runs on

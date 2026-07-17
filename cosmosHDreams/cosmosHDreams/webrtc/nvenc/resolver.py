@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Encoder selection — auto / nvenc / cpu_libav.
 
 Three values are accepted from YAML, CLI, or environment:

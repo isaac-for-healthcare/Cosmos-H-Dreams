@@ -1,8 +1,8 @@
-# Contributing to FlashDreams
+# Contributing to Cosmos-H-Dreams
 
-Thanks for your interest in contributing to **FlashDreams**. This project
+Thanks for your interest in contributing to **Cosmos-H-Dreams**. This project
 is developed openly on GitHub and released under the
-[Apache License 2.0](https://github.com/NVIDIA/flashdreams/blob/main/LICENSE). Outside contributions — bug reports,
+[Apache License 2.0](https://github.com/NVIDIA-Medtech/Cosmos-H-Dreams/blob/main/LICENSE). Outside contributions — bug reports,
 feature requests, performance improvements, new model integrations,
 documentation fixes — are genuinely welcome, and this guide explains how
 they fit in alongside the project's day-to-day work.
@@ -31,7 +31,7 @@ issue and we'll fix it.
 There are several useful ways to help out, ordered roughly from "low
 overhead" to "high overhead":
 
-- **Try FlashDreams and tell us what broke.** A clear bug report — what
+- **Try Cosmos-H-Dreams and tell us what broke.** A clear bug report — what
   you ran, what you expected, what you saw — is one of the most valuable
   contributions a project of this kind can receive.
 - **Improve documentation.** README clarifications, integration walkthroughs,
@@ -43,16 +43,15 @@ overhead" to "high overhead":
 - **Add or extend integrations.** New video-generation models, new schedulers,
   new integrations. For non-trivial features, please open a design issue
   before sending the PR (see [Submitting a pull request](#submitting-a-pull-request)).
-- **Performance work.** FlashDreams cares about latency and throughput
+- **Performance work.** Cosmos-H-Dreams cares about latency and throughput
   on NVIDIA GPUs. Numbers and reproducible benchmarks make these PRs
   easy to evaluate.
 
 ## Project governance
 
-FlashDreams was developed inside NVIDIA's Simulation & Imitation
-Learning group, and at the time of release NVIDIA holds the
-maintainer and admin roles on the
-[`NVIDIA/flashdreams`](https://github.com/NVIDIA/flashdreams) repository.
+Cosmos-H-Dreams was developed inside NVIDIA Medtech, and at the time of
+release NVIDIA holds the maintainer and admin roles on the
+[`NVIDIA-Medtech/Cosmos-H-Dreams`](https://github.com/NVIDIA-Medtech/Cosmos-H-Dreams) repository.
 That includes the `main` branch protections, release tags, the package
 publishing keys, and the right to merge.
 
@@ -68,7 +67,7 @@ develops. Concretely, that means:
   employee or not.
 - **Decisions happen in public.** Significant design changes are
   discussed in GitHub issues, pull requests, or
-  [Discussions](https://github.com/NVIDIA/flashdreams/discussions).
+  [Discussions](https://github.com/NVIDIA-Medtech/Cosmos-H-Dreams/discussions).
   Internal NVIDIA roadmap planning that touches the public project will
   surface as a public issue before it lands.
 - **Release notes credit external contributors** by name and PR.
@@ -86,9 +85,9 @@ not.
 **This project will only accept contributions under the Apache-2.0
 license.** By submitting a pull request you agree that your
 contribution is licensed under the Apache License, Version 2.0 (see
-[LICENSE](https://github.com/NVIDIA/flashdreams/blob/main/LICENSE)).
+[LICENSE](https://github.com/NVIDIA-Medtech/Cosmos-H-Dreams/blob/main/LICENSE)).
 
-All contributions to FlashDreams are made under the
+All contributions to Cosmos-H-Dreams are made under the
 [Developer Certificate of Origin](https://developercertificate.org/).
 This is a lightweight, well-understood mechanism (used by the Linux
 kernel, GitLab, NVIDIA TensorRT, and many other projects) that lets you
@@ -232,7 +231,7 @@ short ping comment.
   locally is the easiest way to avoid surprises.
 - Prefer small, well-named functions over long functions with comments
   explaining each block. Comments should explain *why*, not *what*.
-- Tests live in `flashdreams/tests/` and `integrations/*/tests/`. Use
+- Tests live in `flashdreams/tests/`, `cosmosHDreams/tests/`, and `tests/`. Use
   `pytest` and prefer existing fixtures over hand-rolled setup. See
   [Testing](#testing) for marker requirements.
 - Every source file added by a contribution must include the SPDX
@@ -303,9 +302,10 @@ uv run pytest                    # all tests including manual
 
 ## Dependency version bounds
 
-The `flashdreams/pyproject.toml` declares minimum version bounds for all
-runtime dependencies. These bounds reflect the oldest versions we believe
-are compatible based on API analysis.
+The `flashdreams/pyproject.toml` and `cosmosHDreams/pyproject.toml` declare
+minimum version bounds for their respective runtime dependencies. These
+bounds reflect the oldest versions we believe are compatible based on API
+analysis.
 
 **CI tests run against the pinned versions in `uv.lock`**, not against
 the declared minimums. This means:
@@ -315,46 +315,40 @@ the declared minimums. This means:
   not continuously validate this in CI.
 - If you encounter breakage with a version that satisfies the declared
   bounds but differs from the lock file, please
-  [open an issue](https://github.com/NVIDIA/flashdreams/issues). We will
+  [open an issue](https://github.com/NVIDIA-Medtech/Cosmos-H-Dreams/issues). We will
   either fix compatibility or bump the bound in `pyproject.toml`.
 
-## Working with a single integration package
+## Working with a single workspace package
 
-The workspace contains many integration packages under `integrations/`.
-A full `uv sync` installs dependencies for *all* of them. If you only
-need one (e.g. you're working on `omnidreams`), use `--package` to sync
-only that package's dependencies:
+The workspace contains two packages: `flashdreams` (the core inference
+runtime, under `flashdreams/`) and `flash-cosmosHDreams` (the Cosmos-H-Dreams
+serving integration, under `cosmosHDreams/`). A full `uv sync` installs
+dependencies for both. If you only need one, use `--package` to scope the
+sync:
 
 ```bash
-# Only install omnidreams + its deps (skips unrelated heavy packages)
-uv sync --package omnidreams --extra dev
+# Only install the cosmosHDreams integration and its deps
+uv sync --package flash-cosmosHDreams --extra dev
 
-# Run a script/test from that integration only
-uv run --package omnidreams pytest tests/ -m ci_gpu
+# Run cosmosHDreams tests
+uv run --package flash-cosmosHDreams pytest cosmosHDreams/tests/ -m ci_cpu
+
+# Only install the flashdreams core and its deps
+uv sync --package flashdreams --extra dev
+
+# Run flashdreams core tests
+uv run --package flashdreams pytest flashdreams/tests/ -m ci_cpu
 ```
 
-This avoids pulling in (and compiling) dependencies that other
-integrations require but yours does not, further reducing setup time.
-
-Available integration packages:
-
-```
-integrations/causal_forcing
-integrations/cosmos_predict2
-integrations/fastvideo_causal_wan22
-integrations/flashvsr
-integrations/lingbot
-integrations/omnidreams
-integrations/self_forcing
-integrations/wan21
-```
+This avoids pulling in (and compiling) dependencies you don't need for
+the area you're working on.
 
 ## Licensing of contributions
 
 By submitting a pull request to this repository, you agree that your
 contribution is licensed under the
-[Apache License, Version 2.0](https://github.com/NVIDIA/flashdreams/blob/main/LICENSE), the same license under which
-FlashDreams is distributed. The DCO sign-off described above is your
+[Apache License, Version 2.0](https://github.com/NVIDIA-Medtech/Cosmos-H-Dreams/blob/main/LICENSE), the same license under which
+Cosmos-H-Dreams is distributed. The DCO sign-off described above is your
 attestation that you have the right to make that grant.
 
 Third-party code (i.e. code you did not write yourself, but that you
@@ -363,8 +357,8 @@ contributed only if:
 
 1. its license is compatible with Apache-2.0;
 2. its origin and license are clearly recorded in
-   [`REUSE.toml`](https://github.com/NVIDIA/flashdreams/blob/main/REUSE.toml) and
-   [`THIRD-PARTY-NOTICES`](https://github.com/NVIDIA/flashdreams/blob/main/THIRD-PARTY-NOTICES);
+   [`REUSE.toml`](https://github.com/NVIDIA-Medtech/Cosmos-H-Dreams/blob/main/REUSE.toml) and
+   [`THIRD-PARTY-NOTICES`](https://github.com/NVIDIA-Medtech/Cosmos-H-Dreams/blob/main/THIRD-PARTY-NOTICES);
 3. its files retain whatever attribution headers the upstream license
    requires.
 
@@ -374,18 +368,18 @@ upfront.
 
 ## Reporting issues
 
-Use [GitHub Issues](https://github.com/NVIDIA/flashdreams/issues) to report
+Use [GitHub Issues](https://github.com/NVIDIA-Medtech/Cosmos-H-Dreams/issues) to report
 functional defects and to request improvements. Please do not include
 confidential or customer information.
 
 Do not file security vulnerabilities as public issues. Follow the coordinated
 disclosure process in
-[SECURITY.md](https://github.com/NVIDIA/flashdreams/blob/main/SECURITY.md).
+[SECURITY.md](https://github.com/NVIDIA-Medtech/Cosmos-H-Dreams/blob/main/SECURITY.md).
 
 ## Code of Conduct
 
 This project follows the
-[Code of Conduct](https://github.com/NVIDIA/flashdreams/blob/main/CODE_OF_CONDUCT.md).
+[Code of Conduct](https://github.com/NVIDIA-Medtech/Cosmos-H-Dreams/blob/main/CODE_OF_CONDUCT.md).
 By participating in this project — including issues, discussions, and
 pull requests — you agree to abide by it. Please report concerns to the
 maintainers via the address listed in the Code of Conduct.

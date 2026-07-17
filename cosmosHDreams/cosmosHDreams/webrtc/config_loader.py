@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """YAML config loader for both servers (keyboard + Quest).
 
 One YAML schema covers both servers; each one only reads the sections it

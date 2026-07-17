@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 const remoteVideo = document.getElementById("remoteVideo")
 const videoText = document.getElementById("videoText")
 const eventsText = document.getElementById("eventsText")

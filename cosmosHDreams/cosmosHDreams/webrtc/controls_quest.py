@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Quest 3 controller state + action-chunk computation.
 
 Counterpart to :mod:`cosmosHDreams.webrtc.controls` (keyboard). Wire schema::

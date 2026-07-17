@@ -1,19 +1,17 @@
-NVIDIA FlashDreams
+NVIDIA Cosmos-H-Dreams
 Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 This product is licensed under the Apache License, Version 2.0;
 the full license text is reproduced in LICENSE at the repository root
 and in LICENSES/Apache-2.0.txt.
 
-Two subtrees physically vendored into this repository carry
-different OSI-approved licenses; full texts are reproduced under
-LICENSES/:
+One subtree physically vendored into this repository carries the same
+Apache-2.0 license as the rest of the project:
 
-  - integrations/omnidreams/ludus-renderer/ludus_renderer/_cpp/cudaraster/
-        BSD-3-Clause  (see LICENSES/BSD-3-Clause.txt)
-  - integrations/omnidreams/ludus-renderer/ludus_renderer/_cpp/
-    cudaraster/framework/3rdparty/lodepng/{lodepng.h,lodepng.cpp}
-        Zlib          (see LICENSES/Zlib.txt)
+  - flashdreams/
+        Apache-2.0  (see LICENSES/Apache-2.0.txt)
+        Vendored and extended from NVIDIA FlashDreams
+        (https://github.com/NVIDIA/flashdreams).
 
 Third-party software attributions, source-level redistribution
 disclosures, and the full per-dependency license inventory are

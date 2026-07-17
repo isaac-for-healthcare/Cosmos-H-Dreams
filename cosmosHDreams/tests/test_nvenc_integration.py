@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Real-hardware integration tests for the NVENC encode path.
 
 These exercise ``CosmoshNvencH264`` against a live PyNvVideoCodec +

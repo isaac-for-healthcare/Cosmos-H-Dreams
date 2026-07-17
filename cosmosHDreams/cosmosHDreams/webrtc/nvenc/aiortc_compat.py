@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """aiortc isolation boundary — the single file that touches aiortc internals.
 
 aiortc 1.x does not expose a public codec-registration API, so substituting

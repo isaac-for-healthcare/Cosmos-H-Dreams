@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """VideoEncoder abstraction for the WebRTC video pipeline.
 
 The :class:`VideoEncoder` Protocol pairs a concrete encoder
