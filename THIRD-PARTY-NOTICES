@@ -54,6 +54,7 @@ mediapy                Apache-2.0   https://github.com/google/mediapy
 opencv-python-headless Apache-2.0   https://github.com/opencv/opencv-python
 PyNvVideoCodec         MIT          https://github.com/NVIDIA/PyNvVideoCodec
 pyyaml                 MIT          https://github.com/yaml/pyyaml
+torchvision            BSD-3-Clause https://github.com/pytorch/vision
 
 ================================================================================
 Reference architectures

@@ -278,12 +278,10 @@ class CosmoshRunner(Runner[CosmoshRunnerConfig, CosmoshPipeline]):
         ar_steps = 0
         for ar_idx in range(cfg.total_blocks):
             need = self.pipeline.get_num_actions(ar_idx)
-            print(f"AR step {ar_idx}: need {need} actions")
             if offset + need > n_actions:
                 break
             chunk = all_actions[:, offset : offset + need] if need > 0 else None
             pixels = self.pipeline.generate(ar_idx, cache, actions=chunk)
-            print(f"AR step {ar_idx}: pixels shape {pixels.shape}")
             self.pipeline.finalize(ar_idx, cache)
             offset += need
             ar_steps += 1

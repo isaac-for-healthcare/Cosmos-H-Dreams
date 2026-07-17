@@ -31,6 +31,7 @@ dependencies = [
     "mediapy",
     "PyNvVideoCodec>=2.1",
     "pyyaml>=6.0",
+    "torchvision",
 ]
 
 [tool.uv.sources]
