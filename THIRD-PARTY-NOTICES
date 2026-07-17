@@ -9,9 +9,9 @@ corresponding upstream licenses.
 The primary Cosmos-H-Dreams source is licensed under the Apache License,
 Version 2.0 — see LICENSE at the repository root. Per-file SPDX
 identifiers and the REUSE 3.3 manifest at REUSE.toml are the
-machine-readable counterparts of the information below. Full license
-texts for every SPDX identifier referenced in this file are reproduced
-verbatim under LICENSES/.
+machine-readable counterparts of the information below. The full Apache-2.0
+license text is reproduced at LICENSES/Apache-2.0.txt. License texts for
+runtime dependencies are available from each upstream project's URL.
 
 Most dependencies are consumed unmodified at runtime through Python's
 import system (i.e. dynamic linking via the interpreter); their source

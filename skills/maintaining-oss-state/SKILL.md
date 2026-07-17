@@ -68,7 +68,6 @@ what.
 |---|---|---|
 | `LICENSE` | Apache-2.0 with a short licensing-posture preamble (the whole repo, incl. vendored `flashdreams/`, is Apache-2.0) followed by the canonical Apache-2.0 v2.0 text. CI verifies the canonical Apache-2.0 sentinel strings are present (preamble prose is not lint-gated). | OSRB license review |
 | `LICENSES/Apache-2.0.txt` | REUSE 3.3 license-bundle copy of the canonical Apache-2.0 text (no preamble — must remain reusable verbatim by REUSE tooling). | OSRB license review |
-| `LICENSES/BSD-3-Clause.txt` | Full BSD-3-Clause text, bundled because several runtime dependencies (torch, numpy, nvidia-ml-py, aiortc) are BSD-3-Clause and are attributed in `THIRD-PARTY-NOTICES`. | OSRB attribution review |
 | `NOTICE` | Apache 2.0 §4(d) minimal notice — NVIDIA copyright + pointers to `LICENSE`, `LICENSES/`, and `THIRD-PARTY-NOTICES`, plus the one-line vendored-`flashdreams/` acknowledgement. Carried forward verbatim by downstream redistributions. | Apache-2.0 §4(d) |
 | `THIRD-PARTY-NOTICES` | Full per-dependency attribution: per-package Direct runtime deps + Reference architectures + Source-level redistributions. The source of truth for the third-party manifest. | OSRB review (canonical attribution doc) |
 | `REUSE.toml` | REUSE 3.3 aggregate / override annotations for files without inline SPDX. | OSRB REUSE-compliance review |
@@ -454,10 +453,9 @@ sections).
    must stay preamble-free so REUSE tooling can reuse it verbatim.)
 2. The five core OSRB collateral files exist at the repo root:
    `LICENSE`, `LICENSES/Apache-2.0.txt`, `CONTRIBUTING.md`, `NOTICE`,
-   `REUSE.toml`. (`LICENSES/BSD-3-Clause.txt` and `THIRD-PARTY-NOTICES`
-   also need to be present per OSRB approval, but are not lint-gated —
-   they change slowly and a manual review catches drift sooner than the
-   cost of over-fitted CI would justify.)
+   `REUSE.toml`. (`THIRD-PARTY-NOTICES` also needs to be present per OSRB
+   approval, but is not lint-gated — it changes slowly and a manual review
+   catches drift sooner than the cost of over-fitted CI would justify.)
 3. `CONTRIBUTING.md` references the DCO / sign-off.
 4. Every tracked source file (`.py`, `.pyx`, `.pyi`, `.c`, `.cc`,
    `.cpp`, `.cxx`, `.h`, `.hh`, `.hpp`, `.hxx`, `.cu`, `.cuh`,
