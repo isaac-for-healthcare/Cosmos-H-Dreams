@@ -87,19 +87,15 @@ jobs:
       # without inline headers, but inline tags are the OSRB-preferred form
       # and catch new files copied in without attribution.
       #
-      # Paths covered by REUSE.toml `override` annotations (vendored upstream
-      # whose original BSD-3-Clause / Zlib banners are kept verbatim, plus
-      # generated protobuf stubs) are exempt.
+      # Every first-party source file (incl. the vendored Apache-2.0
+      # flashdreams/ subtree) carries the standard inline header, so there
+      # are no exemptions today. If a future `override` subtree keeps
+      # non-Apache upstream banners verbatim, exempt it here.
       - name: Inline SPDX headers on first-party source files
         run: |
           set -euo pipefail
-          excludes='^integrations/omnidreams/ludus-renderer/ludus_renderer/_cpp/cudaraster/'
-          excludes+='|^integrations/omnidreams/omnidreams/grpc/protos/.*_pb2'
           missing_files=()
           while IFS= read -r f; do
-            if printf '%s\n' "$f" | grep -qE "$excludes"; then
-              continue
-            fi
             if ! head -n 20 "$f" | grep -q "SPDX-License-Identifier"; then
               missing_files+=("$f")
             fi
@@ -149,7 +145,7 @@ jobs:
                -e "proprietary rights in and to this software" \
                -- \
                ':!.github/workflows/reuse-lint.yml' \
-               ':!agentic/skills/maintaining-oss-state/SKILL.md'; then
+               ':!skills/maintaining-oss-state/SKILL.md'; then
             echo "::error::NVIDIA proprietary banner found in repository"
             exit 1
           fi

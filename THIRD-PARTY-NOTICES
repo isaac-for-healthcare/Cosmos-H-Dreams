@@ -39,6 +39,7 @@ torch                  BSD-3-Clause https://pytorch.org
 tqdm                   MIT, MPL-2.0 https://github.com/tqdm/tqdm
 transformers           Apache-2.0   https://github.com/huggingface/transformers
 tyro                   Apache-2.0   https://github.com/brentyi/tyro
+urllib3                MIT          https://github.com/urllib3/urllib3
 
 Optional (Windows only):
 triton-windows         MIT          https://github.com/woct0rdho/triton-windows
