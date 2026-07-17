@@ -18,9 +18,7 @@
 
 The version in ``flashdreams/flashdreams/_version.py`` is the single source of
 truth for the entire monorepo.  This script reads it and updates the
-``version = "..."`` line in every workspace-member ``pyproject.toml``, except
-for packages with independent versioning (ludus-renderer, self-forcing
-parity-check).
+``version = "..."`` line in every workspace-member ``pyproject.toml``.
 
 Intended to run as a pre-commit hook and as a CI safety-net step.
 
@@ -38,11 +36,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 # Packages that maintain their own independent version.
-SKIP_PACKAGES = {
-    "ludus-renderer",
-    "self-forcing-parity-check",
-    "hy-worldplay-parity-check",
-}
+SKIP_PACKAGES: set[str] = set()
 
 # Regex to extract __version__ = "X.Y.Z" from _version.py.
 _VERSION_RE = re.compile(r'^__version__\s*=\s*"([^"]+)"', re.MULTILINE)
