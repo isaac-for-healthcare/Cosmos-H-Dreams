@@ -12,7 +12,7 @@ Real-time action-conditioned surgical video simulation via WebRTC, built on [Fla
 
 Cosmos-H-Dreams is a fine-tuned variant of Cosmos-H-Surgical-Simulator, with its own checkpoint and a serving layer in a streaming server, enabling live surgical simulation driven by keyboard or Meta Quest controller input. Given a conditional first frame from a surgical procedure and a live stream of instrument action vectors, the model rolls forward in blocks of generated frames and streams the output to a browser or VR headset in real time via WebRTC.
 
-The system is built on top of [FlashDreams](https://github.com/NVIDIA/flashdreams), NVIDIA's high-performance inference and serving library for autoregressive video models. It uses a fine-tuned checkpoint from [Cosmos-H-Surgical-Simulator](https://github.com/NVIDIA-Medtech/Cosmos-H-Surgical-Simulator) and supports two modes:
+The system is built on top of [FlashDreams](https://github.com/NVIDIA/flashdreams), NVIDIA's high-performance inference and serving library for autoregressive video models. It uses a fine-tuned checkpoint from [Cosmos-H-Surgical-Simulator](https://github.com/isaac-for-healthcare/Cosmos-H-Surgical-Simulator) and supports two modes:
 
 - **Offline batch inference** — feed a JSON manifest of `{input_video, input_action, output_video}` entries and produce MP4 + raw tensor outputs.
 - **Interactive WebRTC** — drive the rollout live from a browser (keyboard) or a Meta Quest headset (WebXR), with no action `.npy` needed.
@@ -165,7 +165,7 @@ Serves `/keyboard`, `/quest`, `/viewer`, and `/` on a single HTTPS port (default
 
 - [Paper](TODO) — Cosmos-H-Dreams technical report
 - [HuggingFace](TODO) — Model weights and checkpoints
-- [Cosmos-H-Surgical-Simulator](https://github.com/NVIDIA-Medtech/Cosmos-H-Surgical-Simulator) — Base model that Cosmos-H-Dreams is fine-tuned from (offline inference and fine-tuning)
+- [Cosmos-H-Surgical-Simulator](https://github.com/isaac-for-healthcare/Cosmos-H-Surgical-Simulator) — Base model that Cosmos-H-Dreams is fine-tuned from (offline inference and fine-tuning)
 - [FlashDreams](https://github.com/NVIDIA/flashdreams) — Underlying high-performance inference runtime
 - [Open-H Dataset](https://huggingface.co/datasets/nvidia/Open-H) — Multi-embodiment surgical benchmark used for training
 - [NVIDIA Cosmos Platform](https://www.nvidia.com/en-us/ai/cosmos) — Product website

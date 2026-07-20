@@ -1,7 +1,7 @@
 version = 1
 SPDX-PackageName = "Cosmos-H-Dreams"
-SPDX-PackageSupplier = "NVIDIA Corporation <nvidia-medtech@nvidia.com>"
-SPDX-PackageDownloadLocation = "https://github.com/NVIDIA-Medtech/Cosmos-H-Dreams"
+SPDX-PackageSupplier = "NVIDIA Corporation <isaac-for-healthcare@nvidia.com>"
+SPDX-PackageDownloadLocation = "https://github.com/isaac-for-healthcare/Cosmos-H-Dreams"
 
 # Files in this repository that do not (or cannot reasonably) carry a per-file
 # SPDX header are licensed via this manifest, per REUSE 3.3.

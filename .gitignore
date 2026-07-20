@@ -144,3 +144,4 @@ sf_inference_data/
 outputs_interactive/
 plans/
 *.jsonl
+scripts/

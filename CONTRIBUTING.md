@@ -2,7 +2,7 @@
 
 Thanks for your interest in contributing to **Cosmos-H-Dreams**. This project
 is developed openly on GitHub and released under the
-[Apache License 2.0](https://github.com/NVIDIA-Medtech/Cosmos-H-Dreams/blob/main/LICENSE). Outside contributions — bug reports,
+[Apache License 2.0](https://github.com/isaac-for-healthcare/Cosmos-H-Dreams/blob/main/LICENSE). Outside contributions — bug reports,
 feature requests, performance improvements, new model integrations,
 documentation fixes — are genuinely welcome, and this guide explains how
 they fit in alongside the project's day-to-day work.
@@ -51,7 +51,7 @@ overhead" to "high overhead":
 
 Cosmos-H-Dreams was developed inside NVIDIA Medtech, and at the time of
 release NVIDIA holds the maintainer and admin roles on the
-[`NVIDIA-Medtech/Cosmos-H-Dreams`](https://github.com/NVIDIA-Medtech/Cosmos-H-Dreams) repository.
+[`isaac-for-healthcare/Cosmos-H-Dreams`](https://github.com/isaac-for-healthcare/Cosmos-H-Dreams) repository.
 That includes the `main` branch protections, release tags, the package
 publishing keys, and the right to merge.
 
@@ -67,7 +67,7 @@ develops. Concretely, that means:
   employee or not.
 - **Decisions happen in public.** Significant design changes are
   discussed in GitHub issues, pull requests, or
-  [Discussions](https://github.com/NVIDIA-Medtech/Cosmos-H-Dreams/discussions).
+  [Discussions](https://github.com/isaac-for-healthcare/Cosmos-H-Dreams/discussions).
   Internal NVIDIA roadmap planning that touches the public project will
   surface as a public issue before it lands.
 - **Release notes credit external contributors** by name and PR.
@@ -85,7 +85,7 @@ not.
 **This project will only accept contributions under the Apache-2.0
 license.** By submitting a pull request you agree that your
 contribution is licensed under the Apache License, Version 2.0 (see
-[LICENSE](https://github.com/NVIDIA-Medtech/Cosmos-H-Dreams/blob/main/LICENSE)).
+[LICENSE](https://github.com/isaac-for-healthcare/Cosmos-H-Dreams/blob/main/LICENSE)).
 
 All contributions to Cosmos-H-Dreams are made under the
 [Developer Certificate of Origin](https://developercertificate.org/).
@@ -315,7 +315,7 @@ the declared minimums. This means:
   not continuously validate this in CI.
 - If you encounter breakage with a version that satisfies the declared
   bounds but differs from the lock file, please
-  [open an issue](https://github.com/NVIDIA-Medtech/Cosmos-H-Dreams/issues). We will
+  [open an issue](https://github.com/isaac-for-healthcare/Cosmos-H-Dreams/issues). We will
   either fix compatibility or bump the bound in `pyproject.toml`.
 
 ## Working with a single workspace package
@@ -347,7 +347,7 @@ the area you're working on.
 
 By submitting a pull request to this repository, you agree that your
 contribution is licensed under the
-[Apache License, Version 2.0](https://github.com/NVIDIA-Medtech/Cosmos-H-Dreams/blob/main/LICENSE), the same license under which
+[Apache License, Version 2.0](https://github.com/isaac-for-healthcare/Cosmos-H-Dreams/blob/main/LICENSE), the same license under which
 Cosmos-H-Dreams is distributed. The DCO sign-off described above is your
 attestation that you have the right to make that grant.
 
@@ -357,8 +357,8 @@ contributed only if:
 
 1. its license is compatible with Apache-2.0;
 2. its origin and license are clearly recorded in
-   [`REUSE.toml`](https://github.com/NVIDIA-Medtech/Cosmos-H-Dreams/blob/main/REUSE.toml) and
-   [`THIRD-PARTY-NOTICES`](https://github.com/NVIDIA-Medtech/Cosmos-H-Dreams/blob/main/THIRD-PARTY-NOTICES);
+   [`REUSE.toml`](https://github.com/isaac-for-healthcare/Cosmos-H-Dreams/blob/main/REUSE.toml) and
+   [`THIRD-PARTY-NOTICES`](https://github.com/isaac-for-healthcare/Cosmos-H-Dreams/blob/main/THIRD-PARTY-NOTICES);
 3. its files retain whatever attribution headers the upstream license
    requires.
 
@@ -368,18 +368,18 @@ upfront.
 
 ## Reporting issues
 
-Use [GitHub Issues](https://github.com/NVIDIA-Medtech/Cosmos-H-Dreams/issues) to report
+Use [GitHub Issues](https://github.com/isaac-for-healthcare/Cosmos-H-Dreams/issues) to report
 functional defects and to request improvements. Please do not include
 confidential or customer information.
 
 Do not file security vulnerabilities as public issues. Follow the coordinated
 disclosure process in
-[SECURITY.md](https://github.com/NVIDIA-Medtech/Cosmos-H-Dreams/blob/main/SECURITY.md).
+[SECURITY.md](https://github.com/isaac-for-healthcare/Cosmos-H-Dreams/blob/main/SECURITY.md).
 
 ## Code of Conduct
 
 This project follows the
-[Code of Conduct](https://github.com/NVIDIA-Medtech/Cosmos-H-Dreams/blob/main/CODE_OF_CONDUCT.md).
+[Code of Conduct](https://github.com/isaac-for-healthcare/Cosmos-H-Dreams/blob/main/CODE_OF_CONDUCT.md).
 By participating in this project — including issues, discussions, and
 pull requests — you agree to abide by it. Please report concerns to the
 maintainers via the address listed in the Code of Conduct.
