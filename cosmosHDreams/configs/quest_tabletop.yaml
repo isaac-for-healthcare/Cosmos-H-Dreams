@@ -23,20 +23,10 @@ runtime:
 # action stats, and CR1 embeddings change at switch time. First scene below
 # is the one the runtime boots into.
 scenes:
-  - name: suturebot_001867
-    input_path: sf_inference_data/260206/suturebot_inference_data/episode_001867.mp4
-    stats_path: sf_inference_data/260206/stats_cosmos.json
-    cr1_embeddings_path: sf_inference_data/cr1_empty_string_text_embeddings.pt
-    start_frame_idx: 0
-  - name: suturebot_001866
-    input_path: sf_inference_data/260206/suturebot_inference_data/episode_001866.mp4
-    stats_path: sf_inference_data/260206/stats_cosmos.json
-    cr1_embeddings_path: sf_inference_data/cr1_empty_string_text_embeddings.pt
-    start_frame_idx: 0
-  - name: suturebot_001868
-    input_path: sf_inference_data/260206/suturebot_inference_data/episode_001868.mp4
-    stats_path: sf_inference_data/260206/stats_cosmos.json
-    cr1_embeddings_path: sf_inference_data/cr1_empty_string_text_embeddings.pt
+  - name: knot_tying
+    input_path: assets/example_data/offline/knot_tying.mp4
+    stats_path: assets/example_data/offline/stats_tabletop.json
+    cr1_embeddings_path: checkpoints/cr1_empty_string_text_embeddings.pt
     start_frame_idx: 0
 
 vr:

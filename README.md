@@ -60,7 +60,6 @@ docker build -t cosmos-h-dreams:latest docker/
 Place the following assets under the repo root before launching:
 
 - `checkpoints/` — CosmosH `.pt` checkpoint(s)
-- `sf_inference_data/` — input manifests, action `.npy` files, and the precomputed CR1 text embeddings `.pt`
 
 ```bash
 docker run --rm -it \
