@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/Code-Apache_2.0-blue.svg)](LICENSE)
 [![Weights](https://img.shields.io/badge/Weights-NVIDIA_Open_Model-green.svg)](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license)
-[![HuggingFace](https://img.shields.io/badge/%F0%9F%A4%97-Hugging%20Face-yellow)](TODO)
+[![HuggingFace](https://img.shields.io/badge/%F0%9F%A4%97-Hugging%20Face-yellow)](https://huggingface.co/nvidia/Cosmos-H-Dreams)
 [![Paper](https://img.shields.io/badge/arXiv-TODO-red.svg)](TODO)
 [![Python](https://img.shields.io/badge/Python-3.12+-blue.svg)](https://python.org)
 
@@ -82,7 +82,7 @@ uv sync --extra dev --extra runners --group lint
 ```bash
 uv run flashdreams-run cosmosHDreams-chunk3-vae-vae \
   --input-json assets/example_data/offline/suturebot_inference_manifest.json \
-  --cr1-embeddings-path sf_inference_data/cr1_empty_string_text_embeddings.pt \
+  --cr1-embeddings-path checkpoints/cr1_empty_string_text_embeddings.pt \
   --root-dir . \
   --total-blocks 20 \
   --save-comparison True \
@@ -134,6 +134,28 @@ Serves `/keyboard`, `/quest`, `/viewer`, and `/` on a single HTTPS port (default
 
 > **Note — first-input latency.** In interactive mode the DiT is compiled with `torch.compile` on the first forward pass triggered by user input. Expect the first generation to take significantly longer than steady-state; subsequent generations run at normal speed.
 
+## How to create your own Surgical Dreams model
+
+Two paths are supported depending on your starting point.
+
+### Path A — Extend Cosmos-H (recommended)
+
+Start from the Cosmos-H lineage, which already understands instrument kinematics and tissue dynamics from multi-embodiment surgical training.
+
+1. **Collect embodiment data.** Record paired videos and instrument action vectors from your robot or procedure. The [Open-H Dataset](https://huggingface.co/datasets/nvidia/PhysicalAI-Robotics-Open-H-Embodiment) shows the expected format.
+2. **Fine-tune.** Fine-tune [Cosmos-H-Surgical-Simulator](https://github.com/isaac-for-healthcare/Cosmos-H-Surgical-Simulator) on your data following its training guide.
+3. **Distill.** Distill the fine-tuned checkpoint to a 2- or 4-step diffusion schedule for real-time throughput. See the [distillation guide](https://github.com/NVIDIA-Medtech/Cosmos-H-Surgical-Simulator/blob/main/docs/tutorial_teacher_training_and_self_forcing.md).
+4. **Deploy.** Pass your distilled checkpoint via `--pipeline.diffusion-model.transformer.checkpoint-path` to any Cosmos-H-Dreams slug or create a new config for it under [configs](cosmosHDreams/configs/).
+
+### Path B — Bring your own model
+
+Use this path if you are starting from a different video diffusion architecture or a model trained on a proprietary surgical corpus.
+
+1. **Fine-tune on your embodiment.** Train or fine-tune your video generative model on paired video and action data from your target robot and procedure.
+2. **Distill to few-step diffusion.** Reduce the sampling steps to 2–4 using consistency distillation or flow-matching distillation to meet real-time latency targets. See the [distillation guide](https://github.com/NVIDIA-Medtech/Cosmos-H-Surgical-Simulator/blob/main/docs/tutorial_teacher_training_and_self_forcing.md).
+3. **Integrate with FlashDreams.** Register your model as a [FlashDreams](https://github.com/NVIDIA/flashdreams/tree/main) runner. FlashDreams provides AR-cache management, `torch.compile`/CUDA-graph wrapping, and fast VAE/TAEHV decode. We recommend reading the [FlashDreams documentation](https://flashdreams.org/main/documentation.html) before starting this process.
+4. **Serve.** Once registered, your model runs under the same WebRTC serving layer and is controllable from the same keyboard and Meta Quest clients.
+
 ## Documentation
 
 
@@ -163,10 +185,10 @@ Serves `/keyboard`, `/quest`, `/viewer`, and `/` on a single HTTPS port (default
 ## Resources
 
 - [Paper](TODO) — Cosmos-H-Dreams technical report
-- [HuggingFace](TODO) — Model weights and checkpoints
+- [HuggingFace](https://huggingface.co/nvidia/Cosmos-H-Dreams) — Model weights and checkpoints
 - [Cosmos-H-Surgical-Simulator](https://github.com/isaac-for-healthcare/Cosmos-H-Surgical-Simulator) — Base model that Cosmos-H-Dreams is fine-tuned from (offline inference and fine-tuning)
 - [FlashDreams](https://github.com/NVIDIA/flashdreams) — Underlying high-performance inference runtime
-- [Open-H Dataset](https://huggingface.co/datasets/nvidia/Open-H) — Multi-embodiment surgical benchmark used for training
+- [Open-H Dataset](https://huggingface.co/datasets/nvidia/PhysicalAI-Robotics-Open-H-Embodiment) — Multi-embodiment surgical benchmark used for training
 - [NVIDIA Cosmos Platform](https://www.nvidia.com/en-us/ai/cosmos) — Product website
 
 ## Known Issues

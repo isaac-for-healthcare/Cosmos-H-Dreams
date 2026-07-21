@@ -358,9 +358,16 @@ class CosmoshRunner(Runner[CosmoshRunnerConfig, CosmoshPipeline]):
         annotated = _annotate_frame_numbers(video_uint8)
         mediapy.write_video(save_fp + "_annotated.mp4", annotated, fps=cfg.fps)
 
-        # [T, 3, H, W] float in [-1, 1] (CTHW after the transpose below).
-        full_float = full_video[0].permute(1, 0, 2, 3).detach().float().cpu().numpy()
-        np.save(save_fp + ".npy", full_float)
+        # Save as uint8 (T, H, W, 3)
+        full_thwc = full_video[0].permute(0, 2, 3, 1)
+        full_uint8 = (
+            ((full_thwc + 1.0) / 2.0 * 255.0)
+            .clamp(0, 255)
+            .to(torch.uint8)
+            .cpu()
+            .numpy()
+        )
+        np.save(save_fp + ".npy", full_uint8)
 
         if cfg.save_comparison:
             try:

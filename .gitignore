@@ -145,3 +145,4 @@ outputs_interactive/
 plans/
 *.jsonl
 scripts/
+experiments/
