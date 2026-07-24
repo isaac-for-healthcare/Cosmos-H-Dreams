@@ -87,7 +87,7 @@ _FLOWMATCH_SHIFT = 5.0
 
 # Canonical CosmosH 4-step student schedule (with ``shift=5`` the warped sigmas
 # are ``[1.0, 0.9375, 0.833, 0.625]`` — the distribution the net was trained on).
-_DENOISING_4STEP = [1000, 750, 500, 250]
+_DENOISING_4STEP = [1000, 937, 833, 625]
 # 2-step student schedule (alpadreams-style ``[1000, 450]``).
 _DENOISING_2STEP = [1000, 450]
 
@@ -169,6 +169,7 @@ _BASE_VAE_VAE = CosmoshPipelineConfig(
     ),
 )
 
+
 def _teahv_decoder() -> TeahvVAEDecoderConfig:
     """LightTAE drop-in decoder (a fixed sub-config, no knobs)."""
     return TeahvVAEDecoderConfig(
@@ -181,7 +182,9 @@ def _teahv_decoder() -> TeahvVAEDecoderConfig:
 
 _BASE_VAE_LIGHTTAE = cast(
     CosmoshPipelineConfig,
-    derive_config(_BASE_VAE_VAE, name="cosmosHDreams-vae-lighttae", decoder=_teahv_decoder()),
+    derive_config(
+        _BASE_VAE_VAE, name="cosmosHDreams-vae-lighttae", decoder=_teahv_decoder()
+    ),
 )
 
 _BASE_2STEPS_VAE_VAE = cast(
@@ -240,9 +243,10 @@ _CHUNK_DESCRIPTIONS: dict[str, str] = {
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _chunk_slug(base_name: str, len_t: int) -> str:
     """``cosmosHDreams-vae-vae`` + ``len_t=2`` -> ``cosmosHDreams-chunk2-vae-vae``."""
-    rest = base_name[len("cosmosHDreams-"):]
+    rest = base_name[len("cosmosHDreams-") :]
     return f"cosmosHDreams-chunk{len_t}-{rest}"
 
 
@@ -252,7 +256,7 @@ def _4step_slug(name: str) -> str:
     ``cosmosHDreams-chunk3-vae-vae`` -> ``cosmosHDreams-chunk3-4steps-vae-vae``
     """
     prefix = "cosmosHDreams-"
-    rest = name[len(prefix):]
+    rest = name[len(prefix) :]
     if rest.startswith("chunk"):
         chunk_end = rest.index("-") + 1  # length of "chunk3-"
         return f"{prefix}{rest[:chunk_end]}4steps-{rest[chunk_end:]}"
@@ -285,18 +289,19 @@ def _chunk_variant(base: CosmoshPipelineConfig, len_t: int) -> CosmoshPipelineCo
 _CHUNK_LEN_TS: tuple[int, ...] = (2, 3)
 
 _CHUNK_CONFIGS: tuple[CosmoshPipelineConfig, ...] = tuple(
-    _chunk_variant(base, len_t)
-    for base in _DERIVATION_BASES
-    for len_t in _CHUNK_LEN_TS
+    _chunk_variant(base, len_t) for base in _DERIVATION_BASES for len_t in _CHUNK_LEN_TS
 )
 
-COSMOSH_CONFIGS: dict[str, CosmoshPipelineConfig] = {cfg.name: cfg for cfg in _CHUNK_CONFIGS}
+COSMOSH_CONFIGS: dict[str, CosmoshPipelineConfig] = {
+    cfg.name: cfg for cfg in _CHUNK_CONFIGS
+}
 """All registered CosmosH pipeline configs, keyed by ``name``."""
 
 
 # ---------------------------------------------------------------------------
 # Runner registration
 # ---------------------------------------------------------------------------
+
 
 def _runner_for(cfg: CosmoshPipelineConfig, description: str) -> CosmoshRunnerConfig:
     return CosmoshRunnerConfig(
@@ -325,7 +330,8 @@ def _build_cosmosHDreams_runners() -> dict[str, RunnerConfig]:
             original = cast(CosmoshRunnerConfig, runners[slug])
             runners[alias] = CosmoshRunnerConfig(
                 runner_name=alias,
-                description=original.description.rstrip(".") + "; explicit 4-step alias.",
+                description=original.description.rstrip(".")
+                + "; explicit 4-step alias.",
                 pipeline=original.pipeline,
             )
     return runners
@@ -343,26 +349,38 @@ COSMOSHDREAMS_RUNNERS: dict[str, RunnerConfig] = _build_cosmosHDreams_runners()
 
 # chunk2 variants
 RUNNER_COSMOSH_CHUNK2_VAE_VAE = COSMOSHDREAMS_RUNNERS["cosmosHDreams-chunk2-vae-vae"]
-RUNNER_COSMOSH_CHUNK2_VAE_LIGHTTAE = COSMOSHDREAMS_RUNNERS["cosmosHDreams-chunk2-vae-lighttae"]
-RUNNER_COSMOSH_CHUNK2_2STEPS_VAE_VAE = COSMOSHDREAMS_RUNNERS["cosmosHDreams-chunk2-2steps-vae-vae"]
+RUNNER_COSMOSH_CHUNK2_VAE_LIGHTTAE = COSMOSHDREAMS_RUNNERS[
+    "cosmosHDreams-chunk2-vae-lighttae"
+]
+RUNNER_COSMOSH_CHUNK2_2STEPS_VAE_VAE = COSMOSHDREAMS_RUNNERS[
+    "cosmosHDreams-chunk2-2steps-vae-vae"
+]
 RUNNER_COSMOSH_CHUNK2_2STEPS_VAE_LIGHTTAE = COSMOSHDREAMS_RUNNERS[
     "cosmosHDreams-chunk2-2steps-vae-lighttae"
 ]
 
 # chunk3 variants (recommended)
 RUNNER_COSMOSH_CHUNK3_VAE_VAE = COSMOSHDREAMS_RUNNERS["cosmosHDreams-chunk3-vae-vae"]
-RUNNER_COSMOSH_CHUNK3_VAE_LIGHTTAE = COSMOSHDREAMS_RUNNERS["cosmosHDreams-chunk3-vae-lighttae"]
-RUNNER_COSMOSH_CHUNK3_2STEPS_VAE_VAE = COSMOSHDREAMS_RUNNERS["cosmosHDreams-chunk3-2steps-vae-vae"]
+RUNNER_COSMOSH_CHUNK3_VAE_LIGHTTAE = COSMOSHDREAMS_RUNNERS[
+    "cosmosHDreams-chunk3-vae-lighttae"
+]
+RUNNER_COSMOSH_CHUNK3_2STEPS_VAE_VAE = COSMOSHDREAMS_RUNNERS[
+    "cosmosHDreams-chunk3-2steps-vae-vae"
+]
 RUNNER_COSMOSH_CHUNK3_2STEPS_VAE_LIGHTTAE = COSMOSHDREAMS_RUNNERS[
     "cosmosHDreams-chunk3-2steps-vae-lighttae"
 ]
 
 # Explicit 4-step aliases
-RUNNER_COSMOSH_CHUNK2_4STEPS_VAE_VAE = COSMOSHDREAMS_RUNNERS["cosmosHDreams-chunk2-4steps-vae-vae"]
+RUNNER_COSMOSH_CHUNK2_4STEPS_VAE_VAE = COSMOSHDREAMS_RUNNERS[
+    "cosmosHDreams-chunk2-4steps-vae-vae"
+]
 RUNNER_COSMOSH_CHUNK2_4STEPS_VAE_LIGHTTAE = COSMOSHDREAMS_RUNNERS[
     "cosmosHDreams-chunk2-4steps-vae-lighttae"
 ]
-RUNNER_COSMOSH_CHUNK3_4STEPS_VAE_VAE = COSMOSHDREAMS_RUNNERS["cosmosHDreams-chunk3-4steps-vae-vae"]
+RUNNER_COSMOSH_CHUNK3_4STEPS_VAE_VAE = COSMOSHDREAMS_RUNNERS[
+    "cosmosHDreams-chunk3-4steps-vae-vae"
+]
 RUNNER_COSMOSH_CHUNK3_4STEPS_VAE_LIGHTTAE = COSMOSHDREAMS_RUNNERS[
     "cosmosHDreams-chunk3-4steps-vae-lighttae"
 ]
