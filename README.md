@@ -57,7 +57,7 @@ docker build -t cosmos-h-dreams:latest docker/
 
 ### 2. Start the container
 
-Place the following assets under the repo root before launching:
+Download the checkpoints from [Cosmos-H-Dreams model repo](https://huggingface.co/nvidia/Cosmos-H-Dreams) in HF, then place them under the repo root before launching:
 
 - `checkpoints/` — CosmosH `.pt` checkpoint(s)
 
@@ -185,7 +185,7 @@ Use this path if you are starting from a different video diffusion architecture 
 ## Resources
 
 - [Paper](TODO) — Cosmos-H-Dreams technical report
-- [HuggingFace](https://huggingface.co/nvidia/Cosmos-H-Dreams) — Model weights and checkpoints
+- [Cosmos-H-Dreams HF](https://huggingface.co/nvidia/Cosmos-H-Dreams) — Model weights and checkpoints
 - [Cosmos-H-Surgical-Simulator](https://github.com/isaac-for-healthcare/Cosmos-H-Surgical-Simulator) — Base model that Cosmos-H-Dreams is fine-tuned from (offline inference and fine-tuning)
 - [FlashDreams](https://github.com/NVIDIA/flashdreams) — Underlying high-performance inference runtime
 - [Open-H Dataset](https://huggingface.co/datasets/nvidia/PhysicalAI-Robotics-Open-H-Embodiment) — Multi-embodiment surgical benchmark used for training

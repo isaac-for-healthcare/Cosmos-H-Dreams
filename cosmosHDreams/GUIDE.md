@@ -54,12 +54,9 @@ docker build -t cosmos-h-dreams:latest docker/
 
 ## 2. Start the container
 
-Before launching, drop the assets you'll need inside the repo so they
-are reachable from inside the container via the single bind mount:
+Download the checkpoints from [Cosmos-H-Dreams model repo](https://huggingface.co/nvidia/Cosmos-H-Dreams) in HF, then place them under the repo root before launching:
 
 - `checkpoints/` — the CosmosH `.pt` checkpoint(s)
-- `sf_inference_data/` — your input-video manifest, action `.npy`s,
-  and the precomputed CR1 text embedding
 
 (The exact names aren't enforced — keep them anywhere under the repo
 root; the CLI paths below assume these.)
@@ -159,7 +156,7 @@ checkpoint to a domain-specific one:
 ```bash
 uv run flashdreams-run cosmosHDreams-chunk3-vae-vae \
   --input-json assets/example_data/offline/suturebot_inference_manifest.json \
-  --cr1-embeddings-path sf_inference_data/cr1_empty_string_text_embeddings.pt \
+  --cr1-embeddings-path checkpoints/cr1_empty_string_text_embeddings.pt \
   --root-dir . \
   --total-blocks 20 \
   --save-comparison True \
