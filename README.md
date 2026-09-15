@@ -3,7 +3,7 @@
 [![License](https://img.shields.io/badge/Code-Apache_2.0-blue.svg)](LICENSE)
 [![Weights](https://img.shields.io/badge/Weights-NVIDIA_Open_Model-green.svg)](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license)
 [![HuggingFace](https://img.shields.io/badge/%F0%9F%A4%97-Hugging%20Face-yellow)](https://huggingface.co/nvidia/Cosmos-H-Dreams)
-[![Paper](https://img.shields.io/badge/arXiv-TODO-red.svg)](TODO)
+[![Paper](https://img.shields.io/badge/arXiv-2608.24199-red.svg)](https://arxiv.org/abs/2608.24199)
 [![Python](https://img.shields.io/badge/Python-3.12+-blue.svg)](https://python.org)
 
 Real-time action-conditioned surgical video simulation via WebRTC, built on [FlashDreams](https://github.com/NVIDIA/flashdreams).
@@ -184,7 +184,7 @@ Use this path if you are starting from a different video diffusion architecture 
 
 ## Resources
 
-- [Paper](TODO) — Cosmos-H-Dreams technical report
+- [Paper](https://arxiv.org/abs/2608.24199) — Cosmos-H-Dreams technical report
 - [Cosmos-H-Dreams HF](https://huggingface.co/nvidia/Cosmos-H-Dreams) — Model weights and checkpoints
 - [Cosmos-H-Surgical-Simulator](https://github.com/isaac-for-healthcare/Cosmos-H-Surgical-Simulator) — Base model that Cosmos-H-Dreams is fine-tuned from (offline inference and fine-tuning)
 - [FlashDreams](https://github.com/NVIDIA/flashdreams) — Underlying high-performance inference runtime
