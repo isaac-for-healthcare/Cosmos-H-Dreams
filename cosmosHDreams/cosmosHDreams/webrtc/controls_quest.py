@@ -19,8 +19,7 @@ Each arm carries:
 
 Right controller drives PSM1 (right arm in camera frame, dims 0..9); left
 controller drives PSM2 (left arm in camera frame, dims 10..19). Other
-buttons (A/B/grip/thumbstick) are intentionally not wired — see
-QUEST_PLAN.md.
+buttons (A/grip/thumbstick) are intentionally not wired.
 
 Both grippers rest at their ``OPEN`` endpoint (right) / PSM2_GRIPPER_OPEN
 (left): the wider dynamic range gives the model something visible to push
@@ -243,7 +242,10 @@ def _write_arm(
     scaled_dpos = arm.dpos * translate_scale
     v_xyz = _quest_to_camera_axes(scaled_dpos).astype(np.float64)
     write_translate_ramp(
-        chunk, num_frames=num_frames, v_xyz=v_xyz, slice_start=translate_slice_start,
+        chunk,
+        num_frames=num_frames,
+        v_xyz=v_xyz,
+        slice_start=translate_slice_start,
         start_pos=start_pos.copy(),
     )
     start_pos[:] += num_frames * v_xyz

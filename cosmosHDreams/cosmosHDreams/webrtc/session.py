@@ -72,6 +72,7 @@ def _nal_frame_has_sps(nf: NalFrame) -> bool:
             return True
     return False
 
+
 # ---------------------------------------------------------------------------
 # E2E frame-rate profiling
 # ---------------------------------------------------------------------------
@@ -81,11 +82,21 @@ _PROFILE_LATENCY_ENV = "COSMOSH_PROFILE_LATENCY"
 
 
 def _fps_profile_enabled() -> bool:
-    return os.environ.get(_PROFILE_FPS_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+    return os.environ.get(_PROFILE_FPS_ENV, "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 def _latency_profile_enabled() -> bool:
-    return os.environ.get(_PROFILE_LATENCY_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+    return os.environ.get(_PROFILE_LATENCY_ENV, "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 def _fps_profile_interval_s() -> float:
@@ -141,6 +152,7 @@ def _fps_reset_profile(profile: _ChunkFpsProfile) -> None:
 # Per-session latency logger
 # ---------------------------------------------------------------------------
 
+
 class _LatencyLogger:
     """Per-session latency accumulator and JSONL file writer."""
 
@@ -158,9 +170,21 @@ class _LatencyLogger:
         self._block_records.append(record)
         # Build [PERF] log line with only non-None numeric values
         parts = [f"block={record.get('block', '?')}"]
-        for key in ("encode_ms", "diffuse_ms", "decode_ms", "finalize_ms", "d2h_ms",
-                    "gap_ms", "cast_ms", "recv_wait_ms", "pacing_ms",
-                    "jpeg_encode_ms", "mjpeg_drop_rate", "quest_pacing_ms", "input_age_ms"):
+        for key in (
+            "encode_ms",
+            "diffuse_ms",
+            "decode_ms",
+            "finalize_ms",
+            "d2h_ms",
+            "gap_ms",
+            "cast_ms",
+            "recv_wait_ms",
+            "pacing_ms",
+            "jpeg_encode_ms",
+            "mjpeg_drop_rate",
+            "quest_pacing_ms",
+            "input_age_ms",
+        ):
             val = record.get(key)
             if val is not None:
                 parts.append(f"{key}={val:.2f}")
@@ -178,12 +202,20 @@ class _LatencyLogger:
                     sums[key] = sums.get(key, 0.0) + val
                     counts[key] = counts.get(key, 0) + 1
         avgs = {k: sums[k] / counts[k] for k in sums}
-        summary = {"type": "rollout_summary", "mode": self._mode,
-                   "num_blocks": len(self._block_records), **avgs}
+        summary = {
+            "type": "rollout_summary",
+            "mode": self._mode,
+            "num_blocks": len(self._block_records),
+            **avgs,
+        }
         self._file.write(json.dumps(summary) + "\n")
         self._file.flush()
         avg_parts = [f"{k}={v:.2f}" for k, v in avgs.items() if k != "mode"]
-        LOGGER.info("[PERF] rollout_summary blocks=%d %s", len(self._block_records), " ".join(avg_parts))
+        LOGGER.info(
+            "[PERF] rollout_summary blocks=%d %s",
+            len(self._block_records),
+            " ".join(avg_parts),
+        )
         self._block_records.clear()
 
     def close(self) -> None:
@@ -325,7 +357,9 @@ class CosmoshStepResult:
     num_frames: int
     video_chunk: torch.Tensor | None = None
     is_nvenc_published: bool = False
-    timing: dict[str, float] | None = None  # per-block profiler stats; None when profiling is off
+    timing: dict[str, float] | None = (
+        None  # per-block profiler stats; None when profiling is off
+    )
 
 
 # Gripper dims within the shared 20-dim prefix (arm-A at 9, arm-B at 19).
@@ -363,8 +397,7 @@ def _gripper_endpoints_from_stats(
     hi = action.get("q99") or action.get("max")
     if lo is None or hi is None:
         LOGGER.warning(
-            "stats file %s lacks q01/q99/min/max; using default gripper "
-            "endpoints.",
+            "stats file %s lacks q01/q99/min/max; using default gripper " "endpoints.",
             stats_path,
         )
         return {
@@ -594,10 +627,16 @@ class CosmoshInferenceRuntime:
         if self._psm2_rot6d_mean is not None and self._psm2_rot6d_std is not None:
             kwargs["psm2_rot6d_mean"] = self._psm2_rot6d_mean
             kwargs["psm2_rot6d_std"] = self._psm2_rot6d_std
-        if self._psm1_gripper_open is not None and self._psm1_gripper_closed is not None:
+        if (
+            self._psm1_gripper_open is not None
+            and self._psm1_gripper_closed is not None
+        ):
             kwargs["gripper_open_psm1"] = self._psm1_gripper_open
             kwargs["gripper_closed_psm1"] = self._psm1_gripper_closed
-        if self._psm2_gripper_open is not None and self._psm2_gripper_closed is not None:
+        if (
+            self._psm2_gripper_open is not None
+            and self._psm2_gripper_closed is not None
+        ):
             kwargs["gripper_open_psm2"] = self._psm2_gripper_open
             kwargs["gripper_closed_psm2"] = self._psm2_gripper_closed
         return CosmoshActionIntegrator(**kwargs)
@@ -684,9 +723,7 @@ class CosmoshInferenceRuntime:
 
         # ``_initial_cond_pixels`` is ``[1, 1, 3, H, W]``; permute to
         # ``[1, 3, 1, H, W]`` to match the per-block video-chunk layout.
-        initial_b3thw = (
-            self._initial_cond_pixels.permute(0, 2, 1, 3, 4).contiguous()
-        )
+        initial_b3thw = self._initial_cond_pixels.permute(0, 2, 1, 3, 4).contiguous()
         # Always produce the CPU tensor — the unified server's Quest
         # manager consumes it directly for its MJPEG sink even when
         # the keyboard manager is using the NVENC path.
@@ -804,7 +841,9 @@ class CosmoshInferenceRuntime:
         """
         if self._closed:
             return False
-        return self.vr_state.apply_vr_input(payload, recv_t_ms=time.perf_counter() * 1000.0)
+        return self.vr_state.apply_vr_input(
+            payload, recv_t_ms=time.perf_counter() * 1000.0
+        )
 
     async def generate_one_chunk_vr(
         self,
@@ -877,7 +916,10 @@ class CosmoshInferenceRuntime:
         assert self._debug_actions is not None, "debug action stream not loaded"
 
         consumed = self._count_consumed_actions()
-        if consumed == 0 or self._debug_cursor + consumed > self._debug_actions.shape[0]:
+        if (
+            consumed == 0
+            or self._debug_cursor + consumed > self._debug_actions.shape[0]
+        ):
             return None  # stream exhausted
 
         driven = self._debug_actions[self._debug_cursor : self._debug_cursor + consumed]
@@ -894,9 +936,7 @@ class CosmoshInferenceRuntime:
                 "CosmoshRuntimeConfig.cr1_embeddings_path must be set."
             )
         if not self.config.input_path:
-            raise CosmoshRuntimeError(
-                "CosmoshRuntimeConfig.input_path must be set."
-            )
+            raise CosmoshRuntimeError("CosmoshRuntimeConfig.input_path must be set.")
         if not self.config.stats_path:
             raise CosmoshRuntimeError(
                 "CosmoshRuntimeConfig.stats_path must be set "
@@ -907,9 +947,7 @@ class CosmoshInferenceRuntime:
                 f"CR1 embeddings not found: {self.config.cr1_embeddings_path}"
             )
         if not Path(self.config.input_path).exists():
-            raise FileNotFoundError(
-                f"Input not found: {self.config.input_path}"
-            )
+            raise FileNotFoundError(f"Input not found: {self.config.input_path}")
         if not Path(self.config.stats_path).exists():
             raise FileNotFoundError(
                 f"Action stats file not found: {self.config.stats_path}"
@@ -1019,7 +1057,10 @@ class CosmoshInferenceRuntime:
                     f"debug_action_npy not found: {self.config.debug_action_npy}"
                 )
             debug_actions = np.load(self.config.debug_action_npy)
-            if debug_actions.ndim != 2 or debug_actions.shape[1] < ACTION_DIM_NORMALISED:
+            if (
+                debug_actions.ndim != 2
+                or debug_actions.shape[1] < ACTION_DIM_NORMALISED
+            ):
                 raise CosmoshRuntimeError(
                     "debug_action_npy must be [T, >="
                     f"{ACTION_DIM_NORMALISED}]; got shape {debug_actions.shape}."
@@ -1170,9 +1211,7 @@ class CosmoshInferenceRuntime:
         )
 
         text_embeddings_cpu = load_cr1_text_embeddings(scene.cr1_embeddings_path)
-        text_embeddings = text_embeddings_cpu.to(
-            device=self._device, dtype=self._dtype
-        )
+        text_embeddings = text_embeddings_cpu.to(device=self._device, dtype=self._dtype)
 
         stats = _load_action_stats(scene.stats_path)
 
@@ -1263,7 +1302,10 @@ class CosmoshInferenceRuntime:
         rows the pipeline will read.  Rows beyond ``consumed`` are zero-padded
         (they are never accessed by the pipeline).
         """
-        if consumed == self.actions_per_chunk and driven.shape[0] == self.actions_per_chunk:
+        if (
+            consumed == self.actions_per_chunk
+            and driven.shape[0] == self.actions_per_chunk
+        ):
             return driven
         block = np.zeros((self.actions_per_chunk, driven.shape[1]), dtype=np.float32)
         block[:consumed] = driven
@@ -1323,9 +1365,8 @@ class CosmoshInferenceRuntime:
         Snapshots the current :class:`VRControllerState` (latest-sample-wins
         at chunk boundary) and routes through
         :func:`cosmosHDreams.webrtc.controls_quest.compute_action_chunk`, which
-        writes PSM1 translate (xyz), PSM1 rotation (rot6d) and PSM1
-        gripper. PSM2 slices stay at zero. GPU body is shared with the
-        keyboard path via :meth:`_render_chunk_from_actions`.
+        writes PSM1/2 translate (xyz), PSM1/2 rotation (rot6d) and PSM1/2
+        gripper. GPU body is shared with the keyboard path via :meth:`_render_chunk_from_actions`.
 
         PSM1 rot6d stats live on the keyboard integrator (loaded from
         ``stats_cosmos.json`` at init); we reuse them rather than threading
@@ -1383,7 +1424,9 @@ class CosmoshInferenceRuntime:
             caller_needs_cpu_chunk=caller_needs_cpu_chunk,
             caller_needs_nvenc_output=caller_needs_nvenc_output,
         )
-        if result.timing is not None and self.vr_state.t_ms > 0:  # t_ms is 0.0 until the first vr_input arrives
+        if (
+            result.timing is not None and self.vr_state.t_ms > 0
+        ):  # t_ms is 0.0 until the first vr_input arrives
             result.timing["input_age_ms"] = t_chunk_start_ms - self.vr_state.t_ms
         return result
 
@@ -1432,7 +1475,11 @@ class CosmoshInferenceRuntime:
             # The pipeline owns the VAE first-frame encoder + decoder:
             # ``initialize_cache`` encodes the conditional first frame internally
             # and seeds the KV + decoder caches.
-            if _latency_profile_enabled() and self._device is not None and self._device.type == "cuda":
+            if (
+                _latency_profile_enabled()
+                and self._device is not None
+                and self._device.type == "cuda"
+            ):
                 torch.cuda.synchronize(self._device)
             _t0_init = time.perf_counter() if _latency_profile_enabled() else 0.0
             self._cache = self._pipeline.initialize_cache(
@@ -1565,7 +1612,9 @@ class CosmoshInferenceRuntime:
         # frames, and force the next output to be an IDR so the newly-
         # attached browser can start decoding immediately (rather than
         # waiting up to idr_period_s for the next natural IDR).
-        assert isinstance(self._video_encoder, PyNvHardwareEncoder)  # narrow for type checker
+        assert isinstance(
+            self._video_encoder, PyNvHardwareEncoder
+        )  # narrow for type checker
         if not self._last_nvenc_was_active:
             self._video_encoder.reset_session()
             force_idr = True
@@ -1843,9 +1892,9 @@ class CosmoshWebRTCSessionManager:
             enqueued = await video_track.enqueue_markers(num_frames=result.num_frames)
             return enqueued, 0.0
         assert isinstance(video_track, CosmoshVideoTrack)
-        assert result.video_chunk is not None, (
-            "CPU video track expects a non-None video_chunk."
-        )
+        assert (
+            result.video_chunk is not None
+        ), "CPU video track expects a non-None video_chunk."
         return await video_track.enqueue_chunk(result.video_chunk)
 
     def _publish_driver(self, name: str) -> None:
@@ -1942,9 +1991,7 @@ class CosmoshWebRTCSessionManager:
         # no-ops since asyncio.Event stays set once flipped.
         managed_session.first_action_event.set()
 
-    async def _handle_reset(
-        self, *, managed_session: _ManagedCosmoshSession
-    ) -> None:
+    async def _handle_reset(self, *, managed_session: _ManagedCosmoshSession) -> None:
         channel = managed_session.control_channel
         if channel is None or managed_session.closed:
             return
@@ -2027,17 +2074,13 @@ class CosmoshWebRTCSessionManager:
             self._send_json(channel, {"type": "error", "message": str(exc)})
             return
 
-        LOGGER.info(
-            "Scene switched to %r; anchor frame pushed.", scene.name
-        )
+        LOGGER.info("Scene switched to %r; anchor frame pushed.", scene.name)
         self._send_json(
             channel,
             {"type": "scene_set", "name": scene.name},
         )
 
-    async def _render_loop(
-        self, *, managed_session: _ManagedCosmoshSession
-    ) -> None:
+    async def _render_loop(self, *, managed_session: _ManagedCosmoshSession) -> None:
         """Generate chunks while the session is connected.
 
         Pushes the conditional anchor frame to the video track immediately so
@@ -2055,7 +2098,9 @@ class CosmoshWebRTCSessionManager:
         next time the user submits an action.
         """
         channel = managed_session.control_channel
-        latency_logger = _LatencyLogger("keyboard") if _latency_profile_enabled() else None
+        latency_logger = (
+            _LatencyLogger("keyboard") if _latency_profile_enabled() else None
+        )
         _t_prev_block_end: float | None = None
         try:
             try:
@@ -2100,8 +2145,10 @@ class CosmoshWebRTCSessionManager:
                     async with managed_session.render_lock:
                         if managed_session.closed:
                             break
-                        result = await managed_session.runtime.apply_actions_and_generate(
-                            actions
+                        result = (
+                            await managed_session.runtime.apply_actions_and_generate(
+                                actions
+                            )
                         )
                         enqueued, cast_ms = await self._publish_step_to_track(
                             managed_session.video_track, result
@@ -2113,12 +2160,31 @@ class CosmoshWebRTCSessionManager:
 
                 if latency_logger is not None:
                     _t_iter_end = time.perf_counter() * 1000.0
-                    gap_ms = (_t_iter_start - _t_prev_block_end) if _t_prev_block_end is not None else None
-                    record: dict[str, Any] = {"block": result.chunk_index, "gap_ms": gap_ms}
+                    gap_ms = (
+                        (_t_iter_start - _t_prev_block_end)
+                        if _t_prev_block_end is not None
+                        else None
+                    )
+                    record: dict[str, Any] = {
+                        "block": result.chunk_index,
+                        "gap_ms": gap_ms,
+                    }
                     if result.timing:
-                        record.update({k: v for k, v in result.timing.items()
-                                       if k in ("encode_ms", "diffuse_ms", "decode_ms",
-                                                "finalize_ms", "d2h_ms", "input_age_ms")})
+                        record.update(
+                            {
+                                k: v
+                                for k, v in result.timing.items()
+                                if k
+                                in (
+                                    "encode_ms",
+                                    "diffuse_ms",
+                                    "decode_ms",
+                                    "finalize_ms",
+                                    "d2h_ms",
+                                    "input_age_ms",
+                                )
+                            }
+                        )
                     recv_stats = managed_session.video_track.drain_recv_stats()
                     record["cast_ms"] = cast_ms
                     record["recv_wait_ms"] = recv_stats["recv_wait_ms"]
@@ -2126,11 +2192,14 @@ class CosmoshWebRTCSessionManager:
                     latency_logger.log_block(record)
                     _t_prev_block_end = _t_iter_end
                     if channel is not None:
-                        self._send_json(channel, {
-                            "type": "frame_ts",
-                            "chunk_id": result.chunk_index,
-                            "server_ms": time.perf_counter() * 1000.0,
-                        })
+                        self._send_json(
+                            channel,
+                            {
+                                "type": "frame_ts",
+                                "chunk_id": result.chunk_index,
+                                "server_ms": time.perf_counter() * 1000.0,
+                            },
+                        )
 
                 _fps_record_chunk(managed_session.fps_profile, result.num_frames)
 
@@ -2149,8 +2218,7 @@ class CosmoshWebRTCSessionManager:
                     managed_session.first_action_event.clear()
 
                 LOGGER.debug(
-                    "Rendered chunk=%s num_frames=%s enqueued=%s qsize=%s "
-                    "light=%s",
+                    "Rendered chunk=%s num_frames=%s enqueued=%s qsize=%s " "light=%s",
                     result.chunk_index,
                     result.num_frames,
                     enqueued,
@@ -2216,8 +2284,10 @@ class CosmoshWebRTCSessionManager:
                             if result is None:
                                 exhausted = True
                                 break
-                            enqueued, _ = await managed_session.video_track.enqueue_chunk(
-                                result.video_chunk
+                            enqueued, _ = (
+                                await managed_session.video_track.enqueue_chunk(
+                                    result.video_chunk
+                                )
                             )
                     except Exception as exc:
                         LOGGER.exception("Debug render loop chunk failed.")

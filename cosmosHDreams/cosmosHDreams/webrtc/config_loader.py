@@ -58,7 +58,7 @@ Schema (full)::
       rotate_scale: 1.0
       # Browser-side input semantics. Both default to false (absolute
       # play-space input — the historical behaviour). Flip to true to
-      # decouple from the user's body orientation; see QUEST_PLAN.md.
+      # decouple from the user's body orientation.
       body_relative_translate: false
       body_relative_rotation: false
       # In-headset display panel (the floating "monitor"). Defaults
@@ -135,7 +135,9 @@ def load_yaml_config(path: str | Path) -> dict[str, Any]:
     with p.open("r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
     if not isinstance(data, dict):
-        raise ConfigError(f"Top-level YAML must be a mapping; got {type(data).__name__}")
+        raise ConfigError(
+            f"Top-level YAML must be a mapping; got {type(data).__name__}"
+        )
     for key in data.keys():
         if key not in _KNOWN_TOP_LEVEL:
             LOGGER.warning(
@@ -160,9 +162,7 @@ def _parse_translate_scale_vec(value: Any, *, ctx: str) -> tuple[float, float, f
         return (s, s, s)
     if isinstance(value, (list, tuple)) and len(value) == 3:
         return (float(value[0]), float(value[1]), float(value[2]))
-    raise ConfigError(
-        f"{ctx} must be a scalar or 3-element list; got {value!r}"
-    )
+    raise ConfigError(f"{ctx} must be a scalar or 3-element list; got {value!r}")
 
 
 def _parse_translate_scale(value: Any) -> dict[str, tuple[float, float, float]]:
@@ -226,9 +226,7 @@ def _parse_resolution(value: Any) -> tuple[int, int] | None:
             ) from exc
     if isinstance(value, (list, tuple)) and len(value) == 2:
         return (int(value[0]), int(value[1]))
-    raise ConfigError(
-        f"resolution must be [H, W], 'H,W', or null; got {value!r}"
-    )
+    raise ConfigError(f"resolution must be [H, W], 'H,W', or null; got {value!r}")
 
 
 def parse_scenes(cfg: dict[str, Any]) -> list[Scene]:
@@ -251,12 +249,8 @@ def parse_scenes(cfg: dict[str, Any]) -> list[Scene]:
         return [
             Scene(
                 name="default",
-                input_path=str(
-                    _require(runtime, "input_path", section_name="runtime")
-                ),
-                stats_path=str(
-                    _require(runtime, "stats_path", section_name="runtime")
-                ),
+                input_path=str(_require(runtime, "input_path", section_name="runtime")),
+                stats_path=str(_require(runtime, "stats_path", section_name="runtime")),
                 cr1_embeddings_path=str(
                     _require(runtime, "cr1_embeddings_path", section_name="runtime")
                 ),
@@ -472,9 +466,7 @@ def _parse_display_section(value: Any) -> dict[str, float]:
     if value is None:
         return dict(_DISPLAY_DEFAULTS)
     if not isinstance(value, dict):
-        raise ConfigError(
-            f"vr.display must be a mapping; got {type(value).__name__}"
-        )
+        raise ConfigError(f"vr.display must be a mapping; got {type(value).__name__}")
     out: dict[str, float] = dict(_DISPLAY_DEFAULTS)
     for key in ("width_m", "height_m", "distance_m"):
         if key not in value:
@@ -486,9 +478,7 @@ def _parse_display_section(value: Any) -> dict[str, float]:
                 f"vr.display.{key} must be a number; got {value[key]!r}"
             ) from exc
         if v <= 0:
-            raise ConfigError(
-                f"vr.display.{key} must be positive; got {v}"
-            )
+            raise ConfigError(f"vr.display.{key} must be positive; got {v}")
         out[key] = v
     return out
 
@@ -537,9 +527,7 @@ def _validate_nvenc_block(raw: dict[str, Any]) -> dict[str, Any]:
                 f"video.nvenc.bitrate must be an integer; got {raw['bitrate']!r}"
             ) from exc
         if bitrate <= 0:
-            raise ConfigError(
-                f"video.nvenc.bitrate must be > 0; got {bitrate}"
-            )
+            raise ConfigError(f"video.nvenc.bitrate must be > 0; got {bitrate}")
         out["bitrate"] = bitrate
     if "idr_period_s" in raw:
         try:
@@ -550,9 +538,7 @@ def _validate_nvenc_block(raw: dict[str, Any]) -> dict[str, Any]:
                 f"{raw['idr_period_s']!r}"
             ) from exc
         if idr <= 0:
-            raise ConfigError(
-                f"video.nvenc.idr_period_s must be > 0; got {idr}"
-            )
+            raise ConfigError(f"video.nvenc.idr_period_s must be > 0; got {idr}")
         out["idr_period_s"] = idr
     return out
 
