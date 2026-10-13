@@ -12,7 +12,7 @@ Real-time action-conditioned surgical video simulation via WebRTC, built on [Fla
 
 Cosmos-H-Dreams is a fine-tuned variant of Cosmos-H-Surgical-Simulator, with its own checkpoint and a serving layer in a streaming server, enabling live surgical simulation driven by keyboard or Meta Quest controller input. Given a conditional first frame from a surgical procedure and a live stream of instrument action vectors, the model rolls forward in blocks of generated frames and streams the output to a browser or VR headset in real time via WebRTC.
 
-The system is built on top of [FlashDreams](https://github.com/NVIDIA/flashdreams), NVIDIA's high-performance inference and serving library for autoregressive video models. It uses a fine-tuned checkpoint from [Cosmos-H-Surgical-Simulator](https://github.com/isaac-for-healthcare/Cosmos-H-Surgical-Simulator) and supports two modes:
+The system is built on top of [FlashDreams](https://github.com/NVIDIA/flashdreams), NVIDIA's high-performance inference and serving library for autoregressive video models. It uses a fine-tuned checkpoint from [Cosmos-H-Surgical-Simulator](https://github.com/NVIDIA-Medtech/Cosmos-H-Surgical-Simulator) and supports two modes:
 
 - **Offline batch inference** — feed a JSON manifest of `{input_video, input_action, output_video}` entries and produce MP4 + raw tensor outputs.
 - **Interactive WebRTC** — drive the rollout live from a browser (keyboard) or a Meta Quest headset (WebXR), with no action `.npy` needed.
@@ -143,7 +143,7 @@ Two paths are supported depending on your starting point.
 Start from the Cosmos-H lineage, which already understands instrument kinematics and tissue dynamics from multi-embodiment surgical training.
 
 1. **Collect embodiment data.** Record paired videos and instrument action vectors from your robot or procedure. The [Open-H Dataset](https://huggingface.co/datasets/nvidia/PhysicalAI-Robotics-Open-H-Embodiment) shows the expected format.
-2. **Fine-tune.** Fine-tune [Cosmos-H-Surgical-Simulator](https://github.com/isaac-for-healthcare/Cosmos-H-Surgical-Simulator) on your data following its training guide.
+2. **Fine-tune.** Fine-tune [Cosmos-H-Surgical-Simulator](https://github.com/NVIDIA-Medtech/Cosmos-H-Surgical-Simulator) on your data following its training guide.
 3. **Distill.** Distill the fine-tuned checkpoint to a 2- or 4-step diffusion schedule for real-time throughput. See the [distillation guide](https://github.com/NVIDIA-Medtech/Cosmos-H-Surgical-Simulator/blob/main/docs/tutorial_teacher_training_and_self_forcing.md).
 4. **Deploy.** Pass your distilled checkpoint via `--pipeline.diffusion-model.transformer.checkpoint-path` to any Cosmos-H-Dreams slug or create a new config for it under [configs](cosmosHDreams/configs/).
 
@@ -186,7 +186,7 @@ Use this path if you are starting from a different video diffusion architecture 
 
 - [Paper](https://arxiv.org/abs/2608.24199) — Cosmos-H-Dreams technical report
 - [Cosmos-H-Dreams HF](https://huggingface.co/nvidia/Cosmos-H-Dreams) — Model weights and checkpoints
-- [Cosmos-H-Surgical-Simulator](https://github.com/isaac-for-healthcare/Cosmos-H-Surgical-Simulator) — Base model that Cosmos-H-Dreams is fine-tuned from (offline inference and fine-tuning)
+- [Cosmos-H-Surgical-Simulator](https://github.com/NVIDIA-Medtech/Cosmos-H-Surgical-Simulator) — Base model that Cosmos-H-Dreams is fine-tuned from (offline inference and fine-tuning)
 - [FlashDreams](https://github.com/NVIDIA/flashdreams) — Underlying high-performance inference runtime
 - [Open-H Dataset](https://huggingface.co/datasets/nvidia/PhysicalAI-Robotics-Open-H-Embodiment) — Multi-embodiment surgical benchmark used for training
 - [NVIDIA Cosmos Platform](https://www.nvidia.com/en-us/ai/cosmos) — Product website
