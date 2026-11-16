@@ -97,6 +97,17 @@ def resolve_manifest_input_path(entry: dict) -> str:
     return value
 
 
+def resolve_manifest_output_path(output_dir: str | Path, output_video: str) -> str:
+    """Place a manifest ``output_video`` under ``output_dir`` unless it is absolute.
+
+    Relative paths are joined to ``output_dir`` (``--output-dir``); absolute
+    paths are returned unchanged.
+    """
+    if Path(output_video).is_absolute():
+        return output_video
+    return str(Path(output_dir) / output_video)
+
+
 def load_conditional_frame(path: str, start_frame_idx: int) -> np.ndarray:
     """Load the conditional first frame from either a still image or a video.
 

@@ -5,13 +5,18 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from cosmosHDreams.utils import (
     IMAGE_SUFFIXES,
     is_image_path,
     resolve_manifest_input_path,
+    resolve_manifest_output_path,
 )
+
+pytestmark = pytest.mark.ci_cpu
 
 
 def test_is_image_path_recognises_common_suffixes() -> None:
@@ -46,3 +51,25 @@ def test_resolve_manifest_input_path_rejects_multiple_keys() -> None:
         resolve_manifest_input_path(
             {"input": "a.png", "input_video": "b.mp4", "input_action": "a.npy"}
         )
+
+
+def test_resolve_manifest_output_path_anchors_relative_under_output_dir(
+    tmp_path: Path,
+) -> None:
+    out_dir = tmp_path / "out"
+    assert resolve_manifest_output_path(out_dir, "rel/a.mp4") == str(
+        out_dir / "rel" / "a.mp4"
+    )
+
+
+def test_resolve_manifest_output_path_default_output_dir() -> None:
+    # Mode A without --output-dir: the runner default ``outputs`` plus the
+    # shipped manifest's bare file name lands in ./outputs/.
+    assert resolve_manifest_output_path(
+        Path("outputs"), "suturebot_inference_output.mp4"
+    ) == str(Path("outputs") / "suturebot_inference_output.mp4")
+
+
+def test_resolve_manifest_output_path_keeps_absolute_paths(tmp_path: Path) -> None:
+    absolute = str(tmp_path / "abs" / "b.mp4")
+    assert resolve_manifest_output_path(tmp_path / "out", absolute) == absolute
