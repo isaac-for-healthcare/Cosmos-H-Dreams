@@ -2096,8 +2096,11 @@ class CosmoshWebRTCSessionManager:
         action arrives. In ``light_mode`` it additionally idles after each
         chunk if no keys remain held and no events are queued, waking up the
         next time the user submits an action.
+
+        Every send reads ``managed_session.control_channel`` afresh: the loop
+        starts when the peer connection reports ``connected``, before the
+        browser's control DataChannel arrives in ``on_datachannel``.
         """
-        channel = managed_session.control_channel
         latency_logger = (
             _LatencyLogger("keyboard") if _latency_profile_enabled() else None
         )
@@ -2155,7 +2158,10 @@ class CosmoshWebRTCSessionManager:
                         )
                 except Exception as exc:
                     LOGGER.exception("Render loop chunk failed.")
-                    self._send_json(channel, {"type": "error", "message": str(exc)})
+                    self._send_json(
+                        managed_session.control_channel,
+                        {"type": "error", "message": str(exc)},
+                    )
                     break
 
                 if latency_logger is not None:
@@ -2191,15 +2197,14 @@ class CosmoshWebRTCSessionManager:
                     record["pacing_ms"] = recv_stats["pacing_ms"]
                     latency_logger.log_block(record)
                     _t_prev_block_end = _t_iter_end
-                    if channel is not None:
-                        self._send_json(
-                            channel,
-                            {
-                                "type": "frame_ts",
-                                "chunk_id": result.chunk_index,
-                                "server_ms": time.perf_counter() * 1000.0,
-                            },
-                        )
+                    self._send_json(
+                        managed_session.control_channel,
+                        {
+                            "type": "frame_ts",
+                            "chunk_id": result.chunk_index,
+                            "server_ms": time.perf_counter() * 1000.0,
+                        },
+                    )
 
                 _fps_record_chunk(managed_session.fps_profile, result.num_frames)
 
@@ -2226,7 +2231,7 @@ class CosmoshWebRTCSessionManager:
                     managed_session.light_mode,
                 )
                 self._send_json(
-                    channel,
+                    managed_session.control_channel,
                     {
                         "type": "chunk_done",
                         "chunk_index": result.chunk_index,
@@ -2252,8 +2257,9 @@ class CosmoshWebRTCSessionManager:
         exiting; a ``reset`` datachannel message rewinds the action cursor and
         re-arms the event (see :meth:`_handle_reset`), replaying from the top.
         The loop is armed immediately so the first play-through needs no reset.
+        Sends read ``managed_session.control_channel`` afresh, as in
+        :meth:`_render_loop`.
         """
-        channel = managed_session.control_channel
         try:
             # Arm immediately so playback starts without a keypress.
             managed_session.first_action_event.set()
@@ -2291,7 +2297,10 @@ class CosmoshWebRTCSessionManager:
                             )
                     except Exception as exc:
                         LOGGER.exception("Debug render loop chunk failed.")
-                        self._send_json(channel, {"type": "error", "message": str(exc)})
+                        self._send_json(
+                            managed_session.control_channel,
+                            {"type": "error", "message": str(exc)},
+                        )
                         return
 
                     _fps_record_chunk(managed_session.fps_profile, result.num_frames)
@@ -2304,7 +2313,7 @@ class CosmoshWebRTCSessionManager:
                         managed_session.video_track.qsize(),
                     )
                     self._send_json(
-                        channel,
+                        managed_session.control_channel,
                         {
                             "type": "chunk_done",
                             "chunk_index": result.chunk_index,
@@ -2319,13 +2328,25 @@ class CosmoshWebRTCSessionManager:
                     LOGGER.info(
                         "Debug action stream exhausted; send 'reset' to replay."
                     )
-                    self._send_json(channel, {"type": "debug_stream_end"})
+                    self._send_json(
+                        managed_session.control_channel, {"type": "debug_stream_end"}
+                    )
         except asyncio.CancelledError:
             return
 
     @staticmethod
-    def _send_json(channel: Any, payload: dict[str, Any]) -> None:
+    def _send_json(channel: Any | None, payload: dict[str, Any]) -> None:
+        if channel is None:
+            # The control DataChannel has not opened yet.
+            LOGGER.debug(
+                "No control channel yet; dropped %r message.", payload.get("type")
+            )
+            return
         try:
             channel.send(json.dumps(payload))
-        except Exception:
-            return
+        except Exception as exc:
+            LOGGER.warning(
+                "Could not send %r message on the control channel: %s",
+                payload.get("type"),
+                exc,
+            )
