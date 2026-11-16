@@ -147,7 +147,7 @@ Optional:
 - **`--start-frame-idx`** — default conditional-frame index when the JSON doesn't specify it.
 - **`--save-comparison True`** — also write `*_comparison.mp4` (input on the left, prediction on the right).
 - **`--fps`** — output MP4 frame rate (default `10`).
-- **`--output-dir`** — where outputs land. Per-entry `output_video` paths are anchored under this when relative; absolute paths in the JSON are honored as-is.
+- **`--output-dir`** — where outputs land (default `outputs`). Per-entry `output_video` paths are anchored under this when relative; absolute paths in the JSON are honored as-is.
 - **`--resolution H,W`** — override the bundle's default output resolution (default `288,512`). Both dimensions must be multiples of 8 (the Wan2.1 VAE spatial compression ratio).
 
 Example — full Wan VAE on both sides, comparison MP4 on, 4 diffusion steps, override the
