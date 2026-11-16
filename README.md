@@ -90,9 +90,9 @@ uv run flashdreams-run cosmosHDreams-chunk3-vae-vae \
   --pipeline.diffusion-model.transformer.checkpoint-path checkpoints/model_ema_bf16_jhutabletop_288x512_h73.pt
 ```
 
-Each entry produces `<name>.mp4`, `<name>_annotated.mp4`, `<name>.npy` (raw `[3, T, H, W]` tensor in `[-1, 1]`), and `<name>_latents.npy`.
+Each entry produces `<name>.mp4`, `<name>_annotated.mp4`, `<name>.npy` (the video frames as a `uint8` array of shape `(T, H, W, 3)` in `[0, 255]`), and, with `--save-comparison True`, `<name>_comparison.mp4`.
 
-> **Note — first-run latency.** The first block absorbs `torch.compile` JIT and the initial CUDA-graph capture (reported as `[WARMUP]`). Compiled artifacts are cached and reused on subsequent runs of the same configuration and resolution.
+> **Note — first-run latency.** The first block absorbs `torch.compile` JIT and the initial CUDA-graph capture, and the FPS in the final `DONE` log line includes that time. Compiled artifacts are cached and reused on subsequent runs of the same configuration and resolution.
 
 ### 5. Mode B — Interactive WebRTC
 
