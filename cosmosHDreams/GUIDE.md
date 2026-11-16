@@ -175,8 +175,8 @@ uv run flashdreams-run cosmosHDreams-chunk3-2steps-vae-lighttae \
 > **Note — first-run latency.** The very first block of the very first
 > run is significantly slower than later ones: the DiT is compiled
 > with `torch.compile` and the CUDA graphs are captured on the first
-> forward pass. The runner reports this block as `[WARMUP]` in the
-> per-block log. The compiled artifacts are cached by PyTorch's
+> forward pass. The FPS in the runner's final `DONE` log line
+> includes this time. The compiled artifacts are cached by PyTorch's
 > Inductor cache and reused on subsequent runs of the same
 > configuration / resolution / GPU, so repeated invocations of the
 > same `cosmosHDreams-*` config start much faster — only the CUDA-graph
@@ -219,13 +219,13 @@ path, anchored under `--output-dir` when relative):
 |---|---|
 | `<name>.mp4` | Predicted video at `--fps`. |
 | `<name>_annotated.mp4` | Same video with `Frame N` overlays. |
-| `<name>.npy` | Raw float tensor of the full video, shape `[3, T, H, W]`, range `[-1, 1]`. |
+| `<name>.npy` | The frames of `<name>.mp4` (conditioning frame first) as a `uint8` array, shape `(T, H, W, 3)`, range `[0, 255]`. |
 | `<name>_comparison.mp4` | Side-by-side input vs. prediction (only when `--save-comparison True`). |
 
-Per-block timing logs also stream to stdout. The first outer block of
-each entry is reported as `[WARMUP]` because it absorbs `torch.compile`
-JIT and the first CUDA-graph capture; steady-state FPS in the summary
-excludes it.
+The runner logs one line per entry (AR steps, generated frames,
+resolution, wall time) and a final `DONE` line with the total generated
+frames and FPS. That FPS includes the `torch.compile` JIT and CUDA-graph
+capture time, so it is not a steady-state number.
 
 ---
 
