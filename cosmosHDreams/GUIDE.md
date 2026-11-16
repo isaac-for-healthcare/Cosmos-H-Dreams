@@ -160,7 +160,7 @@ uv run flashdreams-run cosmosHDreams-chunk3-vae-vae \
   --root-dir . \
   --total-blocks 20 \
   --save-comparison True \
-  --pipeline.diffusion-model.transformer.checkpoint-path checkpoints/model_ema_bf16_jhutabletop_288x512.pt
+  --pipeline.diffusion-model.transformer.checkpoint-path checkpoints/model_ema_bf16_jhutabletop_288x512_h73.pt
 ```
 
 To switch configuration, swap the first positional. Everything else can stay the same:
