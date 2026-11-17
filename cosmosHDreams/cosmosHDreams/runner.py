@@ -36,6 +36,7 @@ from cosmosHDreams.utils import (
     pad_actions,
     pixel_frame_to_neg1_pos1,
     resolve_manifest_input_path,
+    resolve_manifest_output_path,
 )
 
 # Wan2.1 VAE spatial compression ratio. The output pixel resolution must be a
@@ -62,7 +63,9 @@ class CosmoshRunnerConfig(RunnerConfig):
     ``input_video``, or ``input_image`` (still image or video; type is
     inferred from the file extension), plus ``input_action`` and
     ``output_video`` (and optional per-entry ``start_frame_idx`` /
-    ``resolution`` overrides). Required at ``run()`` time."""
+    ``resolution`` overrides). A relative ``output_video`` is placed under
+    ``output_dir``; an absolute one is used as given. Required at ``run()``
+    time."""
 
     cr1_embeddings_path: Path | None = None
     """Path to a precomputed CR1 text-embeddings ``.pt`` file. Required at
@@ -222,9 +225,9 @@ class CosmoshRunner(Runner[CosmoshRunnerConfig, CosmoshPipeline]):
         cfg = self.config
         input_media_path = str(Path(cfg.root_dir) / input_path)
         input_action_path = str(Path(cfg.root_dir) / entry["input_action"])
-        output_video_path = entry["output_video"]
-        # if not Path(output_video_path).is_absolute():
-        #     output_video_path = str(cfg.output_dir / output_video_path)
+        output_video_path = resolve_manifest_output_path(
+            cfg.output_dir, entry["output_video"]
+        )
         Path(output_video_path).parent.mkdir(parents=True, exist_ok=True)
 
         transformer = self.pipeline.diffusion_model.transformer

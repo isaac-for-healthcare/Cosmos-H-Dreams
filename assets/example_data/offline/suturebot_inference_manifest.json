@@ -2,6 +2,6 @@
   {
     "input": "assets/example_data/offline/episode_001866_frame0.png",
     "input_action": "assets/example_data/offline/trajectory.npy",
-    "output_video": "outputs/suturebot_inference_output.mp4"
+    "output_video": "suturebot_inference_output.mp4"
   }
 ]

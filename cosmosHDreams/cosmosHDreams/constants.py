@@ -17,8 +17,9 @@
 
 AVAILABLE_COSMOSH_CHECKPOINT_PATHS: dict[str, str] = {
     # CosmosH 2B EMA, action_dim=44, temporal_compression_ratio=4.
-    # Single-file .pt extracted from the upstream DCP checkpoint.
-    "default": "checkpoints/model_ema_bf16.pt",
+    # The file published in the Hugging Face model repo
+    # nvidia/Cosmos-H-Dreams, downloaded into checkpoints/.
+    "default": "checkpoints/model_ema_bf16_jhutabletop_288x512_h73.pt",
 }
 """Canonical CosmosH checkpoint paths. Keys are the variant shorthand;
 values are local paths or ``s3://`` URIs."""
